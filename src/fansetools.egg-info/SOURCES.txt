@@ -1,0 +1,15 @@
+LICENSE
+README.md
+setup.py
+src/fansetools/__init__.py
+src/fansetools/bed.py
+src/fansetools/cli.py
+src/fansetools/fastx.py
+src/fansetools/parser.py
+src/fansetools/run.py
+src/fansetools/sam.py
+src/fansetools.egg-info/PKG-INFO
+src/fansetools.egg-info/SOURCES.txt
+src/fansetools.egg-info/dependency_links.txt
+src/fansetools.egg-info/entry_points.txt
+src/fansetools.egg-info/top_level.txt
