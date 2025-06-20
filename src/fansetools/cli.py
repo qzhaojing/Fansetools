@@ -3,7 +3,7 @@
 
 import argparse
 from .parser import fanse_parser
-from .sam import fanse2sam
+from .sam import fanse2sam, fanse2bed, fanse2bam, fanse2fastq, fanse2fasta
 
 def main():
     
