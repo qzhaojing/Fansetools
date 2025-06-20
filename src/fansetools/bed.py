@@ -42,7 +42,7 @@ def parse_fanse_line(line1, line2):
     
     return bed_entries
 
-def process_file(input_path, output_path, max_reads=None):
+def fanse2bed(input_path, output_path, max_reads=None):
     """Convert FANSe3 file to BED format"""
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -77,7 +77,7 @@ def process_file(input_path, output_path, max_reads=None):
         
         pbar.close()
 
-def bed_command(args):
+def fanse2bed(args):
     """Handle the bed subcommand"""
     if os.path.isdir(args.input):
         for f in glob(os.path.join(args.input, args.pattern)):
@@ -99,4 +99,4 @@ def add_bed_subparser(subparsers):
                        help='Max reads to process')
     parser.add_argument('-p', '--pattern', default='*.fanse3', 
                        help='File pattern for batch processing')
-    parser.set_defaults(func=bed_command)
+    parser.set_defaults(func=fanse2bed)

@@ -3,11 +3,18 @@
 
 import argparse
 from .parser import fanse_parser
+from .run import add_run_subparser
 from .sam import fanse2sam
 from .bed import add_bed_subparser
 from .fastx import add_fastx_subparser
 
+
+
+
+
+
 def main():
+    """FANSe 工具集主入口"""
     parser = argparse.ArgumentParser(
         prog='fanse',
         description='FANSe 工具集：用于处理 FANSe3 格式文件的命令行工具\n\n'
@@ -21,8 +28,12 @@ def main():
                '更多帮助请参考：https://github.com/qzhaojing/fansetools',
         formatter_class=argparse.RawTextHelpFormatter  # 保留换行和格式
     )
-    subparsers = parser.add_subparsers(dest='command', required=True)
-
+    subparsers = parser.add_subparsers(
+        title='可用命令',
+        dest='command', 
+        required=True)
+    
+    add_run_subparser(subparsers)
     # 子命令：parser
     parser_parser = subparsers.add_parser(
         'parser',
@@ -66,3 +77,52 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+#import argparse
+#from .run import add_run_subparser
+#from .sam import add_sam_subparser
+#from .bed import add_bed_subparser
+#from .fastx import add_fastx_subparser
+#
+#def main():
+#    """FANSe 工具集主入口"""
+#    parser = argparse.ArgumentParser(
+#        prog='fanse',
+#        description='FANSe 工具集 - 高通量测序数据分析工具',
+#        epilog='更多帮助请访问: https://github.com/qzhaojing/Fansetools',
+#        formatter_class=argparse.RawTextHelpFormatter
+#    )
+#    
+#    # 添加子命令
+#    subparsers = parser.add_subparsers(
+#        title='可用命令',
+#        dest='command',
+#        metavar='<command>'
+#    )
+#    
+#    # 添加各模块子命令
+#    add_run_subparser(subparsers)
+#    add_sam_subparser(subparsers)
+#    add_bed_subparser(subparsers)
+#    add_fastx_subparser(subparsers)
+#    
+#    # 解析参数
+#    args = parser.parse_args()
+#    
+#    if not hasattr(args, 'func'):
+#        parser.print_help()
+#        return
+#    
+#    try:
+#        args.func(args)
+#    except Exception as e:
+#        print(f"\n错误: {str(e)}")
+#        sys.exit(1)
+#
+#if __name__ == '__main__':
+#    main()
