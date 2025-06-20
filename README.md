@@ -6,28 +6,28 @@ fanse以fastq文件输入，输出为fanse格式，方便直接阅读处理。
 
 # fanse
 usage: fanse **
- ##### sam  convert fanse3 to sam file
+ #### sam  convert fanse3 to sam file
  we can use 
  fanse sam -i input.fanse3 -r reference.fasta [-o out.sam] > output.sam
  fanse sam -i input.fanse3 -r reference.fasta  > samtools sort output.sort.bam
 
 需注意，输入的fanse格式需打开--alignment 选项。
 
-##### parser  
+#### parser  
 格式化读取fanse3格式，为其他处理做准备
 
-##### bed 
+#### bed 
 fanse3转为bed格式，可接bedtools直接处理
 
-##### count  
+#### count  
 直接统计输入fanse3文件中每个基因的readcounts
- ####### count gene_level
- ####### count transcript_level
+ ###### count gene_level
+ ###### count transcript_level
 
-##### rpkm 
+#### rpkm 
 用count文件计算rpkm, 需要-reference的长度，直接利用ref生成
- ####### rpkm gene_level
- ####### rpkm transcript_level
+ ###### rpkm gene_level
+ ###### rpkm transcript_level
 
 
 ## 后续加入其他转换模块
