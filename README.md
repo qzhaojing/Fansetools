@@ -44,6 +44,11 @@ For detailed information on the FANSe3 output format, please see:
 On windows, recommand install as follows:
 ```bash
 pip install git+https://github.com/qzhaojing/Fansetools.git
+
+
+#if you don't have git , first install it,you can use:
+conda install git
+
 ```
 
 After installation, you can invoke `fansetools` directly from the command line.
@@ -57,7 +62,8 @@ After installation, you can invoke `fansetools` directly from the command line.
 ```bash
 fanse [subcommand] -h
 ```
-
+### run the alignment with fanse
+fanse run -h
 ### Format Conversions
 
 - **FANSe3 to SAM:**
