@@ -41,6 +41,11 @@ For detailed information on the FANSe3 output format, please see:
    python setup.py install
    ```
 
+On windows, recommand install as follows:
+```bash
+pip install git+https://github.com/qzhaojing/Fansetools.git
+```
+
 After installation, you can invoke `fansetools` directly from the command line.
 
 ---
