@@ -114,43 +114,77 @@ class FanseRunner:
             logger.info("初始化FANSe3配置文件")
             CONFIG_FILE.touch()
     
+    #def _normalize_path(self, path: Union[str, Path]) -> Path:
+    #    """规范化路径处理"""
+    #    path = Path(path).absolute()
+        #    
+    #    # 处理网络路径(Windows)
+    #    if os.name == 'nt' and str(path).startswith('\\\\'):
+    #        return Path(str(path).replace('/', '\\'))
+        #    
+    #    return path
+    
     def _normalize_path(self, path: Union[str, Path]) -> Path:
-        """规范化路径处理"""
         path = Path(path).absolute()
-        
-        # 处理网络路径(Windows)
+        # 统一处理网络路径
         if os.name == 'nt' and str(path).startswith('\\\\'):
             return Path(str(path).replace('/', '\\'))
-        
         return path
+    
+    def set_fanse3_path(self, exe_path: Union[str, Path]):
+        """设置FANSe3路径（直接接受可执行文件路径）"""
+        exe_path = self._normalize_path(exe_path)
+        
+        # 验证可执行文件是否存在
+        if not exe_path.exists():
+            raise FileNotFoundError(f"文件不存在: {exe_path}")
+        
+        # 检查是否是有效的可执行文件名
+        valid_names = ['fanse3', 'fanse3g', 'fanse']
+        if os.name == 'nt':
+            valid_names = [name + '.exe' for name in valid_names]
+        
+        if exe_path.name not in valid_names:
+            raise ValueError(
+                f"无效的可执行文件名，应为: {', '.join(valid_names)}"
+            )
+        
+        # 保存配置（存储所在目录）
+        ConfigManager.save_config('fanse3dir', str(exe_path.parent))
+        ConfigManager.save_config('fanse3exe', str(exe_path.name))
+        
+        print(f"✓ 配置成功: 找到 {exe_path.name} 可执行文件")
+        print(f"  路径: {exe_path}")
+
+    #def get_fanse3_path(self) -> Optional[Path]:
+    #    """获取FANSe3可执行文件完整路径"""
+    #    dir_path = ConfigManager.load_config('fanse3dir')
+    #    exe_name = ConfigManager.load_config('fanse3exe')
+        #    
+    #    if not dir_path or not exe_name:
+    #        return None
+        #    
+    #    path = self._normalize_path(dir_path) / exe_name
+    #    if not path.exists():
+    #        logger.warning(f"配置的FANSe3可执行文件不存在: {path}")
+    #        return None
+        #    
+    #    return path
     
     def get_fanse3_path(self) -> Optional[Path]:
-        """获取FANSe3路径"""
-        path = ConfigManager.load_config('fanse3dir')
-        if not path:
+        """获取完整的FANSe可执行文件路径"""
+        dir_path = ConfigManager.load_config('fanse3dir')
+        exe_name = ConfigManager.load_config('fanse3exe', 'fanse3')  # 默认值
+        
+        if not dir_path:
             return None
         
-        path = self._normalize_path(path)
+        path = self._normalize_path(dir_path) / exe_name
         if not path.exists():
-            logger.warning(f"配置的FANSe3路径不存在: {path}")
+            logger.warning(f"配置的FANSe可执行文件不存在: {path}")
             return None
         
         return path
-    
-    def set_fanse3_path(self, path: Union[str, Path]):
-        """设置FANSe3路径"""
-        path = self._normalize_path(path)
-        
-        # 验证路径有效性
-        if not path.exists():
-            raise FileNotFoundError(f"路径不存在: {path}")
-        
-        exe_path = path / "fanse3.exe" if os.name == 'nt' else path / "fanse3"
-        if not exe_path.exists():
-            raise FileNotFoundError(f"未找到FANSe3可执行文件: {exe_path}")
-        
-        ConfigManager.save_config('fanse3dir', str(path))
-        logger.info(f"FANSe3路径已设置为: {path}")
     
     def parse_input(self, input_str: str) -> List[Path]:
         """解析输入路径"""
@@ -213,26 +247,60 @@ class FanseRunner:
         
         return path_map
     
+    #def build_command(self, input_path: Path, output_path: Path, 
+    #                 refseq: Path, params: Dict[str, Union[int, str]], 
+    #                 options: List[str]) -> str:
+    #    """构建FANSe命令（使用配置的可执行文件名）"""
+    #    # 获取配置的可执行文件名
+    #    exe_name = ConfigManager.load_config('fanse3exe', 'fanse3')  # 默认为fanse3
+    #    exe_path = self.get_fanse3_path()
+        #    
+    #    if not exe_path:
+    #        raise RuntimeError("未配置FANSe可执行文件路径，请先使用 --set-path 配置")
+        #    
+    #    # 构建基础命令
+    #    cmd = f'"{exe_path}" -R"{refseq}" -D"{input_path}" -O"{output_path}"'
+        #    
+    #    # 添加参数
+    #    for param, value in params.items():
+    #        cmd += f" -{param}{value}"
+        #    
+    #    # 添加选项
+    #    for option in options:
+    #        cmd += f" {option}"
+        #    
+    #    return cmd
+    
     def build_command(self, input_path: Path, output_path: Path, 
                      refseq: Path, params: Dict[str, Union[int, str]], 
                      options: List[str]) -> str:
-        """构建FANSe3命令"""
-        cmd = f"fanse3 -R{refseq} -D{input_path} -O{output_path}"
+        exe_path = self.get_fanse3_path()
+        if not exe_path:
+            raise RuntimeError("FANSe3路径未配置")
         
-        # 添加参数
-        for param, value in params.items():
-            cmd += f" -{param}{value}"
+        if not refseq.exists():
+            raise FileNotFoundError(f"参考序列文件不存在: {refseq}")
         
-        # 添加选项
-        for option in options:
-            cmd += f" {option}"
+        # 跨平台路径处理
+        cmd_parts = [
+            f'"{exe_path}"',
+            f'-R"{refseq}"',
+            f'-D"{input_path}"',
+            f'-O"{output_path}"'
+        ]
         
-        return cmd
+        # 添加参数和选项
+        cmd_parts.extend(f"-{param}{value}" for param, value in params.items())
+        cmd_parts.extend(options)
+        
+        return " ".join(cmd_parts)
     
     def run_batch(self, file_map: Dict[Path, Path], refseq: Path,
                  params: Optional[Dict[str, Union[int, str]]] = None,
                  options: Optional[List[str]] = None):
         """批量运行FANSe3"""
+        if not refseq.exists():
+            raise FileNotFoundError(f"参考序列文件不存在: {refseq}")
         # 合并参数和选项
         final_params = {**self.default_params, **(params or {})}
         final_options = [*self.default_options, *(options or [])]
@@ -273,6 +341,20 @@ class FanseRunner:
                 logger.error(f"执行失败: {str(e)}")
         
         logger.info(f"\n处理完成: {success}/{total} 成功")
+
+    def generate_bat(self, file_map: Dict[Path, Path], refseq: Path,
+                    params: Optional[Dict] = None, options: Optional[List] = None,
+                    bat_path: Optional[Path] = None):
+        """生成批处理文件"""
+        bat_path = bat_path or Path("run_fanse3.bat")
+        
+        with open(bat_path, 'w') as f:
+            f.write("@echo off\n")
+            for input_path, output_dir in file_map.items():
+                cmd = self.build_command(input_path, output_dir, refseq, params, options)
+                f.write(f"{cmd}\n")
+        
+        logger.info(f"批处理文件已生成: {bat_path}")
 
 def add_run_subparser(subparsers):
     """添加run子命令到主解析器"""
@@ -322,8 +404,8 @@ def add_run_subparser(subparsers):
     # 配置参数
     parser.add_argument(
         '--set-path',
-        metavar='PATH',
-        help='设置FANSe3可执行文件所在目录'
+        metavar='EXE_PATH',
+        help='设置FANSe3可执行文件完整路径（如/path/to/fanse3.exe）'
     )
     
     # 必需参数
@@ -394,6 +476,7 @@ def add_run_subparser(subparsers):
     
     parser.set_defaults(func=run_command)
 
+
 def run_command(args):
     """处理run子命令"""
     runner = FanseRunner()
@@ -447,16 +530,127 @@ def run_command(args):
         if args.test:
             options.append('--test')
         
-        # 运行批量处理
-        runner.run_batch(
-            file_map=path_map,
-            refseq=Path(args.refseq),
-            params=params,
-            options=options
-        )
+        # 显示交互菜单
+        show_interactive_menu(runner, path_map, Path(args.refseq), params, options)
+        
     except Exception as e:
         logger.error(f"运行失败: {str(e)}")
         sys.exit(1)
+
+def show_interactive_menu(runner: FanseRunner, file_map: Dict[Path, Path], 
+                         refseq: Path, params: Dict, options: List[str]):
+    """显示交互式操作菜单"""
+    while True:
+        print("\n" + "="*50)
+        print("FANSe3 操作菜单")
+        print("="*50)
+        print("当前配置:")
+        print(f"  参考序列: {refseq}")
+        print(f"  输入文件: {len(file_map)} 个")
+        print(f"  参数: {params}")
+        print(f"  选项: {options}")
+        print("\n请选择操作:")
+        print("1. 生成批处理文件")
+        print("2. 直接运行处理")
+        print("3. 重置 FANSe3 路径")
+        print("4. 退出")
+        
+        choice = input("\n请输入选项 (1-4): ").strip()
+        
+        try:
+            if choice == "1":
+                output_dir = input("输入批处理文件保存目录(回车使用当前目录): ").strip()
+                bat_path = Path(output_dir) / "run_fanse3.bat" if output_dir else None
+                runner.generate_bat(file_map, refseq, params, options, bat_path)
+                input("\n按Enter键继续...")
+            elif choice == "2":
+                print("\n即将开始处理，请确认配置:")
+                print(f"  参考序列: {refseq}")
+                print(f"  输入文件: {len(file_map)} 个")
+                print(f"  参数: {params}")
+                print(f"  选项: {options}")
+                
+                confirm = input("\n是否开始处理? (y/N): ").lower()
+                if confirm == 'y':
+                    runner.run_batch(file_map, refseq, params, options)
+                    input("\n按Enter键返回菜单...")
+            elif choice == "3":
+                new_path = input("输入新的FANSe3可执行文件路径: ").strip()
+                if new_path:
+                    runner.set_fanse3_path(new_path)
+                    input("\n按Enter键继续...")
+            elif choice == "4":
+                print("退出操作菜单")
+                break
+            else:
+                print("无效选项，请重新输入")
+        except Exception as e:
+            print(f"\n操作失败: {str(e)}")
+            input("按Enter键继续...")
+            
+#def run_command(args):
+#    """处理run子命令"""
+#    runner = FanseRunner()
+#    
+#    try:
+#        # 处理路径配置
+#        if args.set_path:
+#            runner.set_fanse3_path(args.set_path)
+#            return
+#        
+#        # 检查FANSe3路径
+#        if not runner.get_fanse3_path():
+#            logger.error("错误: 未配置FANSe3路径，请先使用 --set-path 配置")
+#            return
+#        
+#        # 解析输入路径
+#        input_paths = runner.parse_input(args.input)
+#        if not input_paths:
+#            logger.error("错误: 未找到有效的输入路径")
+#            return
+#        
+#        # 解析输出目录(如果有)
+#        output_dirs = None
+#        if args.output:
+#            output_dirs = [Path(d.strip()) for d in args.output.split(',') if d.strip()]
+#        
+#        # 生成路径映射
+#        path_map = runner.generate_output_mapping(input_paths, output_dirs)
+#        
+#        # 准备参数
+#        params = {}
+#        if args.L is not None:
+#            params['L'] = args.L
+#        if args.E is not None:
+#            params['E'] = args.E
+#        if args.S is not None:
+#            params['S'] = args.S
+#        if args.H is not None:
+#            params['H'] = args.H
+#        if args.C is not None:
+#            params['C'] = args.C
+#        
+#        # 准备选项
+#        options = []
+#        if args.all:
+#            options.append('--all')
+#        if args.unique:
+#            options.append('--unique')
+#        if args.showalign:
+#            options.append('--showalign')
+#        if args.test:
+#            options.append('--test')
+#        
+#        # 运行批量处理
+#        runner.run_batch(
+#            file_map=path_map,
+#            refseq=Path(args.refseq),
+#            params=params,
+#            options=options
+#        )
+#    except Exception as e:
+#        logger.error(f"运行失败: {str(e)}")
+#        sys.exit(1)
 
 # 单元测试
 if __name__ == '__main__':
