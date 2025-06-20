@@ -42,7 +42,7 @@ def parse_fanse_line(line1, line2):
     
     return bed_entries
 
-def fanse2bed(input_path, output_path, max_reads=None):
+def process_file(input_path, output_path, max_reads=None):
     """Convert FANSe3 file to BED format"""
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
