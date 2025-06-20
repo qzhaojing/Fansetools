@@ -6,6 +6,7 @@ from .parser import fanse_parser
 from .sam import fanse2sam
 
 def main():
+    
     parser = argparse.ArgumentParser(
         prog='fanse',
         description='FANSe 工具集：用于处理 FANSe3 格式文件的命令行工具\n\n'
@@ -18,7 +19,7 @@ def main():
     )
     subparsers = parser.add_subparsers(dest='command', required=True)
 
-    # 子命令：parser
+    # 子命令：parser  #########################################
     parser_parser = subparsers.add_parser(
         'parser',
         help='解析 FANSe3 文件',
@@ -26,7 +27,8 @@ def main():
     )
     parser_parser.add_argument('input_file', help='输入文件路径（FANSe3 格式）')
 
-    # 子命令：sam
+    
+    # 子命令：sam   #########################################33
     sam_parser = subparsers.add_parser(
         'sam',
         help='转换为 SAM 格式',
@@ -50,5 +52,17 @@ def main():
         elif args.command == 'sam':
             fanse2sam(args.input_file, args.fasta_file, args.output)
 
+        elif args.command =='bed':
+            fanse2bed(args.input_file, args.fasta_file, args.output)
+
+        elif args.command =='fastq':
+            fanse2fastq(args.input_file, args.fasta_file, args.output)
+
+        elif args.command =='fasta':
+            fanse2fasta(args.input_file, args.fasta_file, args.output)
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] 程序已被用户中断")  # 自定义简洁提示
+        sys.exit(0)  # 静默退出，不显示 Traceback
