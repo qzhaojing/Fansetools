@@ -5,10 +5,12 @@ Created on Wed Jun 18 11:06:35 2025
 @author: Administrator
 """
 import re
+import os
 from dataclasses import dataclass
 # from typing import List, Generator
 from typing import List, Generator, Deque
 from collections import deque
+from tqdm import tqdm
 
 
 @dataclass
@@ -98,6 +100,37 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
             )
 
             yield record
+
+
+@dataclass
+class UnmappedRecord:
+    """存储未比对reads的类"""
+    read_id: str
+    sequence: str
+    
+def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
+    """
+    解析未比对reads文件
+    
+    参数:
+        file_path: 输入文件路径（制表符分隔的read_id和序列）
+    
+    返回:
+        生成器，每次yield一个UnmappedRecord对象
+    """
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:  # 跳过空行
+                continue
+                
+            parts = line.split('\t')
+            if len(parts) < 2:
+                raise ValueError(f"Invalid unmapped record format: {line}")
+            
+            yield UnmappedRecord(read_id=parts[0], sequence=parts[1])
+
+
 
 # def fanse_parser(file_path: str, buffer_size: int = 100*1024*1024) -> Generator[FANSeRecord, None, None]:
 #     """
