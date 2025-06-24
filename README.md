@@ -45,6 +45,11 @@ On windows, recommand install as follows:
 ```bash
 pip install git+https://github.com/qzhaojing/Fansetools.git
 
+or 
+```
+git install https://github.com/qzhaojing/Fansetools/archive/refs/tags/v1.0.0.tar.gz
+
+```
 
 #if you don't have git , first install it,you can use:
 conda install git
@@ -64,9 +69,21 @@ fanse [subcommand] -h
 ```
 ### run the alignment with fanse
 fanse run -h
+
+- **FANSe3 run as single file or batch run**
+```
+fanse run -i sample.fastq -r sample.fasta    +fanse参数
+fanse run -i sample.fastq -r sample.fasta -o c:\sample    +fanse参数 
+fanse run -i sample.fastq -r sample.fasta       +fanse参数    [ -E5  -H1  -S8  --all等所有fanse3所带参数均可附加]
+```
+参数- 断点续跑
+当由于文件原因或服务器死机等原因导致失败，可以参考日志删去最后一组不完整的文件。然后重新运行命令，加上这个参数。
+自动识别文件夹中已经存在的结果文件跳过，找到没有结果生成的fastq文件继续跑。省去重复跑或者编写命令的烦恼。
+
 ### Format Conversions
 
 - **FANSe3 to SAM:**
+usage: fanse sam [-h] -i INPUT_FILE -r FASTA_FILE [-o OUTPUT]
   ```bash
   fanse sam -i input.fanse3 -r reference.fasta [-o out.sam] > output.sam
   # Or directly to sorted BAM:
@@ -90,8 +107,10 @@ fanse run -h
   ```
 
 - **FANSe3 to BED:**
+usage: fanse bed [-h] -i INPUT [-o OUTPUT] [-n MAX_READS] [-p PATTERN]
   ```bash
-  fanse2bed -i input.fanse3 -o output.bed
+  fanse bed -i input.fanse3 -o output.bed
+  
   # Output can be used with bedtools and other downstream tools
   ```
 

@@ -5,6 +5,7 @@ import time
 import logging
 import multiprocessing
 import argparse
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict, Optional, Union ,Tuple
 from collections import OrderedDict
@@ -15,7 +16,8 @@ try:
     HAS_COLORAMA = True
 except ImportError:
     HAS_COLORAMA = False
-
+    if not HAS_COLORAMA:
+        print("提示: 安装 colorama 可获得更好的彩色输出体验 (pip install colorama)")
 #在命令行添加 --debug 参数即可启用验证模式：
 # class PathStatus(Enum):
 #     VALID = 0
@@ -23,7 +25,7 @@ except ImportError:
 #     INVALID_TYPE = 2 # 致命错误
 #     LONG_PATH = 3   # 警告
 #     UNWRITABLE = 4  # 警告
-    
+  
 # 配置系统 - 自定义键值对  格式  
 class ConfigManager:
     """配置管理器，使用自定义键值对格式存储配置"""
@@ -126,6 +128,8 @@ class FanseRunner:
     ]
     
     def __init__(self, debug=False, log_path: Optional[Path] = None):
+        # 如果没有colorama，提示
+
         # 默认参数配置
         # self.default_params = {
         #     'L': 1000,      # 最大读长
@@ -235,7 +239,9 @@ class FanseRunner:
                 # 最后尝试处理原始路径
                 return path
 
-
+# =============================================================================
+# set the FANSe3 folder position
+# =============================================================================
     def find_fanse_executable(self, directory: Path) -> Optional[Path]:
         """在目录中查找FANSe可执行文件"""
         for root, _, files in os.walk(directory):
@@ -243,6 +249,7 @@ class FanseRunner:
                 if file in self.FANSE_EXECUTABLES:
                     return Path(root) / file
         return None
+    
     def get_fanse3_path(self) -> Optional[Path]:
         """获取完整的FANSe可执行文件路径（修正目录处理）"""
         path_str = self.config.load_config('fanse3dir')
@@ -284,28 +291,9 @@ class FanseRunner:
         # 保存配置
         self.config.save_config('fanse3dir', str(path))
         self.logger.info(f"FANSe路径配置成功: {path}")
-    # def get_fanse3_path(self) -> Optional[Path]:
-    #     """获取完整的FANSe可执行文件路径 """
-    #     path_str = self.config.load_config('fanse3dir')
-    #     if not path_str:
-    #         return None
-        
-    #     path = self._normalize_path(path_str)
-    #     if path.exists():
-    #         return path
-    #     else:
-    #         self.logger.warning(f"配置的FANSe路径不存在: {path}")
-    #         return None
-    
-    # def set_fanse3_path(self, path: Union[str, Path]):
-    #     """设置FANSe3路径（接受文件或目录）"""
-    #     path = self._normalize_path(path)
-    #     if not path.exists():
-    #         raise FileNotFoundError(f"路径不存在: {path}")
-        
-    #     # 保存配置
-    #     self.config.save_config('fanse3dir', str(path))
-    #     self.logger.info(f"FANSe路径配置成功: {path}")
+# =============================================================================
+# Generate the input and output file and folder
+# =============================================================================
     
     def parse_input(self, input_str: str) -> List[Path]:
         """解析输入路径字符串，支持多种格式（修正目录处理）"""
@@ -343,7 +331,7 @@ class FanseRunner:
                     else:
                         self.logger.warning(f"这路径需要再检查一下: {item}")
             except Exception as e:
-                self.logger.error(f"解析输入的路径失败了: {item} - {str(e)}")
+                self.logger.error(f"解析输入input的路径失败了: {item} - {str(e)}")
         
         return input_paths
 
@@ -388,13 +376,6 @@ class FanseRunner:
                 raise ValueError(f"路径既不是文件也不是文件夹: {path}")
 
 
-        # # 1. 没有指定输出目录
-        # if output_paths is None:
-        #     for path in input_paths:
-        #         # 使用输入文件所在目录作为输出目录
-        #         output_file = path.parent/ f"{path.stem}.fanse3"
-        #         path_map[path] = output_file
-         # 1. 没有指定输出路径
         if output_paths is None:
             for path in expanded_inputs:
                 output_file = path.with_name(f"{path.stem}.fanse3")
@@ -421,6 +402,11 @@ class FanseRunner:
         
         return path_map                
 
+
+
+# =============================================================================
+# Start to integrate the paras  to single cmd
+# =============================================================================
     def build_command(self, input_file: Path, output_file: Path, 
                      refseq: Path, params: Dict[str, Union[int, str]], 
                      options: List[str]) -> str:
@@ -440,14 +426,6 @@ class FanseRunner:
             print(f"结果输出文件夹不存在，将新建: {refseq}")
             output_file.parent.mkdir(parents=True, exist_ok=True)
         
-        
-        # 构建命令部分 - 确保参数格式正确
-        # cmd_fanseparts = [
-        #     self._format_path_for_system(fanse_path),
-        #     f'-R{self._format_path_for_system(refseq)}',  # fanse的参数和值之间不能有空格，否则直接出错
-        #     f'-D{self._format_path_for_system(input_file)}',
-        #     f'-O{self._format_path_for_system(output_file)}'
-        # ]
 
         cmd_fanseparts = [
             str(fanse_path),  # 直接使用字符串路径
@@ -470,15 +448,12 @@ class FanseRunner:
  
     def _print_task_info(self, task_info: str):
         """专用方法处理控制台的任务信息打印"""
+        # 同时打印彩色（示例，假设我们有彩色支持）
         try:
-            from colorama import Fore, Style
-            # 彩色打印（如果colorama可用）
-            colored_info = task_info.replace("输入文件:", f"{Fore.GREEN}输入文件:{Style.RESET_ALL}")
-            colored_info = colored_info.replace("命令:", f"{Fore.YELLOW}命令:{Style.RESET_ALL}")
-            print(colored_info)
+            print(Fore.CYAN + task_info + Style.RESET_ALL)
         except ImportError:
-            # 没有colorama时普通打印
             print(task_info)
+        
         
 
     def log_path_diagnostics(self, path_name, path):
@@ -489,6 +464,7 @@ class FanseRunner:
         self.logger.debug(f"  绝对路径: {path.absolute()}")
         self.logger.debug(f"  真实路径: {path.resolve()}")
         self.logger.debug(f"  是否存在: {path.exists()}")
+        
         if path.exists():
             self.logger.debug(f"  是文件: {path.is_file()}")
             self.logger.debug(f"  是目录: {path.is_dir()}")
@@ -576,21 +552,22 @@ class FanseRunner:
  
                 # 准备任务信息
             task_info = f"""
-                        ========================================
+                        {'='*48}
                         任务 {i}/{total}: {input_file.name}
-                        ========================================
+                        {'='*48}
                         输入文件: {input_file}
                         输出文件: {output_file}
                         参考序列: {refseq}
                         参数: {final_params}
                         选项: {final_options}
                         命令: {cmd}
+                        {'-'*48}
                         """
             # 显示任务信息（调试模式下简化输出）
             if not debug:
                 # self.logger.info(task_info)
                 self._print_task_info(task_info)  # 专门处理控制台打印
-                self.logger.info(task_info)       # 同时记录到日志
+                # self.logger.info(task_info)       # 同时记录到日志
             else:
                 print(task_info)  # 正常模式直接打印到控制台
 
@@ -668,18 +645,120 @@ class FanseRunner:
             except Exception as e:
                 failed.append(input_file.name)
                 self.logger.error(f"  处理异常: {str(e)}")
-        
-        # 汇总统计
+        # 汇总统计（美化显示）
         total_elapsed = time.time() - start_time
-        self.logger.info("\n" + "="*50)
-        self.logger.info(f"处理完成: {success} 成功, {len(failed)} 失败")
-        self.logger.info(f"总耗时: {total_elapsed:.2f}秒")
+        summary = f"\n{'='*50}\n处理完成: {success} 成功, {len(failed)} 失败\n总耗时: {total_elapsed:.2f}秒\n"
+        
+        self.logger.info(summary)
+        # print(f"\033[1;36m{summary}\033[0m")  # 青色加粗标题
+        
         if failed:
             self.logger.info("失败文件列表:")
+            print("\033[31m失败文件列表:\033[0m")  # 红色标题
             for name in failed:
                 self.logger.info(f"  - {name}")
+                print(f"\033[31m  - {name}\033[0m")
+                
+        # # 汇总统计
+        # total_elapsed = time.time() - start_time
+        # self.logger.info("\n" + "="*50)
+        # self.logger.info(f"处理完成: {success} 成功, {len(failed)} 失败")
+        # self.logger.info(f"总耗时: {total_elapsed:.2f}秒")
+        # if failed:
+        #     self.logger.info("失败文件列表:")
+        #     for name in failed:
+        #         self.logger.info(f"  - {name}")
 
 
+
+
+# =============================================================================
+# #未实现，配置参数格式，使之忽略大小写，-i，-I，-e，-E，--indel，--INDEL等通用
+# =============================================================================
+# class CaseInsensitiveDictAction(argparse.Action):
+#     """自定义 action 实现大小写不敏感的参数存储"""
+#     def __call__(self, parser, namespace, values, option_string=None):
+#         # 获取参数名（转换为小写作为键）
+#         key = self.dest.lower()
+        
+#         # 创建大小写不敏感的字典（如果还不存在）
+#         if not hasattr(namespace, 'case_insensitive_params'):
+#             setattr(namespace, 'case_insensitive_params', defaultdict(dict))
+        
+#         # 存储参数值（原始大小写形式）
+#         namespace.case_insensitive_params[key] = values
+
+# def create_case_insensitive_parser():
+#     """创建大小写不敏感的参数解析器"""
+#     parser = argparse.ArgumentParser(
+#         description='FANSe3 CLI Tool',
+#         formatter_class=argparse.RawTextHelpFormatter
+#     )
+    
+#     # 路径配置
+#     parser.add_argument(
+#         '--set-path',
+#         metavar='PATH',
+#         help='配置FANSe可执行文件路径 (文件或目录)'
+#     )
+    
+#     # 必需参数
+#     parser.add_argument(
+#         '-i', '--input',
+#         dest='INPUT',  # 指定标准化的目标属性名
+#         required=False,
+#         help='输入文件/目录 (支持通配符，多个用逗号分隔)'
+#     )
+#     parser.add_argument(
+#         '-r', '--refseq',
+#         dest='REFSEQ',  # 指定标准化的目标属性名
+#         required=False,
+#         help='参考序列文件路径'
+#     )
+    
+#     # 可选参数
+#     parser.add_argument(
+#         '-o', '--output',
+#         dest='OUTPUT',  # 指定标准化的目标属性名
+#         help='输出目录'
+#     )
+    
+#     # 使用自定义 action 实现大小写不敏感的参数
+#     for opt in ['O', 'L', 'E', 'S', 'H', 'C', 'T', 'I']:
+#         parser.add_argument(
+#             f'-{opt}',
+#             action=CaseInsensitiveDictAction,
+#             dest=f'FANSe_PARAM_{opt}',
+#             type=str if opt == 'T' or opt == 'E' else int,
+#             metavar='VALUE' if opt != 'T' else 'SPEC',
+#             help=f'{opt} 参数的值'  # 实际帮助文本在下面统一设置
+#         )
+    
+#     # 单独设置帮助文本（避免重复）
+#     param_help = {
+#         'O': '结果文件夹 (默认: fastq所在文件夹)',
+#         'L': '最大读长 (默认: 1000)',
+#         'E': '错误数量 (默认: 3)',
+#         'S': 'Seed长度 (默认: 13)',
+#         'H': '每批次读取reads数(百万) (默认: 1)',
+#         'C': '并行核数 (默认: CPU核数-2)',
+#         'T': 'START,LENGTH (默认: 0,150)',
+#         'I': '不开启0,开启1(默认: 0)'
+#     }
+    
+#     # 更新参数的帮助文本
+#     for action in parser._actions:
+#         if action.dest.startswith('FANSe_PARAM_'):
+#             opt = action.dest.split('_')[-1]
+#             action.help = param_help.get(opt, '')
+    
+#     # 其他选项...
+    
+#     return parser
+
+
+    
+    
 # 命令行接口
 def add_run_subparser(subparsers):
     """添加run子命令到主解析器"""
@@ -735,6 +814,10 @@ def add_run_subparser(subparsers):
 
     # FANSe3参数
     parser.add_argument(
+        '-O', type=int, metavar='output',
+        help='最大读长 (默认: 1000)'
+    )
+    parser.add_argument(
         '-L', type=int, metavar='LENGTH',
         help='最大读长 (默认: 1000)'
     )
@@ -743,7 +826,7 @@ def add_run_subparser(subparsers):
         help='错误数量 (默认: 5)'
     )
     parser.add_argument(
-        '-S', type=int, metavar='LENGTH',
+        '-S', type=int, metavar='min_LENGTH',
         help='Seed长度 (默认: 13)'
     )
     parser.add_argument(
@@ -755,10 +838,13 @@ def add_run_subparser(subparsers):
         help='并行核数 (默认: CPU核数-2)'
         )
     parser.add_argument(
-        '-T', type=int, metavar='SPLIT READS',
+        '-T', type=str, metavar='SPLIT READS',
         help='START,LENGTH (默认: 0,150)'
     )
-    
+    parser.add_argument(
+        '-I', type=int, metavar='INDEL 0,1',
+        help='不开启0,开启1(默认: 0)'
+    )    
     # FANSe3选项
     parser.add_argument(
         '--all',
@@ -780,8 +866,45 @@ def add_run_subparser(subparsers):
         action='store_true',
         help='以单线程模式运行'
     )
+    parser.add_argument(
+        '--rename',
+        action='store_true',
+        help='对reads改名，改为1，2，3，4……'
+    )
+    parser.add_argument(
+        '--indel',
+        action='store_true',
+        help='开展indel比对'
+    )
     
     parser.set_defaults(func=run_command)
+
+
+def run_command(args):
+    """处理命令行参数（大小写不敏感）"""
+    # 1. 合并所有参数到标准字典
+    params = {}
+    
+    # 收集大小写不敏感的参数
+    if hasattr(args, 'case_insensitive_params'):
+        for key, value in args.case_insensitive_params.items():
+            # 提取参数名 (如 'f' 或 'l')
+            param_name = key.split('_')[-1].lower()
+            params[param_name] = value
+    
+    # 2. 处理路径参数
+    config = {
+        'input': args.INPUT,
+        'refseq': args.REFSEQ,
+        'output': args.OUTPUT,
+        'set_path': args.set_path
+    }
+    
+    # 3. 返回统一格式的参数
+    return {
+        'config': config,
+        'params': params
+    }
 
 def run_command(args):
     
@@ -849,11 +972,14 @@ def run_command(args):
         # 准备参数
         params = {
             key: value for key, value in [
+                ('O', args.O),               
                 ('L', args.L),
                 ('E', args.E),
                 ('S', args.S),
                 ('H', args.H),
-                ('C', args.C)
+                ('C', args.C),
+                ('T', args.T),
+                ('I', args.I),
             ] if value is not None
         }
         
@@ -863,7 +989,8 @@ def run_command(args):
                 ('--all', args.all),
                 ('--unique', args.unique),
                 ('--showalign', args.showalign),
-                ('--test', args.test)
+                ('--test', args.test),
+                ('--indel', args.indel) ,           
             ] if flag
         ]
         
