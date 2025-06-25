@@ -77,9 +77,10 @@ fanse run -i sample.fastq -r sample.fasta -o c:\sample    +fanse参数
 fanse run -i sample.fastq -r sample.fasta       +fanse参数    [ -E5  -H1  -S8  --all等所有fanse3所带参数均可附加]
 ```
 参数- 断点续跑
-当由于文件原因或服务器死机等原因导致失败，可以参考日志删去最后一组不完整的文件。然后重新运行命令，加上这个参数。
+- 当由于文件原因或服务器死机等原因导致失败，可以参考日志删去最后一组不完整的文件。然后重新运行命令，加上这个参数。
 自动识别文件夹中已经存在的结果文件跳过，找到没有结果生成的fastq文件继续跑。省去重复跑或者编写命令的烦恼。
 
+- 想办法实现fanse3读取gz, fq.gz等格式，避免解压缩的繁复操作，且节省空间。可以探索fanse3能否接受标准输入，那么就可以通过python gzip模块解压缩gz，然后传给fanse3,进行比对了
 ### Format Conversions
 
 - **FANSe3 to SAM:**

@@ -5,6 +5,9 @@ import time
 import logging
 import multiprocessing
 import argparse
+import gzip
+import shutil
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Dict, Optional, Union ,Tuple
@@ -347,7 +350,33 @@ class FanseRunner:
             for file in directory.glob(f'*{ext.upper()}'):
                 if file.is_file() and file not in file_list:
                     file_list.append(file)
- 
+
+    def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+        """处理gzipped输入文件，返回实际输入文件路径和临时文件（如果有）"""
+        # 检查是否是需要解压的gzip文件
+        if input_file.suffix != '.gz' and not (len(input_file.suffixes) > 1 and input_file.suffixes[-1] == '.gz'):
+            return input_file, None
+        
+        try:
+            # 创建临时文件（不自动删除）
+            temp_file = Path(tempfile.NamedTemporaryFile(
+                prefix=f"{input_file.stem}_", 
+                suffix=".fastq", 
+                delete=False
+            ).name)
+            
+            # 解压gz文件到临时文件
+            self.logger.info(f"解压文件: {input_file} -> {temp_file}")
+            with gzip.open(input_file, 'rb') as f_in:
+                with open(temp_file, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            
+            return temp_file, temp_file
+        
+        except Exception as e:
+            self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
+            raise    
+
     def generate_output_mapping(self, input_paths: List[Path], 
                              output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
         """        
@@ -375,10 +404,29 @@ class FanseRunner:
             else:
                 raise ValueError(f"路径既不是文件也不是文件夹: {path}")
 
+        # 辅助函数：智能生成输出文件名
+        def get_output_filename(input_file: Path) -> str:
+            """根据输入文件名生成输出文件名，处理压缩文件扩展名"""
+            stem = input_file.stem
+            
+            # 处理常见的压缩文件扩展名
+            compress_exts = ['.gz', '.bz2', '.zip']
+            for ext in compress_exts:
+                if stem.endswith(ext):
+                    stem = stem[:-len(ext)]
+            
+            # 处理常见的测序文件扩展名
+            seq_exts = ['.fastq', '.fq', '.fa', '.fna', '.fasta']
+            for ext in seq_exts:
+                if stem.endswith(ext):
+                    stem = stem[:-len(ext)]
+            
+            return f"{stem}.fanse3"
 
         if output_paths is None:
             for path in expanded_inputs:
-                output_file = path.with_name(f"{path.stem}.fanse3")
+                # 使用智能文件名生成
+                output_file = path.with_name(get_output_filename(path))
                 path_map[path] = output_file
 
         # 2. 指定单个输出路径
@@ -386,7 +434,8 @@ class FanseRunner:
             output_dir = self._normalize_path(output_paths[0])
             output_dir.mkdir(parents=True, exist_ok=True)
             for path in expanded_inputs:
-                output_file = output_dir / f"{path.stem}.fanse3"
+                # 使用智能文件名生成
+                output_file = output_dir / get_output_filename(path)
                 path_map[path] = output_file
         
         # 3. 多个输出路径（必须与输入数量匹配）
@@ -397,10 +446,64 @@ class FanseRunner:
             for input_path, output_dir in zip(expanded_inputs, output_paths):
                 output_dir = self._normalize_path(output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
-                output_file = output_dir / f"{input_path.stem}.fanse3"
+                # 使用智能文件名生成
+                output_file = output_dir / get_output_filename(input_path)
                 path_map[input_path] = output_file
         
-        return path_map                
+        return path_map
+    # def generate_output_mapping(self, input_paths: List[Path], 
+    #                          output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
+    #     """        
+    #     生成输入输出路径映射（支持文件和文件夹输入）
+        
+    #     参数:
+    #         input_paths: 输入路径列表（可以是文件或文件夹）
+    #         output_paths: 可选输出路径列表
+            
+    #     返回:
+    #         输入路径到输出路径的映射字典
+        
+    #     """
+        
+    #     path_map = OrderedDict()
+
+    #     # 展开所有输入路径（处理文件夹情况）
+    #     expanded_inputs = []
+    #     for path in input_paths:
+    #         if path.is_file():
+    #             expanded_inputs.append(path)
+    #         elif path.is_dir():
+    #             # 收集文件夹下所有文件（不递归）
+    #             expanded_inputs.extend([f for f in path.iterdir() if f.is_file()])
+    #         else:
+    #             raise ValueError(f"路径既不是文件也不是文件夹: {path}")
+
+
+    #     if output_paths is None:
+    #         for path in expanded_inputs:
+    #             output_file = path.with_name(f"{path.stem}.fanse3")
+    #             path_map[path] = output_file
+
+    #     # 2. 指定单个输出路径
+    #     elif len(output_paths) == 1:
+    #         output_dir = self._normalize_path(output_paths[0])
+    #         output_dir.mkdir(parents=True, exist_ok=True)
+    #         for path in expanded_inputs:
+    #             output_file = output_dir / f"{path.stem}.fanse3"
+    #             path_map[path] = output_file
+        
+    #     # 3. 多个输出路径（必须与输入数量匹配）
+    #     else:
+    #         if len(expanded_inputs) != len(output_paths):
+    #             raise ValueError(f"输入路径({len(expanded_inputs)})和输出路径({len(output_paths)})数量不匹配")
+            
+    #         for input_path, output_dir in zip(expanded_inputs, output_paths):
+    #             output_dir = self._normalize_path(output_dir)
+    #             output_dir.mkdir(parents=True, exist_ok=True)
+    #             output_file = output_dir / f"{input_path.stem}.fanse3"
+    #             path_map[input_path] = output_file
+        
+    #     return path_map                
 
 
 
@@ -546,16 +649,28 @@ class FanseRunner:
         # 开始处理
         start_time = time.time() 
         
-        for i, (input_file, output_file) in enumerate(file_map.items(), 1):
+        for i, (original_input_file, output_file) in enumerate(file_map.items(), 1):
             # 构建命令
+
+
+            temp_file = None
+            
+            try:
+                # 处理可能的gzipped输入
+                input_file, temp_file = self._handle_gzipped_input(original_input_file)
+            except:
+                input_file = original_input_file  #如果检测不是gzfile，则还是input_file   (*.fastq)
+                
             cmd = self.build_command(input_file, output_file, refseq, final_params, final_options)
- 
+
                 # 准备任务信息
             task_info = f"""
                         {'='*48}
                         任务 {i}/{total}: {input_file.name}
                         {'='*48}
-                        输入文件: {input_file}
+                        原始输入文件: {original_input_file}
+                        {'临时文件: ' + str(temp_file) if temp_file else 'None'}
+                        # 实际输入文件: {input_file}
                         输出文件: {output_file}
                         参考序列: {refseq}
                         参数: {final_params}
@@ -563,11 +678,14 @@ class FanseRunner:
                         命令: {cmd}
                         {'-'*48}
                         """
+                        
             # 显示任务信息（调试模式下简化输出）
             if not debug:
                 # self.logger.info(task_info)
                 self._print_task_info(task_info)  # 专门处理控制台打印
                 # self.logger.info(task_info)       # 同时记录到日志
+                if temp_file:
+                    self.logger.info(f"临时文件将在完成后删除: {temp_file}")
             else:
                 print(task_info)  # 正常模式直接打印到控制台
 
@@ -645,19 +763,48 @@ class FanseRunner:
             except Exception as e:
                 failed.append(input_file.name)
                 self.logger.error(f"  处理异常: {str(e)}")
+            finally:
+                # 清理临时文件（如果创建了）
+                if temp_file and temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                        self.logger.info(f"已清理临时文件: {temp_file}")
+                    except Exception as e:
+                        self.logger.error(f"清理临时文件失败: {temp_file} - {str(e)}")
+                        
+                
         # 汇总统计（美化显示）
         total_elapsed = time.time() - start_time
         summary = f"\n{'='*50}\n处理完成: {success} 成功, {len(failed)} 失败\n总耗时: {total_elapsed:.2f}秒\n"
         
         self.logger.info(summary)
-        # print(f"\033[1;36m{summary}\033[0m")  # 青色加粗标题
+        if HAS_COLORAMA:
+            print(Fore.CYAN + summary + Style.RESET_ALL)
+        else:
+            print(summary)
         
         if failed:
             self.logger.info("失败文件列表:")
-            print("\033[31m失败文件列表:\033[0m")  # 红色标题
+            if HAS_COLORAMA:
+                print(Fore.RED + "失败文件列表:" + Style.RESET_ALL)
+            else:
+                print("失败文件列表:")
             for name in failed:
                 self.logger.info(f"  - {name}")
-                print(f"\033[31m  - {name}\033[0m")
+                if HAS_COLORAMA:
+                    print(Fore.RED + f"  - {name}" + Style.RESET_ALL)
+                else:
+                    print(f"  - {name}")
+        
+        # self.logger.info(summary)
+        # # print(f"\033[1;36m{summary}\033[0m")  # 青色加粗标题
+        
+        # if failed:
+        #     self.logger.info("失败文件列表:")
+        #     print("\033[31m失败文件列表:\033[0m")  # 红色标题
+        #     for name in failed:
+        #         self.logger.info(f"  - {name}")
+        #         print(f"\033[31m  - {name}\033[0m")
                 
         # # 汇总统计
         # total_elapsed = time.time() - start_time
@@ -880,31 +1027,6 @@ def add_run_subparser(subparsers):
     parser.set_defaults(func=run_command)
 
 
-def run_command(args):
-    """处理命令行参数（大小写不敏感）"""
-    # 1. 合并所有参数到标准字典
-    params = {}
-    
-    # 收集大小写不敏感的参数
-    if hasattr(args, 'case_insensitive_params'):
-        for key, value in args.case_insensitive_params.items():
-            # 提取参数名 (如 'f' 或 'l')
-            param_name = key.split('_')[-1].lower()
-            params[param_name] = value
-    
-    # 2. 处理路径参数
-    config = {
-        'input': args.INPUT,
-        'refseq': args.REFSEQ,
-        'output': args.OUTPUT,
-        'set_path': args.set_path
-    }
-    
-    # 3. 返回统一格式的参数
-    return {
-        'config': config,
-        'params': params
-    }
 
 def run_command(args):
     
@@ -937,7 +1059,7 @@ def run_command(args):
         runner.logger.info(f"使用FANSe路径: {fanse_path}")
             
         
-        # 检查是否提供了至少够运行的运行参数
+        # 检查是否提供了够运行的最少运行参数
         if not args.input or not args.refseq:
             runner.logger.error("需至少提供 -i/--input 和 -r/--refseq 参数")
             sys.exit(1)
@@ -979,7 +1101,7 @@ def run_command(args):
                 ('H', args.H),
                 ('C', args.C),
                 ('T', args.T),
-                ('I', args.I),
+                # ('I', args.I),
             ] if value is not None
         }
         
