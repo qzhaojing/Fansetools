@@ -8,8 +8,8 @@ v0.1
 Jinan University
 """
 
-import os
-from typing import Generator,  Optional, Dict, Tuple, Iterator, Set
+# import os
+from typing import Generator,  Optional, Dict  # ,# Tuple, Iterator, Set
 from .parser import FANSeRecord, fanse_parser
 import gzip
 
@@ -289,16 +289,21 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None):
         for record in fanse_parser(fanse_file):
             for sam_line in fanse_to_sam_type(record):
                 print(sam_line)
+
+
 def add_sam_subparser(subparsers):
     sam_parser = subparsers.add_parser(
         'sam',
         help='转换为 SAM 格式',
         description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式'
     )
-    sam_parser.add_argument('-i','--input', dest='input_file', required=True, help='输入文件路径（FANSe3 格式）')
-    sam_parser.add_argument('-r','--fasta' , dest='fasta_file', required=True, help='参考基因组 FASTA 文件路径')
+    sam_parser.add_argument(
+        '-i', '--input', dest='input_file', required=True, help='输入文件路径（FANSe3 格式）')
+    sam_parser.add_argument(
+        '-r', '--fasta', dest='fasta_file', required=True, help='参考基因组 FASTA 文件路径')
     sam_parser.add_argument('-o', '--output', help='输出文件路径（默认：打印到终端）')
-    
+
+
 # 使用示例
 if __name__ == "__main__":
     # 测试数据

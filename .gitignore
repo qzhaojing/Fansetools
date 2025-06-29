@@ -1,4 +1,32 @@
-"__pycache__/" 
-"*.egg-info" 
-"build/" 
-"dist/" 
+# Python
+__pycache__/
+src/fansetools/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+venv/
+.env/
+.python-version
+
+# Windows
+Thumbs.db
+Desktop.ini
+[Dd]esktop.ini
+*.lnk
+~$*
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing/Debugging
+*.log
+*.tmp
+*.bak
+.pytest_cache/
+.coverage
+htmlcov/

@@ -11,6 +11,7 @@ setup(
         ],
     },
     install_requires=[
+        tqdm,   #进度条
         # 你的依赖项
     ],
 )

@@ -5,12 +5,12 @@ Created on Wed Jun 18 11:06:35 2025
 @author: Administrator
 """
 import re
-import os
+# import os
 from dataclasses import dataclass
-# from typing import List, Generator
-from typing import List, Generator, Deque
-from collections import deque
-from tqdm import tqdm
+from typing import List, Generator
+# from typing import List, Generator, Deque
+# from collections import deque
+# from tqdm import tqdm
 
 
 @dataclass
@@ -107,14 +107,15 @@ class UnmappedRecord:
     """存储未比对reads的类"""
     read_id: str
     sequence: str
-    
+
+
 def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
     """
     解析未比对reads文件
-    
+
     参数:
         file_path: 输入文件路径（制表符分隔的read_id和序列）
-    
+
     返回:
         生成器，每次yield一个UnmappedRecord对象
     """
@@ -123,91 +124,12 @@ def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
             line = line.strip()
             if not line:  # 跳过空行
                 continue
-                
+
             parts = line.split('\t')
             if len(parts) < 2:
                 raise ValueError(f"Invalid unmapped record format: {line}")
-            
+
             yield UnmappedRecord(read_id=parts[0], sequence=parts[1])
-
-
-
-# def fanse_parser(file_path: str, buffer_size: int = 100*1024*1024) -> Generator[FANSeRecord, None, None]:
-#     """
-#     带缓冲的高性能FANSe3解析器
-
-#     参数:
-#         file_path: 输入文件路径
-#         buffer_size: 缓冲区大小(字节)
-
-#     返回:
-#         生成器，每次yield一个FANSeRecord对象
-#     """
-#     buffer: Deque[str] = deque()
-#     incomplete_line = ""
-#     count = 0
-#     with open(file_path, 'r') as f:
-#         while True:
-#             # 填充缓冲区
-#             chunk = f.read(buffer_size)
-#             if not chunk and not buffer:
-#                 break
-
-#             # 处理换行符可能被截断的情况
-#             lines = chunk.split('\n')
-#             if incomplete_line:
-#                 lines[0] = incomplete_line + lines[0]
-#                 incomplete_line = ""
-
-#             if chunk and chunk[-1] != '\n':
-#                 incomplete_line = lines.pop()
-#             buffer.extend(lines)
-#             count += 1
-#             print("Block {}".format(count), buffer_size)
-
-#             # 处理缓冲区中的记录
-#             while len(buffer) >= 2:
-#                 line1 = buffer.popleft().strip()
-#                 line2 = buffer.popleft().strip()
-
-#                 if not line1 or not line2:
-#                     continue
-
-#                 # 解析第一行
-#                 fields1 = re.split(r'\t+', line1)
-#                 if len(fields1) < 2:
-#                     raise ValueError(f"无效的第一行格式: {line1}")
-
-#                 # 解析第二行
-#                 fields2 = re.split(r'\t+', line2)
-#                 if len(fields2) < 5:
-#                     raise ValueError(f"无效的第二行格式: {line2}")
-
-#                 # 处理多值字段
-#                 strands = fields2[0].split(',')
-#                 ref_names = fields2[1].split(',')
-#                 mismatches = list(map(int, fields2[2].split(',')))
-#                 positions = list(map(int, fields2[3].split(',')))
-#                 multi_count = int(fields2[4])
-
-#                 # 字段对齐
-#                 max_len = max(len(ref_names), len(strands),
-#                               len(mismatches), len(positions))
-#                 strands += [''] * (max_len - len(strands))
-#                 mismatches += [0] * (max_len - len(mismatches))
-#                 positions += [0] * (max_len - len(positions))
-
-#                 yield FANSeRecord(
-#                     header=fields1[0],
-#                     seq=fields1[1],
-#                     alignment=fields1[2].split(
-#                         ',') if len(fields1) > 2 else '',
-#                     strands=strands,
-#                     ref_names=ref_names,
-#                     mismatches=mismatches,
-#                     positions=positions,
-#                     multi_count=multi_count
-#                 )
 
 
 if __name__ == "__main__":
