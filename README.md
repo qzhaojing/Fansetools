@@ -27,36 +27,36 @@ For detailed information on the FANSe3 output format, please see:
 ## Installation
 
 1. **Clone the repository:**
-   ```bash
+   ```
    git clone https://github.com/qzhaojing/Fansetools.git
    ```
 
 2. **Enter the directory:**
-   ```bash
+   ```
    cd Fansetools
    ```
 
 3. **Install the package:**
-   ```bash
+   ```
    python setup.py install
    ```
 
 On windows, recommand install as follows:
 ```bash
 pip install git+https://github.com/qzhaojing/Fansetools.git
-
-or 
+```
+or
 ```
 git install https://github.com/qzhaojing/Fansetools/archive/refs/tags/v1.0.0.tar.gz
-
 ```
 
-#if you don't have git , first install it,you can use:
-conda install git
 
-```
 
 After installation, you can invoke `fansetools` directly from the command line.
+Now type fanse to start your analysis.
+```
+fanse
+```
 
 ---
 
@@ -71,16 +71,25 @@ fanse [subcommand] -h
 fanse run -h
 
 - **FANSe3 run as single file or batch run**
+if you want to align fastq to ref, first you should use 'fanse run --set-path /path or /path/fanse.exe' to assign the position of fanse3 exe file.
 ```
-fanse run -i sample.fastq -r sample.fasta    +fanse参数
-fanse run -i sample.fastq -r sample.fasta -o c:\sample    +fanse参数 
-fanse run -i sample.fastq -r sample.fasta       +fanse参数    [ -E5  -H1  -S8  --all等所有fanse3所带参数均可附加]
+fanse run -i sample.fastq(or *.fq,*.fq.gz,*.fastq.gz) -r ref.fasta    +fanse参数
+fanse run -i sample.fastq(or *.fq,*.fq.gz,*.fastq.gz) -r ref.fasta -o c:\sample    +fanse参数 
+fanse run -i sample.fastq(or *.fq,*.fq.gz,*.fastq.gz) -r ref.fasta      [ -E5  -H1  -S8  --all等所有fanse3所带参数均可附加]
+```
+Batch run,  you need not any change in command line, just pass the folder to the '-i' , and make sure the folder contain *.fastq or *.fq,*.fq.gz,*.fastq.gz in it. Multi folders or files are also supported.
+```
+fanse run -i /path1 -r ref.fasta -o c:\sample    +fanse参数
+
+#Multi folder
+fanse run -i /path1,/path2,/path3 -r ref.fasta -o c:\sample    +fanse参数
 ```
 参数- 断点续跑
 - 当由于文件原因或服务器死机等原因导致失败，可以参考日志删去最后一组不完整的文件。然后重新运行命令，加上这个参数。
 自动识别文件夹中已经存在的结果文件跳过，找到没有结果生成的fastq文件继续跑。省去重复跑或者编写命令的烦恼。
 
 - 想办法实现fanse3读取gz, fq.gz等格式，避免解压缩的繁复操作，且节省空间。可以探索fanse3能否接受标准输入，那么就可以通过python gzip模块解压缩gz，然后传给fanse3,进行比对了
+
 ### Format Conversions
 
 - **FANSe3 to SAM:**
@@ -92,7 +101,7 @@ usage: fanse sam [-h] -i INPUT_FILE -r FASTA_FILE [-o OUTPUT]
   ```
   > **Note:** Ensure your FANSe3 output is generated with the `--alignment` option enabled.
 
-- **FANSe3 to BAM:**
+- **FANSe3 to BAM:**  need samtools
   - Single-end:
     ```bash
     fanse2bam -s input.fanse3 -o out.bam
@@ -126,6 +135,9 @@ usage: fanse bed [-h] -i INPUT [-o OUTPUT] [-n MAX_READS] [-p PATTERN]
   ```
 
 ### Read Counting
+需要考虑的几个点
+1. 转录本水平 counts
+2. 基因水平 counts
 
 - **Count reads per gene or transcript:**
   ```bash
@@ -139,7 +151,7 @@ usage: fanse bed [-h] -i INPUT [-o OUTPUT] [-n MAX_READS] [-p PATTERN]
 
 - **Calculate RPKM from count file:**
   ```bash
-  fanse2rpkm -i counts.txt -r reference.fasta -o rpkm.txt
+  fanse2rpkm -i counts.txt -r reference.fasta/-gxf *.gtf/gff -o rpkm.txt
   # Options:
   #   --gene_level
   #   --transcript_level
