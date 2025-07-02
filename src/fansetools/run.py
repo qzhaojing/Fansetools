@@ -23,16 +23,6 @@ except ImportError:
     if not HAS_COLORAMA:
         print("提示: 安装 colorama 可获得更好的彩色输出体验 (pip install colorama)")
 # 在命令行添加 --debug 参数即可启用验证模式：
-# class PathStatus(Enum):
-#     VALID = 0
-#     NOT_EXIST = 1   # 致命错误
-#     INVALID_TYPE = 2 # 致命错误
-#     LONG_PATH = 3   # 警告
-#     UNWRITABLE = 4  # 警告
-
-# 配置系统 - 自定义键值对  格式
-
-# %   %  
 
 
 class ConfigManager:
@@ -419,7 +409,6 @@ class FanseRunner:
                 if file.is_file() and file not in file_list:
                     file_list.append(file)
 
-    # def _handle_gzipped_input(self, input_file: Path, temp_dir: Optional[Path] = None) -> Tuple[Path, Optional[Path]]:
     def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
         """处理gzipped输入文件，返回实际输入文件路径和临时文件（如果有）
 
@@ -468,32 +457,6 @@ class FanseRunner:
         except Exception as e:
             self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
             raise
-
-    # def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
-    #     """处理gzipped输入文件，返回实际输入文件路径和临时文件（如果有）"""
-    #     # 检查是否是需要解压的gzip文件
-    #     if input_file.suffix != '.gz' and not (len(input_file.suffixes) > 1 and input_file.suffixes[-1] == '.gz'):
-    #         return input_file, None
-
-    #     try:
-    #         # 创建临时文件（不自动删除）
-    #         temp_file = Path(tempfile.NamedTemporaryFile(
-    #             prefix=f"{input_file.stem}_",
-    #             suffix=".fastq",
-    #             delete=False
-    #         ).name)
-
-    #         # 解压gz文件到临时文件
-    #         self.logger.info(f"解压文件: {input_file} -> {temp_file}")
-    #         with gzip.open(input_file, 'rb') as f_in:
-    #             with open(temp_file, 'wb') as f_out:
-    #                 shutil.copyfileobj(f_in, f_out)
-
-    #         return temp_file, temp_file
-
-    #     except Exception as e:
-    #         self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
-    #         raise
 
     def generate_output_mapping(self, input_paths: List[Path],
                                 output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
@@ -571,58 +534,6 @@ class FanseRunner:
                 path_map[input_path] = output_file
 
         return path_map
-    # def generate_output_mapping(self, input_paths: List[Path],
-    #                          output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
-    #     """
-    #     生成输入输出路径映射（支持文件和文件夹输入）
-
-    #     参数:
-    #         input_paths: 输入路径列表（可以是文件或文件夹）
-    #         output_paths: 可选输出路径列表
-
-    #     返回:
-    #         输入路径到输出路径的映射字典
-
-    #     """
-
-    #     path_map = OrderedDict()
-
-    #     # 展开所有输入路径（处理文件夹情况）
-    #     expanded_inputs = []
-    #     for path in input_paths:
-    #         if path.is_file():
-    #             expanded_inputs.append(path)
-    #         elif path.is_dir():
-    #             # 收集文件夹下所有文件（不递归）
-    #             expanded_inputs.extend([f for f in path.iterdir() if f.is_file()])
-    #         else:
-    #             raise ValueError(f"路径既不是文件也不是文件夹: {path}")
-
-    #     if output_paths is None:
-    #         for path in expanded_inputs:
-    #             output_file = path.with_name(f"{path.stem}.fanse3")
-    #             path_map[path] = output_file
-
-    #     # 2. 指定单个输出路径
-    #     elif len(output_paths) == 1:
-    #         output_dir = self._normalize_path(output_paths[0])
-    #         output_dir.mkdir(parents=True, exist_ok=True)
-    #         for path in expanded_inputs:
-    #             output_file = output_dir / f"{path.stem}.fanse3"
-    #             path_map[path] = output_file
-
-    #     # 3. 多个输出路径（必须与输入数量匹配）
-    #     else:
-    #         if len(expanded_inputs) != len(output_paths):
-    #             raise ValueError(f"输入路径({len(expanded_inputs)})和输出路径({len(output_paths)})数量不匹配")
-
-    #         for input_path, output_dir in zip(expanded_inputs, output_paths):
-    #             output_dir = self._normalize_path(output_dir)
-    #             output_dir.mkdir(parents=True, exist_ok=True)
-    #             output_file = output_dir / f"{input_path.stem}.fanse3"
-    #             path_map[input_path] = output_file
-
-    #     return path_map
 
 
 # =============================================================================
@@ -743,6 +654,7 @@ class FanseRunner:
         self.logger.info("\n" + "="*50)
         self.logger.info("FANSe3 运行配置:")
         self.logger.info(f"  参考序列: {refseq}")
+        # self.logger.info(f"  输入文件夹: {len(file_map)} 个")
         self.logger.info(f"  输入文件: {len(file_map)} 个")
         self.logger.info(f"  参数: {final_params}")
         self.logger.info(f"  选项: {final_options}")
@@ -755,11 +667,15 @@ class FanseRunner:
 
         # 执行模式控制
         run_mode = "confirm"  # 默认：每个命令前需要确认
-        print("\n执行模式：")
-        print(" - 默认模式下'y'会一次性运行所有检测到的fq任务")
-        print(" - 输入 'a' 可切换为单条执行所有剩余任务\n")
-        # 新增调试模式检查
-        # debug = getattr(self, 'debug', False)  # 检查是否启用--debug
+        print("\n执行模式说明：")
+        print(" - [y] 执行当前任务并继续")
+        print(" - [a] 执行当前任务并切换到自动模式（执行所有剩余任务）")
+        print(" - [n] 跳过当前任务，继续下一个")
+        print(" - [q] 退出整个批处理")
+
+        if debug:
+            current_mode = "auto"
+            self.logger.info("调试模式激活，进入自动执行模式")
 
         # 开始处理
         start_time = time.time()
@@ -769,38 +685,44 @@ class FanseRunner:
 
                 temp_file = None
 
-                try:
-                    # 处理可能的gzipped输入
-                    input_file, temp_file = self._handle_gzipped_input(
-                        original_input_file)
-                except:
-                    # 如果检测不是gzfile，则还是input_file   (*.fastq)
-                    input_file = original_input_file
+                # try:
+                #     # 处理可能的gzipped输入
+                #     input_file, temp_file = self._handle_gzipped_input(
+                #         original_input_file)
+                # except:
+                #     # 如果检测不是gzfile，则还是input_file   (*.fastq)
+                #     input_file = original_input_file
 
-                cmd = self.build_command(
-                    input_file, output_file, refseq, final_params, final_options)
+                # cmd = self.build_command(
+                #     original_input_file, output_file, refseq, final_params, final_options)
 
                 # 准备任务信息
                 task_info = f"""
                             {'='*48}
-                            任务 {i}/{total}: {input_file.name}
+                            任务 {i}/{total}: {original_input_file.name}
                             {'='*48}
                             原始输入文件: {original_input_file}
-                            {'临时文件: ' + str(temp_file) if temp_file else 'None'}
-                            # 实际输入文件: {input_file}
                             输出文件: {output_file}
                             参考序列: {refseq}
                             参数: {final_params}
                             选项: {final_options}
-                            命令: {cmd}
                             {'-'*48}
                             """
+                # 命令: {cmd}
+                # {'临时文件: ' + str(temp_file) if temp_file else 'None'}
+                # 实际输入文件: {input_file}
 
                 # 显示任务信息（调试模式下简化输出）
                 if not debug:
                     # self.logger.info(task_info)
                     self._print_task_info(task_info)  # 专门处理控制台打印
                     # self.logger.info(task_info)       # 同时记录到日志
+                    if temp_file and temp_file.exists():
+                        try:
+                            temp_file.unlink()
+                            self.logger.info(f"已清理临时文件: {temp_file}")
+                        except:
+                            pass
                     if temp_file:
                         self.logger.info(f"临时文件将在完成后删除: {temp_file}")
                 else:
@@ -813,7 +735,7 @@ class FanseRunner:
 
                     # 统一调用验证方法
                     for path, name, check_type in [
-                        (input_file, "输入文件", {"is_file": True}),
+                        (original_input_file, "输入文件", {"is_file": True}),
                         (refseq, "参考序列", {"is_file": True}),
                         # (output_file, "输出文件", {"is_file": True})
                     ]:
@@ -832,24 +754,72 @@ class FanseRunner:
 
                 # =============== 调试逻辑结束 ===============
 
-                # 执行确认（在DEBUG模式下跳过）
-                if run_mode == "confirm" and not self.logger.isEnabledFor(logging.DEBUG):
+                # 模式处理逻辑（在非调试模式下）
+                user_action = None
+                if run_mode == "confirm":
+                    # 只有在确认模式下才需要用户输入
+                    response = ""
+                    while response not in ['y', 'a', 'n', 'q']:
+                        response = input(
+                            "请选择操作 [y]自动执行所有/[a]执行本条/[n]跳过本条/[q]退出: ").strip().lower()
+                        user_action = response
 
-                    # 修改后的交互选项
-                    response = input(
-                        "是否执行此任务? [y]全部执行, [a]执行单条, [n]跳过单条, [q]退出: ").strip().lower()
-
-                    if response == 'q':
-                        self.logger.info("用户选择退出程序")
-                        break
-                    elif response == 'n':
-                        self.logger.info("用户选择跳过此任务")
-                        continue
+                    # 处理用户响应
+                    if user_action == 'y':
+                        self.logger.info("切换到自动模式，执行所有剩余任务")
+                        run_mode = "auto"
                     elif response == 'a':
                         self.logger.info("用户选择执行此单条任务")
-                    elif response == 'y':
-                        run_mode = "auto"
-                        self.logger.info("用户选择全部执行所有任务")
+                    elif user_action == 'q':
+                        self.logger.info("用户选择退出批处理")
+                        break
+                    elif user_action == 'n':
+                        self.logger.info(f"跳过任务: {original_input_file.name}")
+                        continue
+
+                # 只有在需要执行任务时才处理文件
+                if user_action in (None, 'y', 'a'):
+                    try:
+                        # 处理可能的gzipped输入
+                        input_file, temp_file = self._handle_gzipped_input(
+                            original_input_file)
+                    except Exception as e:
+                        self.logger.error(f"文件处理失败: {str(e)}")
+                        failed.append(original_input_file.name)
+                        continue
+
+                    # 构建命令
+                    cmd = self.build_command(
+                        input_file, output_file, refseq,
+                        final_params, final_options
+                    )
+
+                    # 显示完整命令信息
+                    cmd_info = f"命令: {cmd}"
+                    self.logger.info(cmd_info)
+                    if HAS_COLORAMA:
+                        print(Fore.YELLOW + cmd_info + Style.RESET_ALL)
+                    else:
+                        print(cmd_info)
+
+                # # 执行确认（在DEBUG模式下跳过）
+                # if run_mode == "confirm" and not self.logger.isEnabledFor(logging.DEBUG):
+
+                #     # 修改后的交互选项
+                #     response = input(
+                #         "是否执行此任务? [y]全部执行, [a]执行单条, [n]跳过单条, [q]退出: ").strip().lower()
+
+                #     if response == 'q':
+                #         self.logger.info("用户选择退出程序")
+                #         break
+                #     elif response == 'n':
+                #         self.logger.info("用户选择跳过此任务")
+                #         continue
+                #     elif response == 'a':
+                #         self.logger.info("用户选择执行此单条任务")
+                #     elif response == 'y':
+                #         run_mode = "auto"
+                #         self.logger.info("用户选择全部执行所有任务")
 
                 # # # 执行前路径诊断
                 # self.log_path_diagnostics("输入文件", input_file)
@@ -914,111 +884,6 @@ class FanseRunner:
                     print(Fore.RED + f"  - {name}" + Style.RESET_ALL)
                 else:
                     print(f"  - {name}")
-
-        # self.logger.info(summary)
-        # # print(f"\033[1;36m{summary}\033[0m")  # 青色加粗标题
-
-        # if failed:
-        #     self.logger.info("失败文件列表:")
-        #     print("\033[31m失败文件列表:\033[0m")  # 红色标题
-        #     for name in failed:
-        #         self.logger.info(f"  - {name}")
-        #         print(f"\033[31m  - {name}\033[0m")
-
-        # # 汇总统计
-        # total_elapsed = time.time() - start_time
-        # self.logger.info("\n" + "="*50)
-        # self.logger.info(f"处理完成: {success} 成功, {len(failed)} 失败")
-        # self.logger.info(f"总耗时: {total_elapsed:.2f}秒")
-        # if failed:
-        #     self.logger.info("失败文件列表:")
-        #     for name in failed:
-        #         self.logger.info(f"  - {name}")
-
-
-# =============================================================================
-# #未实现，配置参数格式，使之忽略大小写，-i，-I，-e，-E，--indel，--INDEL等通用
-# =============================================================================
-# class CaseInsensitiveDictAction(argparse.Action):
-#     """自定义 action 实现大小写不敏感的参数存储"""
-#     def __call__(self, parser, namespace, values, option_string=None):
-#         # 获取参数名（转换为小写作为键）
-#         key = self.dest.lower()
-
-#         # 创建大小写不敏感的字典（如果还不存在）
-#         if not hasattr(namespace, 'case_insensitive_params'):
-#             setattr(namespace, 'case_insensitive_params', defaultdict(dict))
-
-#         # 存储参数值（原始大小写形式）
-#         namespace.case_insensitive_params[key] = values
-
-# def create_case_insensitive_parser():
-#     """创建大小写不敏感的参数解析器"""
-#     parser = argparse.ArgumentParser(
-#         description='FANSe3 CLI Tool',
-#         formatter_class=argparse.RawTextHelpFormatter
-#     )
-
-#     # 路径配置
-#     parser.add_argument(
-#         '--set-path',
-#         metavar='PATH',
-#         help='配置FANSe可执行文件路径 (文件或目录)'
-#     )
-
-#     # 必需参数
-#     parser.add_argument(
-#         '-i', '--input',
-#         dest='INPUT',  # 指定标准化的目标属性名
-#         required=False,
-#         help='输入文件/目录 (支持通配符，多个用逗号分隔)'
-#     )
-#     parser.add_argument(
-#         '-r', '--refseq',
-#         dest='REFSEQ',  # 指定标准化的目标属性名
-#         required=False,
-#         help='参考序列文件路径'
-#     )
-
-#     # 可选参数
-#     parser.add_argument(
-#         '-o', '--output',
-#         dest='OUTPUT',  # 指定标准化的目标属性名
-#         help='输出目录'
-#     )
-
-#     # 使用自定义 action 实现大小写不敏感的参数
-#     for opt in ['O', 'L', 'E', 'S', 'H', 'C', 'T', 'I']:
-#         parser.add_argument(
-#             f'-{opt}',
-#             action=CaseInsensitiveDictAction,
-#             dest=f'FANSe_PARAM_{opt}',
-#             type=str if opt == 'T' or opt == 'E' else int,
-#             metavar='VALUE' if opt != 'T' else 'SPEC',
-#             help=f'{opt} 参数的值'  # 实际帮助文本在下面统一设置
-#         )
-
-#     # 单独设置帮助文本（避免重复）
-#     param_help = {
-#         'O': '结果文件夹 (默认: fastq所在文件夹)',
-#         'L': '最大读长 (默认: 1000)',
-#         'E': '错误数量 (默认: 3)',
-#         'S': 'Seed长度 (默认: 13)',
-#         'H': '每批次读取reads数(百万) (默认: 1)',
-#         'C': '并行核数 (默认: CPU核数-2)',
-#         'T': 'START,LENGTH (默认: 0,150)',
-#         'I': '不开启0,开启1(默认: 0)'
-#     }
-
-#     # 更新参数的帮助文本
-#     for action in parser._actions:
-#         if action.dest.startswith('FANSe_PARAM_'):
-#             opt = action.dest.split('_')[-1]
-#             action.help = param_help.get(opt, '')
-
-#     # 其他选项...
-
-#     return parser
 
 
 # 命令行接口
