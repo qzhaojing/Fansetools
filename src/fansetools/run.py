@@ -225,8 +225,6 @@ class FanseRunner:
         self.logger = logging.getLogger('fanse.run')
         self.logger.setLevel(logging.INFO)
 
-        # # 创建日志格式
-        # formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         # 创建日志格式 - 时间到秒（无毫秒）
         formatter = logging.Formatter(
             fmt='%(asctime)s - %(levelname)s - %(message)s',
@@ -540,6 +538,7 @@ class FanseRunner:
 # Start to integrate the paras  to single cmd
 # =============================================================================
 
+
     def build_command(self, input_file: Path, output_file: Path,
                       refseq: Path, params: Dict[str, Union[int, str]],
                       options: List[str]) -> str:
@@ -640,6 +639,8 @@ class FanseRunner:
                   params: Optional[Dict[str, Union[int, str]]] = None,
                   options: Optional[List[str]] = None,
                   debug: bool = False,
+                  yes: bool = False,  # 新增-y选项
+                  resume: bool = False  # 新增-r选项
                   ):
         """批量运行FANSe3（添加执行确认选项）"""
         # 合并参数和选项
@@ -665,16 +666,36 @@ class FanseRunner:
         success = 0
         failed = []
 
+        # 统计处理进度
+        total = len(file_map)
+        success = 0
+        skipped = 0  # 新增：记录跳过的任务数
+        failed = []
+
         # 执行模式控制
-        run_mode = "confirm"  # 默认：每个命令前需要确认
+        run_mode = "confirm" if not yes else "auto"  # 如果指定了-y，则自动进入自动模式
+
         print("\n执行模式说明：")
         print(" - [y] 执行当前任务并继续")
         print(" - [a] 执行当前任务并切换到自动模式（执行所有剩余任务）")
         print(" - [n] 跳过当前任务，继续下一个")
         print(" - [q] 退出整个批处理")
 
+        # 如果指定了--resume选项，则过滤掉已存在的输出文件
+        if resume:
+            filtered_map = OrderedDict()
+            for input_path, output_path in file_map.items():
+                if output_path.exists():
+                    self.logger.info(f"跳过已存在输出文件: {output_path}")
+                    skipped += 1
+                else:
+                    filtered_map[input_path] = output_path
+            file_map = filtered_map
+            total = len(file_map)
+            self.logger.info(f"断点续运行模式: 跳过 {skipped} 个已完成任务，剩余 {total} 个任务")
+
         if debug:
-            current_mode = "auto"
+            run_mode = "auto"
             self.logger.info("调试模式激活，进入自动执行模式")
 
         # 开始处理
@@ -802,30 +823,6 @@ class FanseRunner:
                     else:
                         print(cmd_info)
 
-                # # 执行确认（在DEBUG模式下跳过）
-                # if run_mode == "confirm" and not self.logger.isEnabledFor(logging.DEBUG):
-
-                #     # 修改后的交互选项
-                #     response = input(
-                #         "是否执行此任务? [y]全部执行, [a]执行单条, [n]跳过单条, [q]退出: ").strip().lower()
-
-                #     if response == 'q':
-                #         self.logger.info("用户选择退出程序")
-                #         break
-                #     elif response == 'n':
-                #         self.logger.info("用户选择跳过此任务")
-                #         continue
-                #     elif response == 'a':
-                #         self.logger.info("用户选择执行此单条任务")
-                #     elif response == 'y':
-                #         run_mode = "auto"
-                #         self.logger.info("用户选择全部执行所有任务")
-
-                # # # 执行前路径诊断
-                # self.log_path_diagnostics("输入文件", input_file)
-                # self.log_path_diagnostics("输出目录", output_file)
-                # self.log_path_diagnostics("参考序列", refseq)
-
                 try:
                     # 执行命令
                     self.logger.info("开始执行命令...")
@@ -864,7 +861,10 @@ class FanseRunner:
 
         # 汇总统计（美化显示）
         total_elapsed = time.time() - start_time
-        summary = f"\n{'='*50}\n处理完成: {success} 成功, {len(failed)} 失败\n总耗时: {total_elapsed:.2f}秒\n"
+        if not resume:
+            summary = f"\n{'='*50}\n处理完成: {success} 成功, {len(failed)} 失败\n总耗时: {total_elapsed:.2f}秒\n"
+        elif resume:
+            summary = f"\n{'='*50}\n处理完成: {success} 成功, {len(failed)} 失败, {skipped} 跳过\n总耗时: {total_elapsed:.2f}秒\n"
 
         self.logger.info(summary)
         if HAS_COLORAMA:
@@ -1018,6 +1018,19 @@ def add_run_subparser(subparsers):
         help='启用indel比对'
     )
 
+    parser.add_argument(
+        '-y', '--yes',
+        action='store_true',
+        help='无需确认直接执行所有任务'
+    )
+
+    parser.add_argument(
+        '--resume',
+        dest='resume',
+        action='store_true',
+        help='断点续运行模式（跳过已存在的输出文件）'
+    )
+
     parser.set_defaults(func=run_command)
 
 
@@ -1127,7 +1140,9 @@ def run_command(args):
             refseq=Path(args.refseq),
             params=params,
             options=options,
-            debug=args.debug  # 添加debug参数
+            debug=args.debug,  # 添加debug参数
+            yes=args.yes,      # 传递-y选项
+            resume=args.resume  # 传递-c选项
         )
 
     except Exception as e:
