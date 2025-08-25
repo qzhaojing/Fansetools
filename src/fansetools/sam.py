@@ -8,10 +8,11 @@ v0.1
 Jinan University
 """
 
-# import os
+import os
 from typing import Generator,  Optional, Dict  # ,# Tuple, Iterator, Set
 from .parser import FANSeRecord, fanse_parser
 import gzip
+import sys
 
 
 def generate_cigar(alignment: str) -> str:
@@ -71,48 +72,92 @@ def generate_cigar(alignment: str) -> str:
     if current_op is not None:
         cigar.append(f"{count}{current_op}")
 
-    # # 验证长度一致性
-    # total_consumed = sum(
-    #     int(p[:-1]) for p in cigar
-    #     if p[-1] in ('M', 'I', 'X', 'S', '=', 'P')
-    # )
-
-    # # 长度修正逻辑
-    # if total_consumed != seq_len:
-    #     diff = seq_len - total_consumed
-    #     if diff > 0:
-    #         cigar.append(f"{diff}S")
-    #     else:
-    #         return f"{seq_len}M"
-
     return "".join(cigar)
 
 
-# # 测试用例
-# if __name__ == "__main__":
-#     test_cases = [
-#         ("..xx--AA..", 10, "2M2X2D2I2M"),  # 匹配+错配+缺失+插入
-#         ("...xx..", 7, "3M2X2M"),         # 常规比对
-#         ("NNN...NNN", 9, "3S3M3S"),       # soft-clip
-#         ("---...", 6, "3D3M"),            # 仅缺失
-#         ("ABC...XYZ", 9, "3I3M3S"),       # 复杂插入
-#     ]
+# def calculate_flag(strand: str, is_secondary: bool = False) -> int:
+#     """计算SAM FLAG值"""
+#     flag = 0
+#     if strand == 'R':
+#         flag |= 0x10  # 反向互补
+#     if is_secondary:
+#         flag |= 0x100  # 辅助比对
+#     return flag
+def calculate_flag(
+    strand: str,
+    is_paired: bool = True,
+    is_proper_pair: bool = True,
+    is_mapped: bool = True,
+    mate_mapped: bool = True,
+    is_read1: bool = False,
+    is_read2: bool = False,
+    is_secondary: bool = False,
+    is_qc_failed: bool = False,
+    is_duplicate: bool = False
+) -> int:
+    """
+    计算SAM FLAG值（基于SAM格式规范v1.6）
 
-#     for align, length, expected in test_cases:
-#         result = generate_cigar(align, length)
-#         print(f"测试: {align} (len={length})")
-#         print(f"生成: {result}")
-#         print(f"预期: {expected}")
-#         print("----")
+    参数说明：
+    strand:      链方向 - 'F'正向 / 'R'反向互补
+    is_paired:   是否为双端测序片段（默认True）
+    is_proper_pair: 是否满足双端比对条件（默认True）
+    is_mapped:   当前read是否比对成功（默认True）
+    mate_mapped: 配对比对是否成功（默认True）
+    is_read1:    是否为read1（双端中的第一条）
+    is_read2:    是否为read2（双端中的第二条）
+    is_secondary:是否为辅助比对（默认False）
+    is_qc_failed:未通过质量控制（默认False）
+    is_duplicate:是否为PCR重复序列（默认False）
 
-
-def calculate_flag(strand: str, is_secondary: bool = False) -> int:
-    """计算SAM FLAG值"""
+    返回：完整SAM FLAG值（按位组合）
+    """
     flag = 0
+
+    # 0x1 (1): 模板包含多个测序片段（双端测序）
+    if is_paired:
+        flag |= 0x1
+
+    # 0x2 (2): 所有片段均正确比对（仅当双端时有效）
+    if is_paired and is_proper_pair:
+        flag |= 0x2
+
+    # 0x4 (4): 当前片段未比对到参考序列
+    if not is_mapped:
+        flag |= 0x4
+
+    # 0x8 (8): 配对片段未比对到参考序列（仅当双端时有效）
+    if is_paired and not mate_mapped:
+        flag |= 0x8
+
+    # 0x10 (16): 当前片段为反向互补链
     if strand == 'R':
-        flag |= 0x10  # 反向互补
+        flag |= 0x10
+
+    # 0x20 (32): 配对片段为反向互补链（仅当双端时有效）
+    if is_paired and strand == 'F':  # 假设配对链方向相反
+        flag |= 0x20
+
+    # 0x40 (64): 第一条测序片段（read1）
+    if is_read1:
+        flag |= 0x40
+
+    # 0x80 (128): 第二条测序片段（read2）
+    if is_read2:
+        flag |= 0x80
+
+    # 0x100 (256): 辅助比对（非主要比对）
     if is_secondary:
-        flag |= 0x100  # 辅助比对
+        flag |= 0x100
+
+    # 0x200 (512): 未通过QC过滤
+    if is_qc_failed:
+        flag |= 0x200
+
+    # 0x400 (1024): PCR或光学重复
+    if is_duplicate:
+        flag |= 0x400
+
     return flag
 
 
@@ -283,12 +328,25 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None):
                 for sam_line in fanse_to_sam_type(record):
                     out_f.write(sam_line + "\n")
     else:
-        # 打印到标准输出
-        # print("@HD\tVN:1.6\tSO:unsorted")
-        print(header)
-        for record in fanse_parser(fanse_file):
-            for sam_line in fanse_to_sam_type(record):
-                print(sam_line)
+        # 修复管道输出兼容性
+        try:
+            # 尝试直接写入标准输出缓冲区
+            sys.stdout.buffer.write(header.encode())
+            for record in fanse_parser(fanse_file):
+                for sam_line in fanse_to_sam_type(record):
+                    sys.stdout.buffer.write((sam_line + "\n").encode())
+        except AttributeError:
+            # 回退方案：使用原始标准输出
+            sys.__stdout__.write(header)
+            for record in fanse_parser(fanse_file):
+                for sam_line in fanse_to_sam_type(record):
+                    sys.__stdout__.write(sam_line + "\n")
+
+
+def run_sam_command(args):
+    """Handle sam subcommand"""
+# def run_fanse2sam(args):
+    fanse2sam(args.fanse_file, args.fasta_path, args.output_sam)
 
 
 def add_sam_subparser(subparsers):
@@ -298,27 +356,29 @@ def add_sam_subparser(subparsers):
         description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式'
     )
     sam_parser.add_argument(
-        '-i', '--input', dest='input_file', required=True, help='输入文件路径（FANSe3 格式）')
+        '-i', '--input', dest='fanse_file', required=True, help='输入文件路径（FANSe3 格式）')
     sam_parser.add_argument(
-        '-r', '--fasta', dest='fasta_file', required=True, help='参考基因组 FASTA 文件路径')
-    sam_parser.add_argument('-o', '--output', help='输出文件路径（默认：打印到终端）')
+        '-r', '--fasta', dest='fasta_path', required=True, help='参考基因组 FASTA 文件路径')
+    sam_parser.add_argument(
+        '-o', '--output', dest='output_sam', help='输出文件路径（不指定输出位置，默认打印到终端）')
+    sam_parser.set_defaults(func=run_sam_command)
 
 
 # 使用示例
 if __name__ == "__main__":
     # 测试数据
-    import sys
+
     if len(sys.argv) < 2:
         print("Usage: python fanse2sam.py <input.fanse3> [output.sam]")
         sys.exit(1)
-
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
-    fanse2sam(sys.argv[1], output_file)
+    fasta_path = sys.argv[2]
+    output_file = sys.argv[3] if len(sys.argv) > 2 else None
+    fanse2sam(sys.argv[1], fasta_path, output_file)
 
 
 # ---------------------------------
     # fanse_file = r'G:\verysync_zhaojing\sample.fanse3'
-    # fasta_path = r'\\fsBACKUP\D\DATA\Zhaojing\Ref_seqs\EnsemblPlants-93-11\cdna\Oryza_indica.ASM465v1.cdna.all.fa'
-    # # fanse_file = r'G:\verysync_zhaojing\Python_pakages\fanse2sam\R1_2.fanse3'
-    # output_sam = r'G:\verysync_zhaojing\sample.sam'
+    fasta_path = r'\\fs2\D\DATA\Zhaojing\20250722-kbseq\PSM-ZM202507310003-0001\out_no_trimming\have_remain_files\fanse3_align\genomic16_merge.fasta'
+    fanse_file = r'\\fs2\D\DATA\Zhaojing\20250722-kbseq\PSM-ZM202507310003-0001\out_no_trimming\have_remain_files\fanse3_align\4.1.merge-polya.fanse3'
+    output_sam = r'\\fs2\D\DATA\Zhaojing\20250722-kbseq\PSM-ZM202507310003-0001\out_no_trimming\have_remain_files\fanse3_align\4.1.merge-polya.sam'
     # fanse2sam(fanse_file, fasta_path, output_sam)
