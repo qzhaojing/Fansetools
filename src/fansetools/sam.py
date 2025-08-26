@@ -15,12 +15,12 @@ import gzip
 import sys
 
 
-def generate_cigar(alignment: str) -> str:
+def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
     """
     参数:
         alignment: FANSe比对字符串
         seq_len: 序列实际长度
-
+        is_reverse: 是否为反向链比对
     返回:
         符合规范的CIGAR字符串
 
@@ -36,28 +36,32 @@ def generate_cigar(alignment: str) -> str:
     """
     # if not alignment or seq_len <= 0:
     #     return f"{seq_len}M"
-
+    
+    # 对于反向链，需要反转比对字符串
+    if is_reverse:
+        alignment = alignment[::-1]
+        
     cigar = []
     current_op = None
     count = 0
-    consumed_query = 0  # 已消耗的查询序列长度
+    # consumed_query = 0  # 已消耗的查询序列长度
 
     for char in alignment:
         # 确定操作类型
         if char == '.':
             op = 'M'
-            consumed_query += 1
+            # consumed_query += 1
         elif char == 'x':
             op = 'X'
-            consumed_query += 1
+            # consumed_query += 1
         elif char == '-':
             op = 'D'  # 不消耗查询序列
         elif char.isalpha():
             op = 'I'
-            consumed_query += 1
+            # consumed_query += 1
         else:
             op = 'S'
-            consumed_query += 1
+            # consumed_query += 1
 
         # 统计连续操作
         if op == current_op:
@@ -167,9 +171,12 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
     for i in range(len(record.ref_names)):
         if i == primary_idx:
             continue
+        
         strand = 'R' if 'R' in record.strands[i] else 'F'
+        is_reverse = (strand == 'R')
+        cigar = generate_cigar(record.alignment[i], is_reverse)
         sa_parts.append(f"{record.ref_names[i]},{record.positions[i]+1},{strand}," +
-                        f"{generate_cigar(record.alignment[i])},255,{record.mismatches[i]}")
+                        f"{cigar},255,{record.mismatches[i]}")
     return f"SA:Z:{';'.join(sa_parts)}" if sa_parts else ""
 
 
@@ -184,7 +191,8 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:
 
     # 处理主记录
     flag = calculate_flag(record.strands[primary_idx])
-    cigar = generate_cigar(record.alignment[primary_idx])
+    is_reverse = (record.strands[primary_idx] == 'R')
+    cigar = generate_cigar(record.alignment[primary_idx], is_reverse)
     seq = reverse_complement(
         record.seq) if 'R' in record.strands[primary_idx] else record.seq
     sa_tag = generate_sa_tag(record, primary_idx)
@@ -215,7 +223,8 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:
         if i == primary_idx:
             continue
         flag = calculate_flag(record.strands[i], is_secondary=True)
-        cigar = generate_cigar(record.alignment[i])
+        is_reverse = (record.strands[i] == 'R')
+        cigar = generate_cigar(record.alignment[i], is_reverse)
         seq = reverse_complement(
             record.seq) if 'R' in record.strands[i] else record.seq
 
