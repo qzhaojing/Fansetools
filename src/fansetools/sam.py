@@ -8,14 +8,11 @@ v0.1
 Jinan University
 """
 
-import time
 import os
 from typing import Generator,  Optional, Dict  # ,# Tuple, Iterator, Set
 from .parser import FANSeRecord, fanse_parser
 import gzip
 import sys
-import traceback
-from tqdm import tqdm
 
 
 def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
@@ -39,11 +36,11 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
     """
     # if not alignment or seq_len <= 0:
     #     return f"{seq_len}M"
-
+    
     # 对于反向链，需要反转比对字符串
     if is_reverse:
         alignment = alignment[::-1]
-
+        
     cigar = []
     current_op = None
     count = 0
@@ -80,33 +77,6 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
         cigar.append(f"{count}{current_op}")
 
     return "".join(cigar)
-
-
-def calculate_mismatches_from_cigar(cigar: str) -> int:
-    """
-    从CIGAR字符串计算实际错配数（包括SNP和indel）
-
-    参数:
-        cigar: CIGAR字符串
-
-    返回:
-        总错配数（SNP + indel）
-    """
-    import re
-    # 解析CIGAR操作
-    ops = re.findall(r'(\d+)([MIDNSHPX=])', cigar)
-
-    mismatches = 0
-    for count, op in ops:
-        count = int(count)
-        if op in ['X', 'I', 'D']:  # 错配、插入、缺失
-            mismatches += count
-        # elif op == 'M':  # 匹配/错配（无法区分）
-        #     # 保守估计：假设所有M都是错配（最坏情况）
-        #     mismatches += count
-        # 忽略S/H/N/P等操作
-
-    return mismatches
 
 
 # def calculate_flag(strand: str, is_secondary: bool = False) -> int:
@@ -201,7 +171,7 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
     for i in range(len(record.ref_names)):
         if i == primary_idx:
             continue
-
+        
         strand = 'R' if 'R' in record.strands[i] else 'F'
         is_reverse = (strand == 'R')
         cigar = generate_cigar(record.alignment[i], is_reverse)
@@ -210,10 +180,8 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
     return f"SA:Z:{';'.join(sa_parts)}" if sa_parts else ""
 
 
-def fanse_to_sam_type(record: FANSeRecord, max_errors: Optional[int] = None) -> Generator[str, None, None]:
-    """将FANSeRecord转换为SAM格式行
-        计算实际错配数目，并可以筛选
-    """
+def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:
+    """将FANSeRecord转换为SAM格式行"""
     if not record.ref_names:
         return
 
@@ -225,33 +193,24 @@ def fanse_to_sam_type(record: FANSeRecord, max_errors: Optional[int] = None) -> 
     flag = calculate_flag(record.strands[primary_idx])
     is_reverse = (record.strands[primary_idx] == 'R')
     cigar = generate_cigar(record.alignment[primary_idx], is_reverse)
-
-    # 计算实际错配数
-    actual_mismatches = calculate_mismatches_from_cigar(cigar)
-
-    # 应用错误过滤
-    if max_errors is not None and actual_mismatches > max_errors:
-        return
-
     seq = reverse_complement(
         record.seq) if 'R' in record.strands[primary_idx] else record.seq
     sa_tag = generate_sa_tag(record, primary_idx)
 
     sam_fields = [
-        record.header,     #QNAME
-        str(flag),          #FLAG
-        record.ref_names[primary_idx],      #RNAME  chr/geneid in rnaseq
-        str(record.positions[primary_idx] + 1),  #pos  1-based
-        "255",  # MAPQ   mapping quanlity
-        cigar,  
-        "*",    # RNEXT, 双端测序中另外一端比对的名称和位置
-        "0",    # PNEXT, 双端测序中另外一端比对的名称和位置
-        "0",    # TLEN， 插入片段的长度，单端为0；双端都比对上的话，可以估算出长度
-        seq,    # seq，通常是参考序列的方向，如果是比对到互补链上则是反转互补序列。
+        record.header,
+        str(flag),
+        record.ref_names[primary_idx],
+        str(record.positions[primary_idx] + 1),  # 1-based
+        "255",  # MAPQ
+        cigar,
+        "*",    # RNEXT
+        "0",    # PNEXT
+        "0",    # TLEN
+        seq,
         "*",    # QUAL
-        f"XM:i:{record.mismatches[primary_idx]}",  # 原始错配数
-        f"XA:i:{actual_mismatches}",              # 实际错配数
-        f"NH:i:{record.multi_count}",             #匹配到多少个位置
+        f"XM:i:{record.mismatches[primary_idx]}",
+        f"XN:i:{record.multi_count}"
     ]
 
     if sa_tag:
@@ -263,18 +222,9 @@ def fanse_to_sam_type(record: FANSeRecord, max_errors: Optional[int] = None) -> 
     for i in range(len(record.ref_names)):
         if i == primary_idx:
             continue
-
         flag = calculate_flag(record.strands[i], is_secondary=True)
         is_reverse = (record.strands[i] == 'R')
         cigar = generate_cigar(record.alignment[i], is_reverse)
-
-        # 计算实际错配数
-        actual_mismatches = calculate_mismatches_from_cigar(cigar)
-
-        # 应用错误过滤
-        if max_errors is not None and actual_mismatches > max_errors:
-            continue
-
         seq = reverse_complement(
             record.seq) if 'R' in record.strands[i] else record.seq
 
@@ -289,10 +239,9 @@ def fanse_to_sam_type(record: FANSeRecord, max_errors: Optional[int] = None) -> 
             "0",
             "0",
             seq,
-            "*", 
-            f"XM:i:{record.mismatches[i]}",  # 原始错配数
-            f"XA:i:{actual_mismatches}",      # 实际错配数
-            f"NH:i:{record.multi_count}"       #匹配到多少个位置
+            "*",
+            f"XM:i:{record.mismatches[i]}",
+            f"XN:i:{record.multi_count}"
         ]
         yield "\t".join(sam_fields)
 
@@ -340,7 +289,7 @@ def parse_fasta(fasta_path: str) -> Dict[str, int]:
     return ref_info
 
 
-def generate_sam_header_from_fasta(fasta_path: str) -> [str, int]:
+def generate_sam_header_from_fasta(fasta_path: str) -> str:
     """
     从FASTA文件生成完整的SAM头部
 
@@ -361,162 +310,66 @@ def generate_sam_header_from_fasta(fasta_path: str) -> [str, int]:
     for ref_name, length in ref_info.items():
         header_lines.append(f"@SQ\tSN:{ref_name}\tLN:{length}")
 
-    return '\n'.join(header_lines) + '\n', len(header_lines)
+    return '\n'.join(header_lines) + '\n'
 
 
-def fanse2sam(fanse_file,
-              fasta_path,
-              output_sam: Optional[str] = None,
-              max_errors: Optional[int] = None,
-              ):
+def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None):
     """
     将FANSe3文件转换为SAM格式
 
     参数:
         fanse_file: 输入FANSe3文件路径
         output_sam: 输出SAM文件路径(如果为None则打印到标准输出)
-        max_errors: 最大允许错配数(None表示不过滤)
     """
     # print('Start fanse2sam: {}'.format(fanse_file))
-
-    # 获取记录总数（用于进度显示）
-    total_records = sum(1 for _ in fanse_parser(fanse_file))
-    processed = 0
-    print(f'fanse3结果文件总记录数: {total_records}')
     # 先读取所有记录以生成头部
     # records = list(fanse_parser(fanse_file))
-    header, len_header = generate_sam_header_from_fasta(fasta_path)
-    print(f'Fasta文件总记录数: {len_header}')
-
+    header = generate_sam_header_from_fasta(fasta_path)
     # 组合两者
     if output_sam:
         with open(output_sam, 'w') as out_f:
             # 写入SAM头
+            # out_f.write("@HD\tVN:1.6\tSO:unsorted\n")
             out_f.write(header)
-            print('Header write done. ')
-
-            # # 处理记录
-            # for record in fanse_parser(fanse_file):
-            #     for sam_line in fanse_to_sam_type(record, max_errors):
-            #         out_f.write(sam_line + "\n")
-
-            # 使用tqdm创建进度条
-            # 创建解析器
-            parser = fanse_parser(fanse_file)
-
-            # 使用tqdm创建进度条
-            try:
-                # 使用tqdm包装解析器
-                progress_bar = tqdm(total=total_records,
-                                    desc="处理进度", unit="记录")
-                use_tqdm = True
-            except ImportError:
-                print("警告: tqdm库未安装，使用简单进度显示")
-                progress_bar = None
-                use_tqdm = False
-
-            # 处理每条记录
-            for record in parser:
-                # 生成SAM行
-                for sam_line in fanse_to_sam_type(record, max_errors):
+            print('Header write done.')
+            # 处理记录
+            for record in fanse_parser(fanse_file):
+                for sam_line in fanse_to_sam_type(record):
                     out_f.write(sam_line + "\n")
-
-                # 更新进度
-                processed += 1
-                if use_tqdm:
-                    progress_bar.update(10)
-                elif processed % 100000 == 0:
-                    print(
-                        f"处理进度: {processed}/{total_records} ({processed/total_records*100:.1f}%)")
-
-            # 关闭进度条
-            if progress_bar:
-                progress_bar.close()
-            # parser = fanse_parser(fanse_file)
-            # for record in parser:
-            #     for sam_line in fanse_to_sam_type(record, max_errors):
-            #         out_f.write(sam_line + "\n")
-
-            #     # 更新进度
-            #     processed += 1
-            #     if processed % 100000 == 0:
-            #         print(
-            #             f"处理进度: {processed}/{total_records} ({processed/total_records*100:.1f}%)")
-
     else:
         # 修复管道输出兼容性
         try:
             # 尝试直接写入标准输出缓冲区
             sys.stdout.buffer.write(header.encode())
             for record in fanse_parser(fanse_file):
-                for sam_line in fanse_to_sam_type(record, max_errors):
+                for sam_line in fanse_to_sam_type(record):
                     sys.stdout.buffer.write((sam_line + "\n").encode())
         except AttributeError:
             # 回退方案：使用原始标准输出
             sys.__stdout__.write(header)
             for record in fanse_parser(fanse_file):
-                for sam_line in fanse_to_sam_type(record, max_errors):
+                for sam_line in fanse_to_sam_type(record):
                     sys.__stdout__.write(sam_line + "\n")
-
-    # 最终进度显示
-    print(f"处理完成: {processed}/{total_records} 记录")
-# def run_sam_command(args):
-#     """Handle sam subcommand"""
-# # def run_fanse2sam(args):
-#     fanse2sam(args.fanse_file, args.fasta_path,
-#               args.output_sam, args.max_errors)
 
 
 def run_sam_command(args):
     """Handle sam subcommand"""
-    # 打印运行参数
-    print("\n📋 运行参数:")
-    print(f"  - 输入文件: {args.fanse_file}")
-    print(f"  - 参考基因组: {args.fasta_path}")
-    print(f"  - 输出文件: {args.output_sam if args.output_sam else '标准输出'}")
-    print(
-        f"  - 输出结果最大错配数（SNP+INDEL）设置为: {args.max_errors if args.max_errors is not None else '无限制'}")
-
-    # 添加分隔线
-    print("-" * 60)
-
-    # 记录开始时间
-    start_time = time.time()
-    print(f"⏱️ 开始处理: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    try:
-        # 执行转换
-        fanse2sam(args.fanse_file, args.fasta_path,
-                  args.output_sam, args.max_errors)
-
-        # 计算处理时间
-        elapsed = time.time() - start_time
-        print(f"\n✅ 处理完成! 耗时: {elapsed:.2f}秒")
-    except Exception as e:
-        # 计算处理时间
-        elapsed = time.time() - start_time
-        print(f"\n❌ 处理失败! 耗时: {elapsed:.2f}秒")
-        print(f"错误信息: {str(e)}")
-        traceback.print_exc()
-        sys.exit(1)
+# def run_fanse2sam(args):
+    fanse2sam(args.fanse_file, args.fasta_path, args.output_sam)
 
 
 def add_sam_subparser(subparsers):
     sam_parser = subparsers.add_parser(
         'sam',
         help='转换为 SAM 格式',
-        description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式，/win下需要安装win版本samtools'
+        description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式'
     )
     sam_parser.add_argument(
-        '-i', '--input', dest='fanse_file', required=True, help='输入文件路径（FANSe3 格式），支持.gz格式')
+        '-i', '--input', dest='fanse_file', required=True, help='输入文件路径（FANSe3 格式）')
     sam_parser.add_argument(
-        '-r', '--fasta', dest='fasta_path', required=True, help='输入参考基因组 FASTA 文件路径，支持.gz格式')
+        '-r', '--fasta', dest='fasta_path', required=True, help='参考基因组 FASTA 文件路径')
     sam_parser.add_argument(
-        '-o', '--output', dest='output_sam', help='SAM结果文件输出文件路径（不指定输出位置，则默认打印到终端屏幕）')
-    sam_parser.add_argument(
-        '-e', '--errors', dest='max_errors', type=int, default=None,
-        help='输出结果中，允许最大实际错配数（包括SNP和indel），基于CIGAR字符串计算。不设置则输出所有reads')
-
+        '-o', '--output', dest='output_sam', help='输出文件路径（不指定输出位置，默认打印到终端）')
     sam_parser.set_defaults(func=run_sam_command)
 
 
@@ -525,7 +378,7 @@ if __name__ == "__main__":
     # 测试数据
 
     if len(sys.argv) < 2:
-        print("Usage: python sam.py <input.fanse3> [output.sam]")
+        print("Usage: python fanse2sam.py <input.fanse3> [output.sam]")
         sys.exit(1)
     fasta_path = sys.argv[2]
     output_file = sys.argv[3] if len(sys.argv) > 2 else None

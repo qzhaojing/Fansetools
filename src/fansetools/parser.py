@@ -12,46 +12,7 @@ from typing import List, Generator
 # from collections import deque
 # from tqdm import tqdm
 
-# def header_parser(header_str):
-#     '''
-#     header 有几种形式
-#     1. @E250124442L1C008R03300204059/1:GTTATA   #自己加的umi
-#     2. @E250124442L1C008R03300204059/1 #正常原始数据
-#     3. @LH00128:391:22WV3CLT4:7:1101:27017:1056 1:N:0:ATTACTCG+TCAGAGCC merged_68_0   #fastp生成的，merge双端后的fastq 的header
-#     4. @LH00128:391:22WV3CLT4:7:1185:5708:13247 1:N:0:ATTACTCG+TCAGAGCC   #原始数据，无合并无umi
-#     5. 。。。
 
-#     Parameters
-#     ----------
-#     header_str : TYPE
-#         DESCRIPTION.
-
-#     Returns
-#     -------
-#     None.
-
-#     '''
-#     header_str
-#         # 错误示例：直接将包含冒号和字母的字符串转换为整数
-#     direction_and_umi = "1:CAGTCA"  # 这可能来自你的FANSe3记录
-#     try:
-#         some_integer_field = int(direction_and_umi)  # 这里会抛出 ValueError
-#     except ValueError as e:
-#         print(f"Error: {e}")
-    
-#     # 正确做法：先分离出方向部分（数字部分），再转换
-#     parts = direction_and_umi.split(':', 1)  # 只分割一次
-#     if parts:  # 确保分割后至少有一个部分
-#         direction_str = parts[0]  # 这里是 "1"
-#         umi = parts[1] if len(parts) > 1 else None  # 这里是 "CAGTCA"
-        
-#         try:
-#             direction = int(direction_str)  # 现在转换 "1" 为整数 1
-#             # 然后使用 direction 来设置FLAG等需要整数的字段
-#             # 同时，你可以将 umi (字符串) 添加到SAM的可选字段中，例如添加 RG:Z 或 UB:Z 标签
-#         except ValueError as e:
-#             print(f"Error converting direction '{direction_str}' to integer: {e}")
-#             # 处理错误，例如使用默认值或跳过该记录
 @dataclass
 class FANSeRecord:
     """存储FANSe3单条记录的类"""
@@ -169,8 +130,6 @@ def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
                 raise ValueError(f"Invalid unmapped record format: {line}")
 
             yield UnmappedRecord(read_id=parts[0], sequence=parts[1])
-
-# @dataclass
 
 
 if __name__ == "__main__":
