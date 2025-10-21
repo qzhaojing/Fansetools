@@ -7,6 +7,8 @@ from .run import add_run_subparser
 from .sam import add_sam_subparser
 from .bed import add_bed_subparser
 from .fastx import add_fastx_subparser
+from .mpileup import add_mpileup_subparser
+from .count import add_count_subparser
 import sys
 import os
 
@@ -50,6 +52,12 @@ def main():
 
     # 子命令：fastx
     add_fastx_subparser(subparsers)
+
+    # 子命令：mpileup
+    add_mpileup_subparser(subparsers)
+    
+    # 子命令：count
+    add_count_subparser(subparsers)
 
     # 解析参数
     args = parser.parse_args()
