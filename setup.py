@@ -10,6 +10,11 @@ setup(
             'fanse=fansetools.cli:main',
         ],
     },
+    author="Zhao Jing",
+    author_email="qzhaojing@qq.com",
+    description="A toolkit for processing fanse3 files",
+    license="MIT",
+    python_requires=">=3.6",
     # install_requires=[
     #    'tqdm',   #进度条
     #    # 你的依赖项
@@ -17,6 +22,9 @@ setup(
     install_requires=[
         'tqdm>=4.0.0',
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
+        "pandas>=1.0.0",
+        "tqdm>=4.0.0",
+        "biopython>=1.70",  # 用于GFF解析
     ],
 
     extras_require={
