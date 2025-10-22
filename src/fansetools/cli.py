@@ -125,7 +125,7 @@ def main():
         args = parser.parse_args()
     except SystemExit:
         # 当没有提供命令时显示帮助
-        #show_main_help(parser)
+        show_main_help(parser)
         return
 
     # 处理帮助请求
@@ -133,9 +133,9 @@ def main():
         show_main_help(parser)
         return
         
-    #if not hasattr(args, 'func') or args.command is None:
-    #    show_main_help(parser)
-    #    return
+    if not hasattr(args, 'func') or args.command is None:
+        show_main_help(parser)
+        return
 
     # 禁用colorama（非交互式终端）
     if not sys.stdout.isatty():
