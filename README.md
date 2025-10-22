@@ -90,6 +90,13 @@ fanse run -i /path1,/path2,/path3 -r ref.fasta -o c:\sample    +fanse参数
 
 - 想办法实现fanse3读取gz, fq.gz等格式，避免解压缩的繁复操作，且节省空间。可以探索fanse3能否接受标准输入，那么就可以通过python gzip模块解压缩gz，然后传给fanse3,进行比对了
 
+### read count from fanse format from 'fanse run'   (*.fanse3, *.fanse3.gz)
+- **fanse count **
+```
+fanse count -i input.fanse3 -o outputdir
+```
+
+
 ### Format Conversions
 
 - **FANSe3 to SAM:**
