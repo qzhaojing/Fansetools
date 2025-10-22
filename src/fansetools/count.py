@@ -55,10 +55,11 @@ class FanseCounter:
         list_unique_mapping = []
         list_multi_mapping = []
         list_normal = []
+        list_raw = []
         list_multi2single = []
         
         total_count = 0
-        block_size = 1024 * 1024 * 2048  # 2GB块大小
+        block_size = 1024 * 1024 * 512  # 512M块大小
         
         files_to_process = [self.input_file]
         if self.paired_end:
@@ -87,7 +88,7 @@ class FanseCounter:
                                     
                                 transcript_id = parts[1]
                                 multimap_value = parts[4]
-                                
+                                list_raw.append(transcript_id)
                                 if multimap_value != '1':  # multi-mapping reads
                                     list_multi_mapping.append(transcript_id)
                                     transcript_ids = transcript_id.split(',')
@@ -105,8 +106,9 @@ class FanseCounter:
         
         # 统计计数
         self.counts_data = {
+            'raw': Counter(list_raw),
             'multi': Counter(list_multi_mapping),
-            'single': Counter(list_unique_mapping),
+            'unique': Counter(list_unique_mapping),
             'normal': Counter(list_normal),
             'multi2single': Counter(list_multi2single),
             'combined': Counter(list_unique_mapping + list_multi_mapping)
@@ -144,7 +146,7 @@ class FanseCounter:
                                      columns=['Accession', 'count'])
             
             # 合并所有计数类型
-            for count_type in ['single', 'multi', 'multi2single']:
+            for count_type in ['raw','unique', 'multi', 'multi2single']:
                 temp_df = pd.DataFrame(self.counts_data[count_type].items(),
                                     columns=['Accession', f'{count_type}_count'])
                 combined_df = combined_df.merge(temp_df, on='Accession', how='outer')
@@ -186,7 +188,7 @@ class FanseCounter:
         # 2. 生成计数文件
         count_files = self.generate_count_files()
         
-        # 3. 可选过滤
+        # 3. 可选过滤reads数目，此处不建议
         if self.minreads > 0:
             self.filter_by_minreads()
         
@@ -221,7 +223,7 @@ def count_main(args):
     
     try:
         # 1. 解析输入路径
-        input_files = processor.parse_input_paths(args.input, ['.fanse','.fanse3', '.fanse3.gz'])
+        input_files = processor.parse_input_paths(args.input, ['.fanse','.fanse3', '.fanse3.gz', '.fanse.gz'])
         if not input_files:
             print("错误: 未找到有效的输入文件")
             sys.exit(1)
@@ -318,32 +320,7 @@ def add_count_subparser(subparsers):
     # 关键修复：设置处理函数，而不是直接解析参数
     parser.set_defaults(func=count_main)
     
-# def count_main(args):
-#     """count子命令的主处理函数"""
-#     # 验证输入文件存在
-#     if not os.path.exists(args.input):
-#         print(f"Error: Input file {args.input} does not exist")
-#         sys.exit(1)
-    
-#     # 修复：移除不存在的 value 参数
-#     counter = FanseCounter(
-#         input_file=args.input,
-#         output_dir=args.output,
-#         minreads=args.minreads,
-#         rpkm=args.rpkm,
-#         gtf_file=args.gtf,
-#         level=args.level,
-#         paired_end=args.paired_end
-#     )
-    
-#     try:
-#         counter.run()
-#         print("Processing completed successfully!")
-#     except Exception as e:
-#         print(f"Error during processing: {e}")
-#         sys.exit(1)
 
-# 移除有问题的 main() 函数，或者修复它
 def main():
     """主函数 - 用于直接运行此脚本"""
     parser = argparse.ArgumentParser(
@@ -360,6 +337,9 @@ def main():
         args.func(args)
     else:
         parser.print_help()
+
+
+
 
 if __name__ == '__main__':
     main()
