@@ -52,40 +52,54 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     返回:
         生成器，每次yield一个FANSeRecord对象
     """
-    with open(file_path, 'r') as f:
+    tab_split = re.compile(r'\t+').split
+    
+    with open(file_path, 'r', buffering=1024 * 1024 ) as f:  #  1 MB缓冲区
         while True:
             # 读取两行作为一个完整记录
-            line1 = f.readline().strip()
-            line2 = f.readline().strip()
+            line1 = f.readline().rstrip('\r\n')
+            line2 = f.readline().rstrip('\r\n')
             if not line1 or not line2:  # 文件结束
                 break
 
             # 解析第一行(使用严格制表符分割)
-            fields = re.split(r'\t+', line1)
+            # fields = re.split(r'\t+', line1)
+            fields = tab_split(line1)
             if len(fields) < 2:
-                raise ValueError(f"无效的第一行格式: {line1}")
+                continue  # 跳过无效行而不是抛出异常
+                # raise ValueError(f"无效的第一行格式: {line1}")
 
             # 解析第二行
-            fields2 = re.split(r'\t+', line2)
+            # fields2 = re.split(r'\t+', line2)
+            fields2 = tab_split(line2)
             if len(fields2) < 5:
-                raise ValueError(f"无效的第二行格式: {line2}")
-
-            # 处理可能的多值字段
-            strands = fields2[0].split(',')
-            ref_names = fields2[1].split(',')
-            mismatches = list(map(int, fields2[2].split(',')))
-            positions = list(map(int, fields2[3].split(',')))
+                continue  # 跳过无效行而不是抛出异常
+                # raise ValueError(f"无效的第二行格式: {line2}")
             multi_count = int(fields2[4])
-
-            # 验证字段一致性并处理可能的长度不一致
-            max_len = max(len(ref_names), len(strands),
-                          len(mismatches), len(positions))
-            if len(strands) < max_len:
-                strands += [''] * (max_len - len(strands))
-            if len(mismatches) < max_len:
-                mismatches += [0] * (max_len - len(mismatches))
-            if len(positions) < max_len:
-                positions += [0] * (max_len - len(positions))
+            # 处理可能的多值字段
+            if multi_count!=1:
+                strands = fields2[0].split(',')
+                ref_names = fields2[1].split(',')
+                # mismatches = list(map(int, fields2[2].split(',')))
+                # positions = list(map(int, fields2[3].split(',')))
+                mismatches = [int(x) for x in fields2[2].split(',')]
+                positions = [int(x) for x in fields2[3].split(',')]
+                multi_count = int(fields2[4])
+            else:  # single-mapping reads
+                # 单映射reads，直接使用字段值
+                strands = [fields2[0]]
+                ref_names = [fields2[1]]
+                mismatches = [int(fields2[2])]
+                positions = [int(fields2[3])]
+            # # 验证字段一致性并处理可能的长度不一致
+            # max_len = max(len(ref_names), len(strands),
+            #               len(mismatches), len(positions))
+            # if len(strands) < max_len:
+            #     strands += [''] * (max_len - len(strands))
+            # if len(mismatches) < max_len:
+            #     mismatches += [0] * (max_len - len(mismatches))
+            # if len(positions) < max_len:
+            #     positions += [0] * (max_len - len(positions))
 
             # 创建记录对象
             record = FANSeRecord(

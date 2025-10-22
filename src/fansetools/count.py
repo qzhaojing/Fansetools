@@ -16,7 +16,8 @@ from pathlib import Path
 
 # 导入新的路径处理器
 from .utils.path_utils import PathProcessor
-
+# 导入新的fanse_parser
+from .parser import fanse_parser, FANSeRecord
 
 class FanseCounter:
     """fanse3文件计数处理器"""
@@ -54,12 +55,12 @@ class FanseCounter:
         # 存储计数列表
         list_unique_mapping = []
         list_multi_mapping = []
-        list_normal = []
+        list_firstID = []
         list_raw = []
         list_multi2single = []
         
         total_count = 0
-        block_size = 1024 * 1024 * 512  # 512M块大小
+        # block_size = 1024 * 1024 * 512  # 512M块大小
         
         files_to_process = [self.input_file]
         if self.paired_end:
@@ -70,48 +71,58 @@ class FanseCounter:
                 continue
                 
             print(f'Reading {fanse_file.name}')
-            with open(fanse_file, 'r') as f:
-                # 使用进度条显示处理进度
-                file_size = os.path.getsize(fanse_file)
-                with tqdm(total=file_size, unit='B', unit_scale=True) as pbar:
-                    while True:
-                        lines = f.readlines(block_size)
-                        if not lines:
-                            break
-                        
-                        # 处理每一块数据
-                        for i, line in enumerate(lines):
-                            if i % 2 == 1:  # 每两行处理一次（read序列和mapping信息）
-                                parts = line.strip().split()
-                                if len(parts) < 5:
-                                    continue
-                                    
-                                transcript_id = parts[1]
-                                multimap_value = parts[4]
-                                list_raw.append(transcript_id)
-                                if multimap_value != '1':  # multi-mapping reads
-                                    list_multi_mapping.append(transcript_id)
-                                    transcript_ids = transcript_id.split(',')
-                                    list_normal.append(transcript_ids[0])  # 取第一个ID
-                                    list_multi2single.extend(transcript_ids)
-                                else:  # unique mapping reads
-                                    list_unique_mapping.append(transcript_id)
-                                    list_normal.append(transcript_id)
+            try:
+                file_read_size = os.path.getsize(fanse_file)/500    #粗略估计500字节一个fanse记录
+                with tqdm(total=file_read_size, unit='reads', mininterval=10, unit_scale=True) as pbar:
+                    for record in fanse_parser(str(fanse_file)):
+                        # 处理每个记录
+                        if record.ref_names:
+                            # 获取转录本ID（多个用逗号分隔）
+                            transcript_ids = record.ref_names
+                            
+                            # 1. raw reads - 记录原始映射信息
+                            raw_id = transcript_ids[0] if len(transcript_ids) == 1 else ','.join(transcript_ids)
+                            # raw_id = ','.join(transcript_ids)
+                            list_raw.append(raw_id)
+                            
+                            if record.is_multi is True:  # multi-mapping reads
+                                # 2. multi mapping reads
+                                list_multi_mapping.append(raw_id)
                                 
-                                total_count += 1
-                                #if total_count % 1000000 == 0:
-                                    #print(f'Processed {total_count} reads')
-                        
-                        pbar.update(len(''.join(lines)))
+                                # 3. first ID of reads (用于normal计数)
+                                if transcript_ids:
+                                    #firstID 的多重比对部分
+                                    list_firstID.append(transcript_ids[0])
+                                
+                                # 4. multi ID split to one by one
+                                list_multi2single.extend(transcript_ids)
+                            elif record.is_multi is False:  # unique mapping reads
+                                # 唯一映射
+                                # print(11)
+                                if transcript_ids:
+                                    transcript_id = transcript_ids[0]
+                                    list_unique_mapping.append(transcript_id)
+                                    #firstID 的独立比对部分
+                                    list_firstID.append(transcript_id)
+                            
+                            total_count += 1
+                            pbar.update(1)
+                            
+                            # if total_count % 1000000 == 0:
+                            #     print(f'Processed {total_count} reads')
+                            
+            except Exception as e:
+                print(f"Error parsing file {fanse_file}: {str(e)}")
+                continue
         
         # 统计计数
         self.counts_data = {
             'raw': Counter(list_raw),
             'multi': Counter(list_multi_mapping),
             'unique': Counter(list_unique_mapping),
-            'normal': Counter(list_normal),
+            'firstID': Counter(list_firstID),
             'multi2single': Counter(list_multi2single),
-            'combined': Counter(list_unique_mapping + list_multi_mapping)
+            # 'combined': Counter(list_unique_mapping + list_multi_mapping)
         }
         
         self.summary_stats = {
@@ -142,8 +153,8 @@ class FanseCounter:
         
         # 生成合并的计数文件
         if self.level in ['isoform', 'both']:
-            combined_df = pd.DataFrame(self.counts_data['normal'].items(), 
-                                     columns=['Accession', 'count'])
+            combined_df = pd.DataFrame(self.counts_data['firstID'].items(), 
+                                     columns=['Accession', 'fanse_count'])
             
             # 合并所有计数类型
             for count_type in ['raw','unique', 'multi', 'multi2single']:
