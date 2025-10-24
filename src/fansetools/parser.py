@@ -4,6 +4,7 @@ Created on Wed Jun 18 11:06:35 2025
 
 @author: Administrator
 """
+
 import re
 # import os
 from dataclasses import dataclass
@@ -52,26 +53,28 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     返回:
         生成器，每次yield一个FANSeRecord对象
     """
-    tab_split = re.compile(r'\t+').split
+    # tab_split = re.compile(r'\t+').split
     
-    with open(file_path, 'r', buffering=1024 * 1024 ) as f:  #  1 MB缓冲区
+    with open(file_path, 'r', buffering=1024 * 1024*10 ) as f:  #  1 MB缓冲区
         while True:
             # 读取两行作为一个完整记录
-            line1 = f.readline().rstrip('\r\n')
-            line2 = f.readline().rstrip('\r\n')
+            line1 = f.readline().rstrip()
+            line2 = f.readline().rstrip()
             if not line1 or not line2:  # 文件结束
                 break
 
             # 解析第一行(使用严格制表符分割)
             # fields = re.split(r'\t+', line1)
-            fields = tab_split(line1)
-            if len(fields) < 2:
+            # 使用更快的字符串分割
+            fields1 = line1.split('\t')
+            fields2 = line2.split('\t')
+            # fields = tab_split(line1)
+
+            if len(fields1) < 2:
                 continue  # 跳过无效行而不是抛出异常
                 # raise ValueError(f"无效的第一行格式: {line1}")
 
             # 解析第二行
-            # fields2 = re.split(r'\t+', line2)
-            fields2 = tab_split(line2)
             if len(fields2) < 5:
                 continue  # 跳过无效行而不是抛出异常
                 # raise ValueError(f"无效的第二行格式: {line2}")
@@ -82,35 +85,42 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
                 ref_names = fields2[1].split(',')
                 # mismatches = list(map(int, fields2[2].split(',')))
                 # positions = list(map(int, fields2[3].split(',')))
-                mismatches = [int(x) for x in fields2[2].split(',')]
+                # mismatches = [int(x) for x in fields2[2].split(',')]
+                mismatches = [int(fields2[2])]    #fanse 文件中此字段只有一个而非多个用逗号分割，因此测试注释掉上面行
                 positions = [int(x) for x in fields2[3].split(',')]
-                multi_count = int(fields2[4])
+                # multi_count = int(fields2[4])
             else:  # single-mapping reads
                 # 单映射reads，直接使用字段值
                 strands = [fields2[0]]
                 ref_names = [fields2[1]]
                 mismatches = [int(fields2[2])]
                 positions = [int(fields2[3])]
-            # # 验证字段一致性并处理可能的长度不一致
-            # max_len = max(len(ref_names), len(strands),
-            #               len(mismatches), len(positions))
-            # if len(strands) < max_len:
-            #     strands += [''] * (max_len - len(strands))
-            # if len(mismatches) < max_len:
-            #     mismatches += [0] * (max_len - len(mismatches))
-            # if len(positions) < max_len:
-            #     positions += [0] * (max_len - len(positions))
+            
+            # 验证字段一致性并处理可能的长度不一致，这里主要是提供给fanse2sam 使用，没有貌似会报错。
+            # len_ref_names   =  len(ref_names)
+            # len_strands   =  len(strands)
+            len_mismatches   =  len(mismatches)
+            len_positions   =  len(positions)            
+            # max_len = max(len_ref_names, len_strands,
+            #                len_mismatches, len_positions)
+            mismatches += [int(fields2[2])] * (len_positions - len_mismatches)
+            # if len_mismatches < max_len:
+            #      mismatches += [int(fields2[2])] * (max_len - len_mismatches)
+            # if len_strands < max_len:
+            #      strands += [''] * (max_len - len_strands)
+            # if len_positions < max_len:
+            #      positions += [0] * (max_len - len_positions)
 
             # 创建记录对象
             record = FANSeRecord(
-                header=fields[0],
-                seq=fields[1],
-                alignment=fields[2].split(',') if len(fields) > 2 else '',
-                strands=strands,
-                ref_names=ref_names,
-                mismatches=mismatches,
-                positions=positions,
-                multi_count=multi_count
+                                header=fields1[0],
+                                seq=fields1[1],
+                                alignment=fields1[2].split(',') if len(fields1) > 2 else '',
+                                strands=strands,
+                                ref_names=ref_names,
+                                mismatches=mismatches,
+                                positions=positions,
+                                multi_count=multi_count
             )
 
             yield record

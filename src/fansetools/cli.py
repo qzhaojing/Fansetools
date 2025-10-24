@@ -11,7 +11,7 @@ from .bed import add_bed_subparser
 from .fastx import add_fastx_subparser
 from .mpileup import add_mpileup_subparser
 from .count import add_count_subparser
-
+from .sort import add_sort_subparser
 
 
 def main():
@@ -120,6 +120,9 @@ def main():
     # 子命令：count
     add_count_subparser(subparsers)
 
+    # 子命令：sort
+    add_sort_subparser(subparsers)
+    
     # 解析参数
     try:
         args = parser.parse_args()
@@ -159,7 +162,8 @@ def show_main_help(parser):
     print("  fanse run -i input.fq -r ref.fa -o output/    # 运行FANSe3比对")
     print("  fanse count -i *.fanse3 -o results/           # 统计reads计数")
     print("  fanse sam -i input.fanse3 -r ref.fa -o output.sam  # 转换为SAM格式")
-    print("\n使用 fanse -v 查看版本，fanse --version-info 查看更新信息")
+    print("  fanse sort -i input.sam -o sorted.sam --sort coord  # 排序SAM文件")
+    print("\n使用 fanse -v 查看版本，fanse --version-info 检查更新信息")
 
 
 def show_detailed_version_info():
