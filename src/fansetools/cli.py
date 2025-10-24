@@ -13,9 +13,29 @@ from .mpileup import add_mpileup_subparser
 from .count import add_count_subparser
 from .sort import add_sort_subparser
 
+class CustomHelpFormatter(argparse.RawTextHelpFormatter):
+    """自定义帮助格式化器，提供更简洁的帮助信息"""
+    
+    def _format_action(self, action):
+        # 简化子命令的显示格式
+        if isinstance(action, argparse._SubParsersAction):
+            # 只显示子命令名称和简短描述
+            parts = []
+            for choice, subparser in action.choices.items():
+                # 获取子命令的简短描述
+                help_text = subparser.description.split('\n')[0] if subparser.description else ""
+                parts.append(f"  {choice:<12} {help_text}")
+            
+            return "\n".join(parts) + "\n"
+        return super()._format_action(action)
+        
 
 def main():
     """FANSe 工具集主入口"""
+    
+    # 初始化变量
+    remaining_args = sys.argv[1:]
+    
    # 先解析基础参数（版本相关）
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument('-v', '--version', action='store_true', help='显示版本信息')
@@ -26,25 +46,23 @@ def main():
         base_args, _ = base_parser.parse_known_args()
     except:
         base_args = argparse.Namespace(version=False, version_info=False)
-
-    # 只有在明确要求版本信息时才检查更新
+        remaining_args = sys.argv[1:]
+        
+    # 处理版本信息请求
     if base_args.version or base_args.version_info:
         try:
             from .utils.version_check import DualVersionChecker, get_installation_method
             from . import __version__, __github_repo__
             
             if base_args.version:
-                # 简单版本信息
                 print(f"fansetools {__version__}")
                 return
                 
             elif base_args.version_info:
-                # 详细版本信息
                 show_detailed_version_info()
                 return
                 
         except ImportError:
-            # 如果版本检查模块不可用，显示基本版本
             from . import __version__
             if base_args.version:
                 print(f"fansetools {__version__}")
@@ -52,6 +70,7 @@ def main():
             elif base_args.version_info:
                 print(f"fansetools {__version__} (版本检查模块不可用)")
                 return
+
     # 版本检查（在解析参数前）
     #try:
     #    from .utils.version_check import DualVersionChecker, get_installation_method
@@ -69,23 +88,16 @@ def main():
     #except ImportError:
     #    pass
 
-    
+    # 创建主解析器
     parser = argparse.ArgumentParser(
         prog='fanse',
-        description='FANSe 工具集：用于处理 FANSe3 格式文件的命令行工具\n\n'
-                    '支持以下子命令：',
-        epilog='示例：\n'
-        ' fanse run -i inputdir/input.fastq/fq/fastq.gz/fq.gz  -r ref.fa -o outputdir'
-               '  fanse parser input.fanse3      解析 FANSe3 文件\n'
-               '  fanse sam input.fanse3 ref.fa  转换为 SAM 格式\n\n'
-               '  fanse bed   \n'
-               '  fanse convert  \n'
-               '  fanse count \n'
-
-               '更多帮助请参考：https://github.com/qzhaojing/fansetools',
-        formatter_class=argparse.RawTextHelpFormatter,  # 保留换行和格式
-        add_help=False  # 禁用默认的help，我们会自己处理
+        description='FANSe 工具集 - 处理 FANSe3 格式文件的命令行工具',
+        epilog='使用 "fanse <command> -h" 查看具体命令的帮助信息',
+        formatter_class=CustomHelpFormatter,
+        add_help=False,
+        usage='fanse [-h] [-v] [--version-info] <command> [<args>]'
     )
+    
     
  # 添加帮助选项
     parser.add_argument('-h', '--help', action='store_true', help='显示帮助信息')
@@ -105,8 +117,14 @@ def main():
     )
     parser_parser.add_argument('input_file', help='输入文件路径（FANSe3 格式）')
 
+    # 子命令：count
+    add_count_subparser(subparsers)
+    
     # 子命令：sam
     add_sam_subparser(subparsers)
+
+    # 子命令：sort
+    add_sort_subparser(subparsers)
 
     # 子命令： bed
     add_bed_subparser(subparsers)
@@ -117,27 +135,30 @@ def main():
     # 子命令：mpileup
     add_mpileup_subparser(subparsers)
     
-    # 子命令：count
-    add_count_subparser(subparsers)
 
-    # 子命令：sort
-    add_sort_subparser(subparsers)
-    
-    # 解析参数
-    try:
-        args = parser.parse_args()
-    except SystemExit:
-        # 当没有提供命令时显示帮助
-        show_main_help(parser)
+
+    # 特殊情况：直接显示子命令帮助
+    if len(remaining_args) == 1 and remaining_args[0] in subparsers.choices:
+        # 用户输入了 "fanse command"，显示该命令的帮助
+        subparsers.choices[remaining_args[0]].print_help()
         return
 
+    # 解析剩余参数
+    try:
+        args = parser.parse_args(remaining_args)
+    except SystemExit:
+        # 当没有提供命令时显示简洁帮助
+        if not remaining_args or remaining_args[0] in ['-h', '--help']:
+            show_brief_help(parser, subparsers)
+        return
+        
     # 处理帮助请求
     if hasattr(args, 'help') and args.help:
-        show_main_help(parser)
+        show_brief_help(parser, subparsers)
         return
         
     if not hasattr(args, 'func') or args.command is None:
-        show_main_help(parser)
+        show_brief_help(parser, subparsers)
         return
 
     # 禁用colorama（非交互式终端）
@@ -147,8 +168,81 @@ def main():
     try:
         args.func(args)
     except Exception as e:
-        print(f"\n错误: {str(e)}")
+        print(f"错误: {str(e)}")
         sys.exit(1)
+
+
+def show_brief_help(parser, subparsers):
+    """显示简洁的帮助信息"""
+    from . import __version__
+    
+    print(f"fansetools {__version__} - FANSe3文件处理工具集")
+    print("=" * 50)
+    print("使用方法: fanse <command> [选项]")
+    print()
+    print("可用命令:")
+    
+    # 显示简化的命令列表
+    max_cmd_len = max(len(cmd) for cmd in subparsers.choices.keys())
+    for cmd, subparser in subparsers.choices.items():
+        desc = subparser.description.split('\n')[0] if subparser.description else ""
+        print(f"  {cmd:<{max_cmd_len}}  {desc}")
+    
+    print()
+    print("使用 'fanse <command> -h' 查看具体命令的详细帮助")
+    print("使用 'fanse -v' 查看版本，'fanse --version-info' 查看更新信息")
+
+
+def show_detailed_version_info():
+    """显示详细的版本信息"""
+    from . import __version__, __github_repo__
+    from .utils.version_check import DualVersionChecker, get_installation_method
+    
+    installation_method = get_installation_method()
+    
+    print("=" * 50)
+    print("fansetools - 版本信息")
+    print("=" * 50)
+    print(f"当前版本: {__version__}")
+    print(f"安装方式: {installation_method}")
+    print(f"GitHub仓库: {__github_repo__}")
+    print()
+    
+    # 检查更新
+    try:
+        checker = DualVersionChecker(
+            current_version=__version__,
+            package_name="fansetools",
+            github_repo=__github_repo__,
+            check_interval_days=0
+        )
+        
+        version_info = checker.check_version()
+        
+        if version_info:
+            print("最新版本信息:")
+            if version_info.get('pypi_latest'):
+                status = "可更新" if version_info.get('pypi_update_available') else "已是最新"
+                print(f"  PyPI版本: {version_info['pypi_latest']} ({status})")
+            
+            if version_info.get('github_latest'):
+                gh_info = version_info['github_latest']
+                print(f"  GitHub最新提交: {gh_info['sha'][:18]} - {gh_info['message'][:150]}...")
+            
+            print()
+            print("更新命令:")
+            if installation_method == 'pip':
+                print("  pip install --upgrade fansetools")
+            elif installation_method == 'git':
+                print("  git pull origin main")
+            elif installation_method == 'conda':
+                print("  conda update fansetools")
+            else:
+                print("  pip install --upgrade fansetools")
+    except Exception:
+        print("无法检查更新信息")
+    
+    print("=" * 50)
 
 
 def show_main_help(parser):
@@ -161,61 +255,61 @@ def show_main_help(parser):
     print("\n快速使用:")
     print("  fanse run -i input.fq -r ref.fa -o output/    # 运行FANSe3比对")
     print("  fanse count -i *.fanse3 -o results/           # 统计reads计数")
-    print("  fanse sam -i input.fanse3 -r ref.fa -o output.sam  # 转换为SAM格式")
-    print("  fanse sort -i input.sam -o sorted.sam --sort coord  # 排序SAM文件")
+    print("  fanse sam -i input.fanse3 -r ref.fa -o output.sam  # 转换FANSe为SAM格式")
+    print("  fanse sort -i input.sam -o sorted.sam --sort coord  # 排序SAM文件, 默认coord")
     print("\n使用 fanse -v 查看版本，fanse --version-info 检查更新信息")
 
 
-def show_detailed_version_info():
-    """显示详细的版本信息"""
-    from . import __version__, __github_repo__
-    from .utils.version_check import DualVersionChecker, get_installation_method
-    
-    installation_method = get_installation_method()
-    
-    print("=" * 60)
-    print("fansetools - 版本信息")
-    print("=" * 60)
-    print(f"当前版本: {__version__}")
-    print(f"安装方式: {installation_method}")
-    print(f"GitHub仓库: {__github_repo__}")
-    print("")
-    
-    # 检查更新
-    checker = DualVersionChecker(
-        current_version=__version__,
-        package_name="fansetools",
-        github_repo=__github_repo__,
-        check_interval_days=0
-    )
-    
-    version_info = checker.check_version()
-    
-    if version_info:
-        print("最新版本信息:")
-        if version_info.get('pypi_latest'):
-            status = "可更新" if version_info.get('pypi_update_available') else "已是最新"
-            print(f"  PyPI版本: {version_info['pypi_latest']} ({status})")
-        
-        if version_info.get('github_latest'):
-            gh_info = version_info['github_latest']
-            print(f"  GitHub最新提交: {gh_info['sha']}")
-            print(f"  提交信息: {gh_info['message']}")
-            print(f"  提交时间: {gh_info['date'][:10]}")
-        
-        print("")
-        print("更新命令:")
-        if installation_method == 'pip':
-            print("  pip install --upgrade fansetools")
-        elif installation_method == 'git':
-            print("  git pull origin main")
-            print("  pip install -e .  # 重新安装开发版本")
-        elif installation_method == 'conda':
-            print("  conda update fansetools")
-        else:
-            print("  pip install --upgrade fansetools")
-    
-    print("=" * 60)
+#def show_detailed_version_info():
+#    """显示详细的版本信息"""
+#    from . import __version__, __github_repo__
+#    from .utils.version_check import DualVersionChecker, get_installation_method
+#    
+#    installation_method = get_installation_method()
+#    
+#    print("=" * 60)
+#    print("fansetools - 版本信息")
+#    print("=" * 60)
+#    print(f"当前版本: {__version__}")
+#    print(f"安装方式: {installation_method}")
+#    print(f"GitHub仓库: {__github_repo__}")
+#    print("")
+#    
+#    # 检查更新
+#    checker = DualVersionChecker(
+#        current_version=__version__,
+#        package_name="fansetools",
+#        github_repo=__github_repo__,
+#        check_interval_days=0
+#    )
+#    
+#    version_info = checker.check_version()
+#    
+#    if version_info:
+#        print("最新版本信息:")
+#        if version_info.get('pypi_latest'):
+#            status = "可更新" if version_info.get('pypi_update_available') else "已是最新"
+#            print(f"  PyPI版本: {version_info['pypi_latest']} ({status})")
+#        
+#        if version_info.get('github_latest'):
+#            gh_info = version_info['github_latest']
+#            print(f"  GitHub最新提交: {gh_info['sha']}")
+#            print(f"  提交信息: {gh_info['message']}")
+#            print(f"  提交时间: {gh_info['date'][:10]}")
+#        
+#        print("")
+#        print("更新命令:")
+#        if installation_method == 'pip':
+#            print("  pip install --upgrade fansetools")
+#        elif installation_method == 'git':
+#            print("  git pull origin main")
+#            print("  pip install -e .  # 重新安装开发版本")
+#        elif installation_method == 'conda':
+#            print("  conda update fansetools")
+#        else:
+#            print("  pip install --upgrade fansetools")
+#    
+#    print("=" * 60)
 
 
     

@@ -126,6 +126,25 @@ class FanseRunner:
         "fanse3g.exe", "fanse3.exe", "fanse3g", "fanse3", "fanse",
     ]
 
+    def _validate_output_intent(self, input_paths: List[Path], output_paths: Optional[List[Path]]) -> None:
+        """验证输出路径意图并提供用户提示"""
+        if not output_paths:
+            return
+            
+        if len(output_paths) == 1 and len(input_paths) == 1:
+            output_path = self._normalize_path(output_paths[0])
+            
+            # 检查是否是明显的文件路径（有.fanse3扩展名）
+            if output_path.suffix == '.fanse3':
+                self.logger.info(f"检测到文件输出模式: {output_path}")
+            elif output_path.exists() and output_path.is_file():
+                self.logger.info(f"使用现有文件作为输出: {output_path}")
+            else:
+                self.logger.info(f"检测到目录输出模式，将在目录内创建文件")
+                
+        elif len(output_paths) > 1:
+            self.logger.info(f"多文件输出模式: {len(output_paths)} 个输出路径")
+        
     def __init__(self, debug=False, log_path: Optional[Path] = None):
         # 如果没有colorama，提示
 
@@ -456,22 +475,101 @@ class FanseRunner:
             self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
             raise
 
+    # def generate_output_mapping(self, input_paths: List[Path],
+    #                             output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
+    #     """        
+    #     生成输入输出路径映射（支持文件和文件夹输入）
+
+    #     参数:
+    #         input_paths: 输入路径列表（可以是文件或文件夹）
+    #         output_paths: 可选输出路径列表
+
+    #     返回:
+    #         输入路径到输出路径的映射字典
+
+    #     """
+
+    #     path_map = OrderedDict()
+
+    #     # 展开所有输入路径（处理文件夹情况）
+    #     expanded_inputs = []
+    #     for path in input_paths:
+    #         if path.is_file():
+    #             expanded_inputs.append(path)
+    #         elif path.is_dir():
+    #             # 收集文件夹下所有文件（不递归）
+    #             expanded_inputs.extend(
+    #                 [f for f in path.iterdir() if f.is_file()])
+    #         else:
+    #             raise ValueError(f"路径既不是文件也不是文件夹: {path}")
+
+    #     # 辅助函数：智能生成输出文件名
+    #     def get_output_filename(input_file: Path) -> str:
+    #         """根据输入文件名生成输出文件名，处理压缩文件扩展名"""
+    #         stem = input_file.stem
+
+    #         # 处理常见的压缩文件扩展名
+    #         compress_exts = ['.gz', '.bz2', '.zip']
+    #         for ext in compress_exts:
+    #             if stem.endswith(ext):
+    #                 stem = stem[:-len(ext)]
+
+    #         # 处理常见的测序文件扩展名
+    #         seq_exts = ['.fastq', '.fq', '.fa', '.fna', '.fasta']
+    #         for ext in seq_exts:
+    #             if stem.endswith(ext):
+    #                 stem = stem[:-len(ext)]
+
+    #         return f"{stem}.fanse3"
+
+    #     if output_paths is None:
+    #         for path in expanded_inputs:
+    #             # 使用智能文件名生成
+    #             output_file = path.with_name(get_output_filename(path))
+    #             path_map[path] = output_file
+
+    #     # 2. 指定单个输出路径
+    #     elif len(output_paths) == 1:
+    #         output_dir = self._normalize_path(output_paths[0])
+            
+    #         output_dir.mkdir(parents=True, exist_ok=True)
+    #         for path in expanded_inputs:
+    #             # 使用智能文件名生成
+    #             output_file = output_dir / get_output_filename(path)
+    #             path_map[path] = output_file
+
+    #     # 3. 多个输出路径（必须与输入数量匹配）
+    #     else:
+    #         if len(expanded_inputs) != len(output_paths):
+    #             raise ValueError(
+    #                 f"输入路径({len(expanded_inputs)})和输出路径({len(output_paths)})数量不匹配")
+
+    #         for input_path, output_dir in zip(expanded_inputs, output_paths):
+    #             output_dir = self._normalize_path(output_dir)
+    #             output_dir.mkdir(parents=True, exist_ok=True)
+    #             # 使用智能文件名生成
+    #             output_file = output_dir / get_output_filename(input_path)
+    #             path_map[input_path] = output_file
+
+    #     return path_map
+
     def generate_output_mapping(self, input_paths: List[Path],
-                                output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
+                               output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
         """        
         生成输入输出路径映射（支持文件和文件夹输入）
-
+    
         参数:
             input_paths: 输入路径列表（可以是文件或文件夹）
             output_paths: 可选输出路径列表
-
+    
         返回:
             输入路径到输出路径的映射字典
-
         """
+        # 验证输出意图
+        # self._validate_output_intent(input_paths, output_paths)
 
         path_map = OrderedDict()
-
+    
         # 展开所有输入路径（处理文件夹情况）
         expanded_inputs = []
         for path in input_paths:
@@ -483,56 +581,101 @@ class FanseRunner:
                     [f for f in path.iterdir() if f.is_file()])
             else:
                 raise ValueError(f"路径既不是文件也不是文件夹: {path}")
-
+    
         # 辅助函数：智能生成输出文件名
         def get_output_filename(input_file: Path) -> str:
             """根据输入文件名生成输出文件名，处理压缩文件扩展名"""
             stem = input_file.stem
-
+    
             # 处理常见的压缩文件扩展名
             compress_exts = ['.gz', '.bz2', '.zip']
             for ext in compress_exts:
                 if stem.endswith(ext):
                     stem = stem[:-len(ext)]
-
+    
             # 处理常见的测序文件扩展名
             seq_exts = ['.fastq', '.fq', '.fa', '.fna', '.fasta']
             for ext in seq_exts:
                 if stem.endswith(ext):
                     stem = stem[:-len(ext)]
-
+    
             return f"{stem}.fanse3"
-
+    
+        # 智能识别输出路径类型
         if output_paths is None:
+            # 没有指定输出路径，使用输入文件所在目录
             for path in expanded_inputs:
-                # 使用智能文件名生成
                 output_file = path.with_name(get_output_filename(path))
                 path_map[path] = output_file
-
-        # 2. 指定单个输出路径
+    
         elif len(output_paths) == 1:
-            output_dir = self._normalize_path(output_paths[0])
-            output_dir.mkdir(parents=True, exist_ok=True)
-            for path in expanded_inputs:
-                # 使用智能文件名生成
-                output_file = output_dir / get_output_filename(path)
-                path_map[path] = output_file
-
-        # 3. 多个输出路径（必须与输入数量匹配）
+            # 单个输出路径 - 需要智能识别是文件还是文件夹
+            output_path = self._normalize_path(output_paths[0])
+            
+            # 检查路径是否已存在
+            if output_path.exists():
+                if output_path.is_file():
+                    # 如果输出路径是已存在的文件
+                    if len(expanded_inputs) == 1:
+                        # 单个输入对应单个文件输出
+                        path_map[expanded_inputs[0]] = output_path
+                    else:
+                        # 多个输入不能输出到单个文件
+                        raise ValueError(f"多个输入文件不能输出到单个文件: {output_path}")
+                else:
+                    # 输出路径是目录
+                    for path in expanded_inputs:
+                        output_file = output_path / get_output_filename(path)
+                        path_map[path] = output_file
+            else:
+                # 路径不存在，通过扩展名判断意图
+                if output_path.suffix == '.fanse3' and len(expanded_inputs) == 1:
+                    # 有.fanse3扩展名且单个输入 - 视为文件输出
+                    # 确保父目录存在
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    path_map[expanded_inputs[0]] = output_path
+                else:
+                    # 没有.fanse3扩展名或多个输入 - 视为目录
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    for path in expanded_inputs:
+                        output_file = output_path / get_output_filename(path)
+                        path_map[path] = output_file
+    
         else:
+            # 多个输出路径（必须与输入数量匹配）
             if len(expanded_inputs) != len(output_paths):
                 raise ValueError(
                     f"输入路径({len(expanded_inputs)})和输出路径({len(output_paths)})数量不匹配")
-
-            for input_path, output_dir in zip(expanded_inputs, output_paths):
-                output_dir = self._normalize_path(output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
-                # 使用智能文件名生成
-                output_file = output_dir / get_output_filename(input_path)
-                path_map[input_path] = output_file
-
+    
+            for input_path, output_path in zip(expanded_inputs, output_paths):
+                output_path = self._normalize_path(output_path)
+                
+                if output_path.exists() and output_path.is_file():
+                    # 直接使用指定的文件路径
+                    path_map[input_path] = output_path
+                else:
+                    # 视为目录或创建文件
+                    if output_path.suffix == '.fanse3':
+                        # 有.fanse3扩展名 - 视为文件
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        path_map[input_path] = output_path
+                    else:
+                        # 没有扩展名 - 视为目录
+                        output_path.mkdir(parents=True, exist_ok=True)
+                        output_file = output_path / get_output_filename(input_path)
+                        path_map[input_path] = output_file
+    
+        # # 添加调试信息，帮助用户理解路径映射
+        # self.logger.info("输出路径映射:")
+        # for input_path, output_path in path_map.items():
+        #     self.logger.info(f"  {input_path} -> {output_path}")
+            
+        #     # 如果输出路径是目录而不是文件，发出警告
+        #     if output_path.exists() and output_path.is_dir():
+        #         self.logger.warning(f"警告: 输出路径是目录而不是文件: {output_path}")
+        #         self.logger.warning(f"      将在目录内创建: {get_output_filename(input_path)}")
+    
         return path_map
-
 
 # =============================================================================
 # Start to integrate the paras  to single cmd
@@ -968,19 +1111,19 @@ def add_run_subparser(subparsers):
     )
     parser.add_argument(
         '-S', type=int, metavar='min_LENGTH',
-        help='Seed长度 (默认: 13)'
+        help='Seed长度 (默认: 13)，不建议设置低于10，速度很慢'
     )
     parser.add_argument(
-        '-H', type=int, metavar='MILLIONREADS',
-        help='每批次读取reads数(百万) (默认: 1)'
+        '-H', type=int, metavar='MILLION READS',
+        help='比对时每批次读取fastq的reads数(百万) (默认: 1)，可以为小数，例如0.01'
     )
     parser.add_argument(
         '-C', type=int, metavar='CORES',
-        help='并行核数 (默认: CPU核数-2)'
+        help='并行核数 (默认: 现有CPU总核数-2)'
     )
     parser.add_argument(
-        '-T', type=str, metavar='SPLIT READS',
-        help='START,LENGTH (默认: 0,150)'
+        '-T', type=str, metavar='TRIM READS',
+        help='对read进行预处理，切除不用的区域。从第start位开始切割，向后保留length长度：START,LENGTH (默认: 0,150)'
     )
     parser.add_argument(
         '-I', type=int, metavar='INDEL 0,1',
@@ -1010,12 +1153,12 @@ def add_run_subparser(subparsers):
     parser.add_argument(
         '--rename',
         action='store_true',
-        help='启用reads改名，改为1，2，3，4……'
+        help='启用reads改名，改为1，2，3，4……，减小结果文件大小'
     )
     parser.add_argument(
         '--indel',
         action='store_true',
-        help='启用indel比对'
+        help='启用indel比对，结果更精细，耗时加倍'
     )
 
     parser.add_argument(
@@ -1109,6 +1252,21 @@ def run_command(args):
         # 关键点：生成路径映射必须保留
         path_map = runner.generate_output_mapping(input_paths, output_paths)
 
+        # # 添加用户确认提示
+        # if not args.yes and not args.debug:
+        #     print("\n输出路径确认:")
+        #     for i, (input_path, output_path) in enumerate(path_map.items(), 1):
+        #         print(f"{i}. {input_path.name}")
+        #         print(f"   输出到: {output_path}")
+        #         if output_path.exists() and output_path.is_dir():
+        #             print(f"  警告: 输出路径是目录")
+        #         print()
+            
+        #     response = input("确认输出路径是否正确? [y/n]: ").strip().lower()
+        #     if response != 'y':
+        #         runner.logger.info("用户取消执行")
+        #         return
+        
         # 准备参数
         params = {
             key: value for key, value in [
