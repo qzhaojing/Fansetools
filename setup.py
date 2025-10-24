@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='fansetools',
-    version='v1.0.1',
+    version='v1.0.2',
     package_dir={"": "src"},  # 指定包根目录为src
     packages=find_packages(where="src"),
     entry_points={
