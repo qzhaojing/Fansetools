@@ -199,78 +199,6 @@ def main():
         print(f"错误: {str(e)}")
         sys.exit(1)
 
-#
-#def show_brief_help(parser, subparsers):
-#    """显示简洁的帮助信息"""
-#    from . import __version__
-#
-#    print(f"fansetools {__version__} - FANSe3文件处理工具集")
-#    print("=" * 50)
-#    print("使用方法: fanse <command> [选项]")
-#    print()
-#    print("可用命令:")
-#    
-#    # 显示简化的命令列表
-#    max_cmd_len = max(len(cmd) for cmd in subparsers.choices.keys())
-#    for cmd, subparser in subparsers.choices.items():
-#        desc = subparser.description.split('\n')[0] if subparser.description else ""
-#        print(f"  {cmd:<{max_cmd_len}}  {desc}")
-#    
-#    print()
-#    print("使用 'fanse <command> -h' 查看具体命令的详细帮助")
-#    print("使用 'fanse -v' 查看版本，'fanse --version-info' 查看更新信息")
-#
-#
-#def show_detailed_version_info():
-#    """显示详细的版本信息"""
-#    from . import __version__, __github_repo__
-#    from .utils.version_check import DualVersionChecker, get_installation_method
-#    
-#    installation_method = get_installation_method()
-#    
-#    print("=" * 50)
-#    print("fansetools - 版本信息")
-#    print("=" * 50)
-#    print(f"当前版本: {__version__}")
-#    print(f"安装方式: {installation_method}")
-#    print(f"GitHub仓库: {__github_repo__}")
-#    print()
-#    
-#    # 检查更新
-#    try:
-#        checker = DualVersionChecker(
-#            current_version=__version__,
-#            package_name="fansetools",
-#            github_repo=__github_repo__,
-#            check_interval_days=0
-#        )
-#        
-#        version_info = checker.check_version()
-#        
-#        if version_info:
-#            print("最新版本信息:")
-#            if version_info.get('pypi_latest'):
-#                status = "可更新" if version_info.get('pypi_update_available') else "已是最新"
-#                print(f"  PyPI版本: {version_info['pypi_latest']} ({status})")
-#            
-#            if version_info.get('github_latest'):
-#                gh_info = version_info['github_latest']
-#                print(f"  GitHub最新提交: {gh_info['sha'][:18]} - {gh_info['message'][:150]}...")
-#            
-#            print()
-#            print("更新命令:")
-#            if installation_method == 'pip':
-#                print("  pip install --upgrade fansetools")
-#            elif installation_method == 'git':
-#                print("  git pull origin main")
-#            elif installation_method == 'conda':
-#                print("  conda update fansetools")
-#            else:
-#                print("  pip install --upgrade fansetools")
-#    except Exception:
-#        print("无法检查更新信息")
-#    
-#    print("=" * 50)
 def show_brief_help(parser, subparsers):
     """显示简洁的帮助信息"""
     from . import __version__
@@ -380,59 +308,6 @@ def show_main_help(parser):
     print("  fanse sort -i input.sam -o sorted.sam --sort coord  # 排序SAM文件, 默认coord")
     print("\n使用 fanse -v 查看版本，fanse --version-info 检查更新信息")
     print("使用 fanse update 检查并更新到最新版本")
-
-#def show_detailed_version_info():
-#    """显示详细的版本信息"""
-#    from . import __version__, __github_repo__
-#    from .utils.version_check import DualVersionChecker, get_installation_method
-#    
-#    installation_method = get_installation_method()
-#    
-#    print("=" * 60)
-#    print("fansetools - 版本信息")
-#    print("=" * 60)
-#    print(f"当前版本: {__version__}")
-#    print(f"安装方式: {installation_method}")
-#    print(f"GitHub仓库: {__github_repo__}")
-#    print("")
-#    
-#    # 检查更新
-#    checker = DualVersionChecker(
-#        current_version=__version__,
-#        package_name="fansetools",
-#        github_repo=__github_repo__,
-#        check_interval_days=0
-#    )
-#    
-#    version_info = checker.check_version()
-#    
-#    if version_info:
-#        print("最新版本信息:")
-#        if version_info.get('pypi_latest'):
-#            status = "可更新" if version_info.get('pypi_update_available') else "已是最新"
-#            print(f"  PyPI版本: {version_info['pypi_latest']} ({status})")
-#        
-#        if version_info.get('github_latest'):
-#            gh_info = version_info['github_latest']
-#            print(f"  GitHub最新提交: {gh_info['sha']}")
-#            print(f"  提交信息: {gh_info['message']}")
-#            print(f"  提交时间: {gh_info['date'][:10]}")
-#        
-#        print("")
-#        print("更新命令:")
-#        if installation_method == 'pip':
-#            print("  pip install --upgrade fansetools")
-#        elif installation_method == 'git':
-#            print("  git pull origin main")
-#            print("  pip install -e .  # 重新安装开发版本")
-#        elif installation_method == 'conda':
-#            print("  conda update fansetools")
-#        else:
-#            print("  pip install --upgrade fansetools")
-#    
-#    print("=" * 60)
-
-
     
     
 if __name__ == '__main__':
