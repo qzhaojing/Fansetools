@@ -321,7 +321,7 @@ def add_count_subparser(subparsers):
     parser.add_argument('--minreads', type=int, default=0,
                        help='Minimum reads threshold for filtering')
     parser.add_argument('--rpkm', type=float, default=0,
-                       help='RPKM threshold for filtering')
+                       help='RPKM threshold for filtering，尚未完成')
     
     parser.add_argument('--gtf', 
                        help='GTF/GFF file for gene-level annotation')

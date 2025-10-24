@@ -2,23 +2,23 @@
 """
 版本检测和更新提示模块 - 支持PyPI和GitHub
 """
-import requests
+import os
+import re
+import sys
 import json
 import time
+import requests
 import warnings
+import subprocess
 from pathlib import Path
 from packaging import version
-import sys
-import subprocess
-import os
 from datetime import datetime, timedelta
-import re
 
 class DualVersionChecker:
     """双平台版本检测器（PyPI + GitHub）"""
     
     def __init__(self, current_version, package_name="fansetools", 
-                 github_repo="zhaojing1990/fansetools",  # 替换为您的GitHub仓库
+                 github_repo="qzhaojing/fansetools",  # 替换为您的GitHub仓库
                  check_interval_days=1, enable_check=True):
         self.current_version = current_version
         self.package_name = package_name
@@ -280,6 +280,80 @@ class DualVersionChecker:
                     return True
         return False
 
+
+    def perform_update(self, interactive=True):
+        """执行更新操作"""
+        installation_method = get_installation_method()
+        version_info = self.check_version()
+        
+        if not version_info or not version_info.get('any_update_available'):
+            print("当前已是最新版本，无需更新。")
+            return True
+        
+        print("=" * 60)
+        print("开始更新 fansetools")
+        print("=" * 60)
+        
+        if interactive:
+            # 显示更新信息
+            if version_info.get('pypi_update_available'):
+                print(f"发现新版本: {version_info['pypi_latest']} (当前: {version_info['current_version']})")
+            elif version_info.get('github_update_available'):
+                print("发现GitHub代码更新")
+            
+            # 确认更新
+            try:
+                response = input("是否立即更新? [y/N]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("更新已取消。")
+                    return False
+            except KeyboardInterrupt:
+                print("\n更新已取消。")
+                return False
+        
+        try:
+            if installation_method == 'pip':
+                print("使用pip进行更新...")
+                result = subprocess.run([
+                    sys.executable, '-m', 'pip', 'install', '--upgrade', self.package_name
+                ], check=True, capture_output=True, text=True)
+                print("更新完成!")
+                return True
+                
+            elif installation_method == 'conda':
+                print("使用conda进行更新...")
+                result = subprocess.run([
+                    'conda', 'update', self.package_name
+                ], check=True, capture_output=True, text=True)
+                print("更新完成!")
+                return True
+                
+            elif installation_method == 'git':
+                print("使用git进行更新...")
+                # 拉取最新代码
+                subprocess.run(['git', 'pull'], check=True)
+                # 重新安装
+                subprocess.run([
+                    sys.executable, '-m', 'pip', 'install', '-e', '.'
+                ], check=True)
+                print("更新完成!")
+                return True
+                
+            else:
+                print("无法确定安装方式，请手动更新:")
+                if version_info.get('pypi_latest'):
+                    print(f"  pip install --upgrade {self.package_name}")
+                return False
+                
+        except subprocess.CalledProcessError as e:
+            print(f"更新失败: {e}")
+            if e.stderr:
+                print(f"错误信息: {e.stderr}")
+            return False
+        except Exception as e:
+            print(f"更新过程中发生错误: {e}")
+            return False
+            
 def get_installation_method():
     """检测安装方式"""
     try:
@@ -317,6 +391,7 @@ def get_installation_method():
     
     return 'unknown'
 
+
 def check_fansetools_version():
     """检查fansetools版本的主函数"""
     try:
@@ -327,7 +402,7 @@ def check_fansetools_version():
             return
         
         # 根据安装方式决定GitHub仓库（替换为您的实际仓库）
-        github_repo = "zhaojing1990/fansetools"  # 请修改为您的GitHub用户名和仓库名
+        github_repo = "qzhaojing/fansetools"  # 请修改为您的GitHub用户名和仓库名
         
         checker = DualVersionChecker(
             current_version=__version__,
@@ -348,3 +423,31 @@ def check_fansetools_version():
         # 版本检查不应该影响主要功能
         if os.getenv('FANSETOOLS_DEBUG'):
             print(f"版本检查错误: {e}")
+            
+            
+def update_fansetools(args):
+    """更新fansetools的主函数"""
+    try:
+        from .. import __version__, __github_repo__
+        
+        checker = DualVersionChecker(
+            current_version=__version__,
+            package_name="fansetools",
+            github_repo=__github_repo__,
+            check_interval_days=0,  # 强制检查
+            enable_check=True
+        )
+        
+        return checker.perform_update(interactive=not args.yes)
+        
+    except ImportError:
+        print("错误: 无法导入fansetools版本信息")
+        return False
+    except Exception as e:
+        print(f"更新过程中发生错误: {e}")
+        return False
+
+
+            
+            
+            
