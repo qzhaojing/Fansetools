@@ -2,8 +2,11 @@
 """
 Fansetools - FANSe3文件处理工具包
 """
-from .._version import __version__
-
+try:
+    from fansetools._version import __version__
+except ImportError:
+    # 如果 _version.py 不存在，使用默认版本
+    __version__ = "0.0.0"
 #__version__ = "1.0.3"
 __author__ = "Zhao Jing"
 __email__ = "qzhaojing@qq.com"

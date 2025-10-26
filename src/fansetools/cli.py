@@ -120,7 +120,6 @@ def main():
         usage='fanse [-h] [-v] [--version-info] <command> [<args>]'
     )
     
-    
  # 添加帮助选项
     parser.add_argument('-h', '--help', action='store_true', help='显示帮助信息')
     
