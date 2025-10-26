@@ -2,7 +2,9 @@
 """
 Fansetools - FANSe3文件处理工具包
 """
-__version__ = "1.0.3"
+from .._version import __version__
+
+#__version__ = "1.0.3"
 __author__ = "Zhao Jing"
 __email__ = "qzhaojing@qq.com"
 __github_repo__ = "qzhaojing/fansetools"  # 替换为您的GitHub仓库

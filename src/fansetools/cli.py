@@ -53,8 +53,8 @@ def main():
     # 处理版本信息请求
     if base_args.version or base_args.version_info:
         try:
-            from .utils.version_check import DualVersionChecker, get_installation_method
-            from . import __version__, __github_repo__
+            from fansetools.utils.version_check import DualVersionChecker, get_installation_method
+            from fansetools import __version__, __github_repo__
             
             if base_args.version:
                 # 显示当前版本和最新版本号
@@ -77,12 +77,16 @@ def main():
                 return
                 
         except ImportError:
-            from . import __version__
-            if base_args.version:
-                print(f"fansetools {__version__}")
-                return
-            elif base_args.version_info:
-                print(f"fansetools {__version__} (版本检查模块不可用)")
+            try:
+                from fansetools import __version__
+                if base_args.version:
+                    print(f"fansetools {__version__}")
+                    return
+                elif base_args.version_info:
+                    print(f"fansetools {__version__} (版本检查模块不可用)")
+                    return
+            except ImportError:
+                print("fansetools 版本信息不可用")
                 return
 
     # 版本检查（在解析参数前）
@@ -154,7 +158,7 @@ def main():
     add_mpileup_subparser(subparsers)
     
 
-    # 子命令：update - 新增更新命令
+    # 子命令：update -更新命令
     update_parser = subparsers.add_parser(
         'update',
         help='检查并更新 fansetools',
@@ -170,7 +174,15 @@ def main():
         # 用户输入了 "fanse command"，显示该命令的帮助
         subparsers.choices[remaining_args[0]].print_help()
         return
-
+        
+    # 检查未知命令
+    if remaining_args and remaining_args[0] not in subparsers.choices:
+        if remaining_args[0] not in ['-h', '--help', '-v', '--version', '--version-info']:
+            print(f"错误: 未知命令 '{remaining_args[0]}'")
+            print("当前可用命令: " + ", ".join(sorted(subparsers.choices.keys())))
+            print("如需添加新功能新想法，请至  https://github.com/qzhaojing/fansetools   提交issue反馈探讨沟通")
+            return 1
+            
     # 解析剩余参数
     try:
         args = parser.parse_args(remaining_args)
