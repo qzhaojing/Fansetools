@@ -5,7 +5,7 @@ setup(
     use_scm_version={
         "root": ".",
         "relative_to": __file__,
-        "write_to": "fansetools/_version.py",  # 自动生成版本文件
+        "write_to": "src/fansetools/_version.py",  # 自动生成版本文件
         "version_scheme": "post-release",  # 版本生成策略
         "local_scheme": "dirty-tag",      # 本地修改标记
         "write_to_template": '__version__ = "{version}"',  # 自定义文件格式
