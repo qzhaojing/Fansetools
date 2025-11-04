@@ -19,7 +19,7 @@ class DualVersionChecker:
     
     def __init__(self, current_version, package_name="fansetools", 
                  github_repo="qzhaojing/fansetools",  # 替换为您的GitHub仓库
-                 check_interval_days=1, enable_check=True):
+                 check_interval_days=7, enable_check=True):
         self.current_version = current_version
         self.package_name = package_name
         self.github_repo = github_repo

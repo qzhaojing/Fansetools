@@ -4,14 +4,7 @@
 import os
 import sys
 import argparse
-from .parser import fanse_parser
-from .run import add_run_subparser
-from .sam import add_sam_subparser
-from .bed import add_bed_subparser
-from .fastx import add_fastx_subparser
-from .mpileup import add_mpileup_subparser
-from .count import add_count_subparser
-from .sort import add_sort_subparser
+
 from .utils.version_check import DualVersionChecker, get_installation_method, update_fansetools
 
 
@@ -38,19 +31,33 @@ def main():
     # 初始化变量
     remaining_args = sys.argv[1:]
     
-   # 先解析基础参数（版本相关）
+    # 延迟导入子命令模块
+    from .parser import fanse_parser
+    from .run import add_run_subparser
+    from .count import add_count_subparser
+    
+    from .sam import add_sam_subparser
+    from .bam import add_bam_subparser
+    
+    from .bed import add_bed_subparser
+    from .fastx import add_fastx_subparser
+    from .mpileup import add_mpileup_subparser
+    from .sort import add_sort_subparser
+    
+    
+    # 先解析基础参数（版本相关）
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument('-v', '--version', action='store_true', help='显示版本信息')
     base_parser.add_argument('--version-info', action='store_true', help='显示详细的版本和更新信息')
     
     # 只解析版本相关参数
     try:
-        base_args, _ = base_parser.parse_known_args()
+        base_args, remaining_args = base_parser.parse_known_args()
     except:
         base_args = argparse.Namespace(version=False, version_info=False)
         remaining_args = sys.argv[1:]
-        
-    # 处理版本信息请求
+    
+    # 处理版本信息请求（优先处理）
     if base_args.version or base_args.version_info:
         try:
             from fansetools.utils.version_check import DualVersionChecker, get_installation_method
@@ -89,27 +96,6 @@ def main():
                 print("fansetools 版本信息不可用")
                 return
 
-    # 版本检查（在解析参数前）
-    try:
-        from .utils.version_check import DualVersionChecker, get_installation_method
-        from . import __version__, __github_repo__
-                
-        if not os.getenv('FANSETOOLS_DISABLE_VERSION_CHECK'):
-            checker = DualVersionChecker(
-                current_version=__version__,
-                package_name="fansetools",
-                github_repo=__github_repo__,
-                check_interval_days=7,  # 每次都检查
-                enable_check=True
-            )
-            # 只在非update命令时显示更新通知
-            if not (remaining_args and remaining_args[0] == 'update'):
-                checker.show_update_notification(force_check=True)
-    except ImportError:
-        pass
-
-#----------------------------------------------------------------------------
-
     # 创建主解析器
     parser = argparse.ArgumentParser(
         prog='fanse',
@@ -120,16 +106,18 @@ def main():
         usage='fanse [-h] [-v] [--version-info] <command> [<args>]'
     )
     
- # 添加帮助选项
+    # 添加帮助选项
     parser.add_argument('-h', '--help', action='store_true', help='显示帮助信息')
     
     subparsers = parser.add_subparsers(
         title='可用命令',
         dest='command',
-        required=False)
+        metavar='<command>'
+    )
+    
     # 添加所有子命令   
     add_run_subparser(subparsers)
-
+    
     # 子命令：parser
     parser_parser = subparsers.add_parser(
         'parser',
@@ -137,13 +125,16 @@ def main():
         description='解析 FANSe3 文件并输出结构化数据'
     )
     parser_parser.add_argument('input_file', help='输入文件路径（FANSe3 格式）')
-
+    
     # 子命令：count
     add_count_subparser(subparsers)
     
     # 子命令：sam
     add_sam_subparser(subparsers)
 
+    # 子命令：bam
+    add_bam_subparser(subparsers)
+    
     # 子命令：sort
     add_sort_subparser(subparsers)
 
@@ -156,8 +147,7 @@ def main():
     # 子命令：mpileup
     add_mpileup_subparser(subparsers)
     
-
-    # 子命令：update -更新命令
+    # 子命令：update - 更新命令（放在最后，避免干扰）
     update_parser = subparsers.add_parser(
         'update',
         help='检查并更新 fansetools',
@@ -167,48 +157,63 @@ def main():
                               help='自动确认更新，无需交互')
     update_parser.set_defaults(func=update_fansetools)
     
+    # 如果没有参数，显示帮助
+    if not remaining_args:
+        show_brief_help(parser, subparsers)
+        return
     
-    # 特殊情况：直接显示子命令帮助
+    # 特殊处理：如果第一个参数是子命令但后面没有其他参数，显示该子命令的帮助
     if len(remaining_args) == 1 and remaining_args[0] in subparsers.choices:
-        # 用户输入了 "fanse command"，显示该命令的帮助
         subparsers.choices[remaining_args[0]].print_help()
         return
-        
-    # 检查未知命令
-    if remaining_args and remaining_args[0] not in subparsers.choices:
-        if remaining_args[0] not in ['-h', '--help', '-v', '--version', '--version-info']:
-            print(f"错误: 未知命令 '{remaining_args[0]}'")
-            print("当前可用命令: " + ", ".join(sorted(subparsers.choices.keys())))
-            print("如需添加新功能新想法，请至  https://github.com/qzhaojing/fansetools   提交issue反馈探讨沟通")
-            return 1
-            
-    # 解析剩余参数
+    
+    # 解析参数
     try:
         args = parser.parse_args(remaining_args)
     except SystemExit:
-        # 当没有提供命令时显示简洁帮助
-        if not remaining_args or remaining_args[0] in ['-h', '--help']:
-            show_brief_help(parser, subparsers)
-        return
-        
+        return 1
+    
     # 处理帮助请求
     if hasattr(args, 'help') and args.help:
         show_brief_help(parser, subparsers)
         return
-        
-    if not hasattr(args, 'func') or args.command is None:
+    
+    # 执行对应的函数
+    if hasattr(args, 'func'):
+        # 如果是update命令，跳过版本检查（避免循环）
+        if args.command == 'update':
+            try:
+                return args.func(args)
+            except Exception as e:
+                print(f"更新过程中发生错误: {e}")
+                return 1
+        else:
+            # 对于其他命令，进行版本检查
+            try:
+                from .utils.version_check import DualVersionChecker, get_installation_method
+                from . import __version__, __github_repo__
+                
+                if not os.getenv('FANSETOOLS_DISABLE_VERSION_CHECK'):
+                    checker = DualVersionChecker(
+                        current_version=__version__,
+                        package_name="fansetools",
+                        github_repo=__github_repo__,
+                        check_interval_days=7,
+                        enable_check=True
+                    )
+                    checker.show_update_notification(force_check=True)
+            except ImportError:
+                pass
+            
+            # 执行命令
+            try:
+                return args.func(args)
+            except Exception as e:
+                print(f"命令执行错误: {e}")
+                return 1
+    else:
         show_brief_help(parser, subparsers)
-        return
-
-    # 禁用colorama（非交互式终端）
-    if not sys.stdout.isatty():
-        os.environ["COLORAMA_DISABLE"] = "true"
-
-    try:
-        args.func(args)
-    except Exception as e:
-        print(f"错误: {str(e)}")
-        sys.exit(1)
+        return 1
 
 def show_brief_help(parser, subparsers):
     """显示简洁的帮助信息"""
