@@ -1,5 +1,10 @@
 from setuptools import setup, find_packages
 import os
+import sys
+package_data = {}
+if sys.platform == 'win32':
+    package_data['fansetools'] = ['bin/windows/*']
+
 
 setup(
     name='fansetools',
@@ -13,15 +18,25 @@ setup(
         "write_to_template": '__version__ = "{version}"',  # 自定义文件格式
         "fallback_version": "1.0.0",     # Git无标签时的默认版本
     },
+    
     setup_requires=["setuptools_scm"],
     #version='v1.0.2',
     package_dir={"": "src"},  # 指定包根目录为src
     packages=find_packages(where="src"),
+    
     entry_points={
         'console_scripts': [
             'fanse=fansetools.cli:main',
         ],
     },
+    package_data={
+    'fansetools': [
+        'bin/windows/*.exe', 
+        'bin/windows/*.txt',
+        'bin/windows/*.pl'
+    ]
+    },
+    include_package_data=True,
     # install_requires=[
     #    'tqdm',   #进度条
     #    # 你的依赖项
@@ -30,6 +45,8 @@ setup(
         'tqdm>=4.0.0',
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
         'pandas', 
+        'biopython',
+         
         
     ],
 
