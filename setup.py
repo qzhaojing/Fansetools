@@ -8,7 +8,8 @@ setup(
         "relative_to": __file__,
         "write_to": "src/fansetools/_version.py",  # 自动生成版本文件
         "version_scheme": "post-release",  # 版本生成策略
-        "local_scheme": "dirty-tag",      # 本地修改标记
+        #"local_scheme": "dirty-tag",      # 本地修改标记
+        "local_scheme": "no-local-version",  # 这行很重要，避免 +dirty 后缀
         "write_to_template": '__version__ = "{version}"',  # 自定义文件格式
         "fallback_version": "1.0.0",     # Git无标签时的默认版本
     },
@@ -28,6 +29,8 @@ setup(
     install_requires=[
         'tqdm>=4.0.0',
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
+        'pandas', 
+        
     ],
 
     extras_require={

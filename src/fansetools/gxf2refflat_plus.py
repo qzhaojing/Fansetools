@@ -501,6 +501,444 @@ def convert_gxf_to_refflat(input_file, output_prefix, file_type='auto', add_head
     
     return genomic_df, rna_df
 
+
+###################
+
+def add_exon_numbering_to_rna_refflat(rna_df):
+    """
+    在RNA坐标的refFlat中添加外显子编号信息
+    """
+    enhanced_df = rna_df.copy()
+    
+    def add_exon_numbers(row):
+        if not row['exonStarts_list'] or not row['exonEnds_list']:
+            return row
+        
+        # 为每个外显子添加编号
+        exon_numbers = []
+        for i, (start, end) in enumerate(zip(row['exonStarts_list'], row['exonEnds_list'])):
+            exon_numbers.append(f"Exon{i+1}({start}-{end})")
+        
+        row['exon_labels'] = ';'.join(exon_numbers)
+        return row
+    
+    return enhanced_df.apply(add_exon_numbers, axis=1)
+
+def generate_exon_bed_track(genomic_df, output_file):
+    """
+    生成外显子BED轨道文件，用于IGV中显示外显子边界
+    """
+    bed_records = []
+    
+    for _, transcript in genomic_df.iterrows():
+        if not transcript['exonStarts_list']:
+            continue
+            
+        # 为每个外显子创建BED记录
+        for i, (start, end) in enumerate(zip(transcript['exonStarts_list'], 
+                                            transcript['exonEnds_list'])):
+            bed_record = {
+                'chrom': transcript['chrom'],
+                'start': start,
+                'end': end,
+                'name': f"{transcript['txname']}_exon{i+1}",
+                'score': 0,
+                'strand': transcript['strand'],
+                'thickStart': start,
+                'thickEnd': end,
+                'itemRgb': f"{i*30},{i*50},{i*70}"  # 不同外显子不同颜色
+            }
+            bed_records.append(bed_record)
+    
+    # 保存为BED文件
+    bed_df = pd.DataFrame(bed_records)
+    bed_df.to_csv(output_file, sep='\t', header=False, index=False)
+
+def generate_exon_gtf_track(rna_df, output_file):
+    """
+    生成RNA坐标下的外显子GTF轨道文件
+    """
+    gtf_records = []
+    
+    for _, transcript in rna_df.iterrows():
+        if not transcript['exonStarts_list']:
+            continue
+            
+        # 为每个外显子创建GTF记录
+        for i, (start, end) in enumerate(zip(transcript['exonStarts_list'], 
+                                            transcript['exonEnds_list'])):
+            attributes = (
+                f'gene_id "{transcript["geneName"]}"; '
+                f'transcript_id "{transcript["txname"]}"; '
+                f'exon_number "{i+1}"; '
+                f'exon_id "{transcript["txname"]}_exon{i+1}"; '
+                f'color "{i*40},{i*60},{i*80}"'
+            )
+            
+            gtf_record = {
+                'seqname': transcript['txname'],  # 使用转录本名作为序列名
+                'source': 'gxf_converter',
+                'feature': 'exon',
+                'start': start + 1,  # GTF是1-based
+                'end': end,
+                'score': '.',
+                'strand': '+',  # RNA坐标总是正向
+                'frame': '.',
+                'attributes': attributes
+            }
+            gtf_records.append(gtf_record)
+    
+    # 保存为GTF文件
+    gtf_df = pd.DataFrame(gtf_records)
+    gtf_df.to_csv(output_file, sep='\t', header=False, index=False, )
+                 # quoting=csv.QUOTE_NONE)
+    
+def generate_ucsc_style_track(genomic_df, output_file):
+    """
+    生成UCSC风格的基因预测轨道
+    """
+    # 创建BED12格式，可以显示外显子-内含子结构
+    bed12_records = []
+    
+    for _, transcript in genomic_df.iterrows():
+        if not transcript['exonStarts_list']:
+            continue
+            
+        # 排序外显子
+        exon_data = sorted(zip(transcript['exonStarts_list'], 
+                             transcript['exonEnds_list']))
+        starts, ends = zip(*exon_data)
+        
+        # BED12格式需要计算外显子大小和相对位置
+        block_sizes = [end - start for start, end in exon_data]
+        block_starts = [start - transcript['txStart'] for start in starts]
+        
+        bed12_record = {
+            'chrom': transcript['chrom'],
+            'start': transcript['txStart'],
+            'end': transcript['txEnd'],
+            'name': transcript['txname'],
+            'score': 1000,  # 显示高度
+            'strand': transcript['strand'],
+            'thickStart': transcript['cdsStart'],
+            'thickEnd': transcript['cdsEnd'],
+            'itemRgb': '0,0,255',  # 蓝色
+            'blockCount': len(exon_data),
+            'blockSizes': ','.join(map(str, block_sizes)) + ',',
+            'blockStarts': ','.join(map(str, block_starts)) + ','
+        }
+        bed12_records.append(bed12_record)
+    
+    # 保存为BED12文件
+    bed12_df = pd.DataFrame(bed12_records)
+    bed12_df.to_csv(output_file, sep='\t', header=False, index=False)
+
+def convert_gxf_to_refflat_with_tracks(input_file, output_prefix, file_type='auto', add_header=False):
+    """
+    增强版转换函数：生成refFlat文件和外显子轨道文件
+    """
+    # 原有的转换逻辑
+    genomic_df, rna_df = convert_gxf_to_refflat(input_file, output_prefix, file_type, add_header)
+    
+    if genomic_df is None:
+        return None, None
+    
+    # 生成外显子轨道文件
+    print("生成外显子可视化轨道文件...")
+    
+    # 1. 基因组坐标的外显子BED轨道
+    exon_bed_file = f"{output_prefix}.exons_genomic.bed"
+    generate_exon_bed_track(genomic_df, exon_bed_file)
+    
+    # 2. RNA坐标的外显子GTF轨道
+    exon_gtf_file = f"{output_prefix}.exons_rna.gtf"
+    generate_exon_gtf_track(rna_df, exon_gtf_file)
+    
+    # 3. UCSC风格的基因预测轨道
+    ucsc_bed_file = f"{output_prefix}.ucsc_style.bed"
+    generate_ucsc_style_track(genomic_df, ucsc_bed_file)
+    
+    print("生成的外显子轨道文件:")
+    print(f"1. 基因组外显子BED: {exon_bed_file}")
+    print(f"2. RNA外显子GTF: {exon_gtf_file}") 
+    print(f"3. UCSC基因预测BED: {ucsc_bed_file}")
+    
+    return genomic_df, rna_df
+
+def generate_unified_rna_gtf(genomic_df, output_file):
+    """
+    生成统一的RNA坐标GTF文件，同时满足基因模型和外显子可视化需求
+    
+    参数:
+        genomic_df: 基因组坐标的DataFrame
+        output_file: 输出GTF文件路径
+    """
+    gtf_records = []
+    
+    for _, transcript in genomic_df.iterrows():
+        tx_id = transcript['txname']
+        gene_id = transcript['geneName']
+        tx_length = transcript['txLength']
+        
+        # 1. 转录本级别的记录（作为"染色体"定义）
+        transcript_record = {
+            'seqname': tx_id,  # 使用转录本ID作为序列名
+            'source': 'gxf_converter',
+            'feature': 'transcript',
+            'start': 1,  # RNA坐标从1开始
+            'end': tx_length,
+            'score': '.',
+            'strand': '+',  # RNA坐标总是正向
+            'frame': '.',
+            'attributes': f'gene_id "{gene_id}"; transcript_id "{tx_id}"; '
+                        f'gene_name "{transcript.get("genename", gene_id)}"; '
+                        f'biotype "{transcript.get("t_biotype", "")}"; '
+                        f'tx_length "{tx_length}"; '
+                        f'cds_length "{transcript.get("cdsLength", 0)}"; '
+                        f'utr5_length "{transcript.get("utr5Length", 0)}"; '
+                        f'utr3_length "{transcript.get("utr3Length", 0)}"'
+        }
+        gtf_records.append(transcript_record)
+        
+        # 2. 外显子记录（用于可视化外显子边界）
+        if transcript.get('exonStarts_list') and transcript.get('exonEnds_list'):
+            for i, (start, end) in enumerate(zip(transcript['exonStarts_list'], 
+                                                transcript['exonEnds_list'])):
+                # 转换为RNA坐标（0-based到1-based）
+                rna_start = start + 1
+                rna_end = end
+                
+                exon_record = {
+                    'seqname': tx_id,
+                    'source': 'gxf_converter', 
+                    'feature': 'exon',
+                    'start': rna_start,
+                    'end': rna_end,
+                    'score': '.',
+                    'strand': '+',
+                    'frame': '.',
+                    'attributes': f'gene_id "{gene_id}"; transcript_id "{tx_id}"; '
+                                f'exon_number "{i+1}"; '
+                                f'exon_id "{tx_id}_exon{i+1}"; '
+                                f'color "{min(255, i*40)},{min(255, i*60)},{min(255, i*80)}"'
+                }
+                gtf_records.append(exon_record)
+        
+        # 3. CDS区域记录
+        if transcript.get('cdsStart', 0) < transcript.get('cdsEnd', 0):
+            cds_start = transcript['cdsStart'] + 1  # 转换为1-based
+            cds_end = transcript['cdsEnd']
+            
+            cds_record = {
+                'seqname': tx_id,
+                'source': 'gxf_converter',
+                'feature': 'CDS', 
+                'start': cds_start,
+                'end': cds_end,
+                'score': '.',
+                'strand': '+',
+                'frame': '0',  # CDS起始帧
+                'attributes': f'gene_id "{gene_id}"; transcript_id "{tx_id}"; '
+                            f'protein_id "{transcript.get("protein_id", "")}"'
+            }
+            gtf_records.append(cds_record)
+        
+        # 4. UTR区域记录（如果存在）
+        if transcript.get('utr5Length', 0) > 0:
+            utr5_start = 1
+            utr5_end = transcript.get('utr5Length', 0)
+            
+            utr5_record = {
+                'seqname': tx_id,
+                'source': 'gxf_converter',
+                'feature': 'five_prime_UTR',
+                'start': utr5_start,
+                'end': utr5_end,
+                'score': '.', 
+                'strand': '+',
+                'frame': '.',
+                'attributes': f'gene_id "{gene_id}"; transcript_id "{tx_id}"'
+            }
+            gtf_records.append(utr5_record)
+        
+        if transcript.get('utr3Length', 0) > 0:
+            utr3_start = tx_length - transcript.get('utr3Length', 0) + 1
+            utr3_end = tx_length
+            
+            utr3_record = {
+                'seqname': tx_id,
+                'source': 'gxf_converter',
+                'feature': 'three_prime_UTR', 
+                'start': utr3_start,
+                'end': utr3_end,
+                'score': '.',
+                'strand': '+',
+                'frame': '.',
+                'attributes': f'gene_id "{gene_id}"; transcript_id "{tx_id}"'
+            }
+            gtf_records.append(utr3_record)
+    
+    # 转换为DataFrame并保存
+    gtf_df = pd.DataFrame(gtf_records)
+    
+    # 保存为GTF文件
+    gtf_df.to_csv(output_file, sep='\t', header=False, index=False, )
+                 # quoting=csv.QUOTE_NONE)
+    
+    print(f"生成统一RNA GTF文件: {output_file}")
+    print(f"包含 {len(gtf_df)} 条记录，涵盖 {len(genomic_df)} 个转录本")
+    return gtf_df
+
+
+# def generate_enhanced_rna_gtf(genomic_df, output_file, include_splicing_events=True):
+#     """
+#     生成增强版的RNA坐标GTF文件，支持选择性剪接可视化，，以后再增强吧，现在先不了
+#     """
+#     gtf_records = []
+#     splicing_events = defaultdict(list) if include_splicing_events else None
+    
+#     for _, transcript in genomic_df.iterrows():
+#         tx_id = transcript['txname']
+#         gene_id = transcript['geneName']
+        
+#         # 基本转录本记录
+#         transcript_record = create_transcript_record(transcript)
+#         gtf_records.append(transcript_record)
+        
+#         # 外显子记录（带颜色编码）
+#         exon_records = create_exon_records(transcript, color_by='type')
+#         gtf_records.extend(exon_records)
+        
+#         # CDS和UTR记录
+#         cds_utr_records = create_cds_utr_records(transcript)
+#         gtf_records.extend(cds_utr_records)
+        
+#         # 选择性剪接标记（如果启用）
+#         if include_splicing_events:
+#             splicing_markers = create_splicing_markers(transcript, splicing_events)
+#             gtf_records.extend(splicing_markers)
+    
+#     # 添加选择性剪接事件汇总
+#     if include_splicing_events and splicing_events:
+#         event_records = create_splicing_event_summary(splicing_events, genomic_df)
+#         gtf_records.extend(event_records)
+    
+#     # 保存文件
+#     gtf_df = pd.DataFrame(gtf_records)
+#     gtf_df.to_csv(output_file, sep='\t', header=False, index=False, 
+#                   quoting=csv.QUOTE_NONE)
+    
+#     return gtf_df
+
+# def create_exon_records(transcript, color_by='type'):
+#     """创建外显子记录，支持不同的颜色编码方案"""
+#     records = []
+#     tx_id = transcript['txname']
+#     gene_id = transcript['geneName']
+    
+#     if not transcript.get('exonStarts_list'):
+#         return records
+    
+#     for i, (start, end) in enumerate(zip(transcript['exonStarts_list'], 
+#                                         transcript['exonEnds_list'])):
+#         # 确定外显子类型和颜色
+#         exon_type, color = classify_exon(transcript, i, color_by)
+        
+#         attributes = (
+#             f'gene_id "{gene_id}"; transcript_id "{tx_id}"; '
+#             f'exon_number "{i+1}"; exon_type "{exon_type}"; '
+#             f'color "{color}"; length "{end - start}"'
+#         )
+        
+#         record = {
+#             'seqname': tx_id,
+#             'source': 'gxf_converter',
+#             'feature': 'exon',
+#             'start': start + 1,
+#             'end': end,
+#             'score': '.',
+#             'strand': '+',
+#             'frame': '.',
+#             'attributes': attributes
+#         }
+#         records.append(record)
+    
+#     return records
+
+def classify_exon(transcript, exon_index, color_by):
+    """分类外显子并分配颜色"""
+    if color_by == 'type':
+        # 基于外显子类型分配颜色
+        exon_types = {
+            'first': '255,100,100',    # 红色 - 第一个外显子
+            'last': '100,100,255',     # 蓝色 - 最后一个外显子  
+            'middle': '100,255,100',   # 绿色 - 中间外显子
+            'alternative': '255,200,50' # 黄色 - 选择性外显子
+        }
+        
+        total_exons = len(transcript['exonStarts_list'])
+        
+        if exon_index == 0:
+            return 'first', exon_types['first']
+        elif exon_index == total_exons - 1:
+            return 'last', exon_types['last']
+        else:
+            return 'middle', exon_types['middle']
+    
+    elif color_by == 'position':
+        # 基于位置渐变颜色
+        r = min(255, exon_index * 40)
+        g = min(255, exon_index * 60) 
+        b = min(255, exon_index * 80)
+        return 'exon', f'{r},{g},{b}'
+    
+    else:
+        return 'exon', '100,100,100'
+    
+def convert_gxf_to_unified_gtf(input_file, output_prefix, file_type='auto', 
+                              enhanced=False, add_header=False):
+    """
+    主转换函数：生成统一的RNA坐标GTF文件
+    
+    参数:
+        input_file: 输入GXF文件
+        output_prefix: 输出文件前缀
+        file_type: 文件类型检测
+        enhanced: 是否使用增强版（支持选择性剪接）
+        add_header: 是否添加文件头
+    """
+    # 1. 解析原始GXF文件
+    genomic_df = load_annotation_to_dataframe(input_file, file_type)
+    
+    if genomic_df.empty:
+        print("错误：没有找到可转换的数据")
+        return None
+    
+    # 2. 生成统一GTF文件
+    # if enhanced:
+    #     output_file = f"{output_prefix}.enhanced.rna.gtf"
+    #     gtf_df = generate_enhanced_rna_gtf(genomic_df, output_file, 
+    #                                      include_splicing_events=True)
+    # else:
+    output_file = f"{output_prefix}.rna.gtf" 
+    gtf_df = generate_unified_rna_gtf(genomic_df, output_file)
+    
+    # 3. 可选：生成基因组坐标的refFlat作为备份
+    genomic_file = f"{output_prefix}.genomic.refflat"
+    save_refflat_dataframe(genomic_df, genomic_file, add_header, is_rna=False)
+    
+    print("转换完成！")
+    print(f"主要输出: {output_file} (统一RNA GTF文件)")
+    print(f"备用输出: {genomic_file} (基因组坐标refFlat)")
+    print("\nIGV使用说明:")
+    print("1. 加载RNA GTF文件作为注释轨道")
+    print("2. 选择任意转录本ID作为参考序列")
+    print("3. 外显子将自动显示不同颜色和编号")
+    
+    return gtf_df
+
+
+
 def main():
     """Command line interface."""
     args = parse_arguments()
@@ -513,10 +951,16 @@ def main():
     file_type = detect_file_type(args.gxf)
     print(f"Detected file type: {file_type.upper()}")
     
-    # Generate output files
-    genomic_df, rna_df = convert_gxf_to_refflat(
+    # Generate output files    #两个refflat文件，rna没有分割bed
+    # genomic_df, rna_df = convert_gxf_to_refflat(
+    #     args.gxf, args.output_prefix, file_type, args.add_header
+    # )
+    #生成两个refflat文件，再加上RNA.bed, 先这样子先
+    genomic_df, rna_df = convert_gxf_to_refflat_with_tracks(
         args.gxf, args.output_prefix, file_type, args.add_header
-    )
+    )    
+    # genomic_df, rna_df =  convert_gxf_to_refflat_with_tracks(input_gff, output_prefix, file_type='auto', add_header=True)
+    
     
     if genomic_df is not None:
         print(f"Conversion complete. Processed {len(genomic_df)} transcripts.")
@@ -535,6 +979,16 @@ if __name__ == '__main__':
     
     
     input_gff = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311.gff'
-    output_prefix = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311'
+    output_prefix = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311_tracks'
     add_header = 1
     genomic_df, rna_df = convert_gxf_to_refflat(input_gff, output_prefix, file_type='auto', add_header=True)
+
+    genomic_df, rna_df =  convert_gxf_to_refflat_with_tracks(input_gff, output_prefix, file_type='auto', add_header=True)
+
+
+    # 基本使用
+    rna_gtf = convert_gxf_to_unified_gtf(
+        input_file= input_gff , 
+        output_prefix = output_prefix ,
+        file_type="auto"
+    )
