@@ -2,7 +2,7 @@
 """
 Created on Wed Jun 18 11:56:35 2025
 v0.1
-
+v0.2 优化的FANSe到SAM转换，包含精确MAPQ计算
 @author: P.h.D., ZhaoJing, 
 
 主要新增功能说明：
@@ -39,7 +39,7 @@ chr1,chr2:500-1000- 多区域组合
 
 Jinan University
 """
-
+import math
 import os
 import gzip
 import sys
@@ -181,10 +181,10 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
 #     return flag
 def calculate_flag(
     strand: str,
-    is_paired: bool = True,
-    is_proper_pair: bool = True,
+    is_paired: bool = False,   # 默认改为False，因为fanse目前支持单端测序
+    is_proper_pair: bool = False,
     is_mapped: bool = True,
-    mate_mapped: bool = True,
+    mate_mapped: bool = False,
     is_read1: bool = False,
     is_read2: bool = False,
     is_secondary: bool = False,
@@ -256,6 +256,217 @@ def calculate_flag(
 
     return flag
 
+def calculate_nm(alignment: str) -> int:
+    """计算编辑距离（不匹配+插入+缺失）"""
+    nm = 0
+    for char in alignment:
+        if char == 'x':  # 错配
+            nm += 1
+        elif char == '-':  # 缺失
+            nm += 1
+        elif char.isalpha() and char not in 'x':  # 插入
+            nm += 1
+    return nm
+
+
+
+def calculate_mapq(record: FANSeRecord, alignment_index: int, is_primary: bool = True) -> int:
+    """
+    计算精确的MAPQ值，基于FANSe3比对特征
+    
+    参数:
+        record: FANSe记录
+        alignment_index: 当前比对在记录中的索引
+        is_primary: 是否为主要比对
+    
+    返回:
+        MAPQ值 (0-60)
+    """
+    # 获取当前比对信息
+    alignment_str = record.alignment[alignment_index]
+    mismatches = record.mismatches[alignment_index]
+    read_length = len(record.seq)
+    multi_count = record.multi_count
+    
+    # 1. 计算基础比对质量（基于错配率）
+    alignment_length = len(alignment_str)
+    
+    # 计算有效比对长度（排除缺失和软裁剪）
+    effective_length = sum(1 for char in alignment_str if char not in '-S')
+    
+    if effective_length == 0:
+        return 0  # 无效比对
+    
+    # 错配率
+    mismatch_rate = mismatches / effective_length
+    
+    # 2. 基础质量得分（基于错配率，0-60分）
+    # 完美比对: 60分，每增加1%错配率减少3分
+    base_quality = max(0, 60 - (mismatch_rate * 100 * 3))
+    
+    # 3. 长度惩罚因子（短比对惩罚）
+    length_factor = min(1.0, effective_length / 100.0)  # 以100bp为基准
+    
+    # 4. 多重比对惩罚因子
+    if multi_count > 1:
+        # 多重比对惩罚：每个额外比对减少质量
+        multi_penalty = min(30, 10 * math.log2(multi_count))
+    else:
+        multi_penalty = 0
+    
+    # 5. 比对一致性得分（基于连续匹配）
+    consistency_score = calculate_alignment_consistency(alignment_str)
+    
+    # 6. 最终MAPQ计算
+    mapq = base_quality * length_factor - multi_penalty + consistency_score
+    
+    # 7. 如果是次要比对，进一步降低质量
+    if not is_primary:
+        mapq *= 0.7  # 次要比对质量降低30%
+    
+    # 边界检查和质量分级
+    mapq = max(0, min(60, mapq))
+    
+    # 8. 质量分级（离散化到标准MAPQ级别）
+    return discretize_mapq(mapq)
+
+def calculate_alignment_consistency(alignment: str) -> float:
+    """
+    计算比对一致性得分，基于连续匹配块的质量
+    
+    参数:
+        alignment: 比对字符串
+    
+    返回:
+        一致性得分 (0-10)
+    """
+    if not alignment:
+        return 0
+    
+    # 查找连续匹配块
+    current_char = alignment[0]
+    current_length = 1
+    match_blocks = []
+    
+    for char in alignment[1:]:
+        if char == current_char:
+            current_length += 1
+        else:
+            if current_char in '.':  # 匹配块
+                match_blocks.append(current_length)
+            current_char = char
+            current_length = 1
+    
+    # 处理最后一个块
+    if current_char in '.':
+        match_blocks.append(current_length)
+    
+    if not match_blocks:
+        return 0
+    
+    # 计算平均匹配块长度和最大块长度
+    avg_block_length = sum(match_blocks) / len(match_blocks)
+    max_block_length = max(match_blocks)
+    
+    # 一致性得分：基于块长度和质量
+    consistency = min(10, (avg_block_length + max_block_length) / 20.0)
+    return consistency
+
+def discretize_mapq(raw_mapq: float) -> int:
+    """
+    将原始MAPQ值离散化到标准级别
+    
+    参数:
+        raw_mapq: 原始MAPQ值
+    
+    返回:
+        离散化的MAPQ (0, 1, 3, 5, 10, 20, 30, 40, 50, 60)
+    """
+    # 标准MAPQ离散级别
+    levels = [0, 1, 3, 5, 10, 20, 30, 40, 50, 60]
+    
+    for level in reversed(levels):
+        if raw_mapq >= level:
+            return level
+    
+    return 0
+
+def calculate_mapq_advanced(record: FANSeRecord, alignment_index: int, 
+                          is_primary: bool = True, scoring_system: dict = None) -> int:
+    """
+    高级MAPQ计算，支持自定义打分系统
+    
+    参数:
+        record: FANSe记录
+        alignment_index: 比对索引
+        is_primary: 是否主要比对
+        scoring_system: 自定义打分系统
+    
+    返回:
+        MAPQ值
+    """
+    if scoring_system is None:
+        scoring_system = {
+            'match_score': 2,      # 匹配得分
+            'mismatch_penalty': -4, # 错配惩罚
+            'gap_open_penalty': -6, # 开空位惩罚
+            'gap_extend_penalty': -1, # 空位延伸惩罚
+            'min_mapq': 0,          # 最小MAPQ
+            'max_mapq': 60          # 最大MAPQ
+        }
+    
+    alignment = record.alignment[alignment_index]
+    mismatches = record.mismatches[alignment_index]
+    
+    # 计算比对得分
+    alignment_score = 0
+    gap_open = False
+    
+    for char in alignment:
+        if char == '.':
+            alignment_score += scoring_system['match_score']
+            gap_open = False
+        elif char == 'x':
+            alignment_score += scoring_system['mismatch_penalty']
+            gap_open = False
+        elif char == '-':
+            if not gap_open:
+                alignment_score += scoring_system['gap_open_penalty']
+                gap_open = True
+            else:
+                alignment_score += scoring_system['gap_extend_penalty']
+        else:  # 插入
+            if not gap_open:
+                alignment_score += scoring_system['gap_open_penalty']
+                gap_open = True
+            else:
+                alignment_score += scoring_system['gap_extend_penalty']
+    
+    # 理论最大得分（完美比对）
+    max_possible_score = len([c for c in alignment if c != '-']) * scoring_system['match_score']
+    
+    if max_possible_score == 0:
+        return scoring_system['min_mapq']
+    
+    # 得分比例
+    score_ratio = alignment_score / max_possible_score
+    
+    # 转换为MAPQ
+    raw_mapq = score_ratio * scoring_system['max_mapq']
+    
+    # 多重比对惩罚,太多了就罚60分了，没分了
+    if record.multi_count > 1:
+        multi_penalty = min(60, math.log2(record.multi_count) * 5)
+        raw_mapq -= multi_penalty
+    
+    # 次要比对惩罚
+    if not is_primary:
+        raw_mapq *= 0.6
+    
+    # 边界检查
+    raw_mapq = max(scoring_system['min_mapq'], min(scoring_system['max_mapq'], raw_mapq))
+    
+    return discretize_mapq(raw_mapq)
 
 def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
     """生成SA标签字符串"""
@@ -415,11 +626,20 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
 def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #20251024第二次优化
     if not record.ref_names:
         return
-
+    
+        
     # 直接使用第一条记录作为主记录
     primary_idx = 0
     primary_strand = record.strands[primary_idx]
     is_primary_reverse = (primary_strand == 'R')
+
+    # 预计算所有MAPQ值
+    mapq_values = []
+    for i in range(len(record.ref_names)):
+        is_primary = (i == primary_idx)
+        # 使用高级MAPQ计算
+        mapq = calculate_mapq_advanced(record, i, is_primary)
+        mapq_values.append(mapq)
     
     # 按需计算：只在需要时才计算反向互补序列
     primary_seq = record.seq
@@ -431,9 +651,9 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         record.alignment[primary_idx], 
         is_primary_reverse
     )
-    
+    nm = calculate_nm(record.alignment[i])
     # 主记录的FLAG
-    primary_flag = calculate_flag(primary_strand)
+    primary_flag = calculate_flag(primary_strand, is_secondary=False)
     
     # 构建主记录SAM行
     sam_fields = [
@@ -441,7 +661,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         str(primary_flag),
         record.ref_names[primary_idx],
         str(record.positions[primary_idx] + 1),
-        "255",
+        str(mapq_values[primary_idx]),  # 使用计算的MAPQ
         primary_cigar,
         "*", 
         "0", 
@@ -449,7 +669,9 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         primary_seq,
         "*",
         f"XM:i:{record.mismatches[primary_idx]}",
-        f"XN:i:{record.multi_count}"
+        f"XN:i:{record.multi_count}",
+        f"NM:i:{nm}",  # 添加编辑距离
+        f"XS:i:{mapq_values[primary_idx]}"  # 添加原始得分标签
     ]
     
     # 处理多重比对记录（只有multi_count > 1时才需要额外处理）
@@ -476,7 +698,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
                 continue
             strand_i = record.strands[i]
             sa_parts.append(f"{record.ref_names[i]},{record.positions[i]+1},{strand_i},"
-                           f"{cigars[i]},255,{record.mismatches[i]}")
+                           f"{cigars[i]},{mapq_values[i]},{record.mismatches[i]}")
         
         if sa_parts:
             sam_fields.append(f"SA:Z:{';'.join(sa_parts)}")
@@ -494,13 +716,17 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
                 str(flag_i),
                 record.ref_names[i],
                 str(record.positions[i] + 1),
-                "255",
+                str(mapq_values[i]),  # 辅助比对的MAPQ（通常较低）
                 cigars[i],
-                "*", "0", "0",
+                "*", 
+                "0", 
+                "0",
                 seq_i,
                 "*",
                 f"XM:i:{record.mismatches[i]}",
-                f"XN:i:{record.multi_count}"
+                f"XN:i:{record.multi_count}",
+                f"NM:i:{nm}",  # 添加编辑距离,这里目前与主记录一致，是否应该这样，后面再检查
+                f"XS:i:{mapq_values[i]}",
             ]
             yield "\t".join(sam_fields_secondary)
     else:

@@ -314,8 +314,8 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
                         'strand': strand,
                         'txStart': int(start) - 1,  # 0-based
                         'txEnd': int(end),
-                        'cdsStart': int(end),  # Will be updated
-                        'cdsEnd': int(start) - 1,
+                        'cdsStart': float('inf'),  # Will be updated,先给个默认值
+                        'cdsEnd': -1,              # 初始化为极小值，便于后续取最大值
                         'exonStarts_list': [],  # Store as list for calculations
                         'exonEnds_list': [],
                         'cdsRegions': [],
@@ -338,10 +338,15 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
                 
                 elif feature == 'CDS':
                     cds_start, cds_end = int(start) - 1, int(end)
+                    
                     transcript['cdsStart'] = min(transcript['cdsStart'], cds_start)
                     transcript['cdsEnd'] = max(transcript['cdsEnd'], cds_end)
+                    # 在处理完所有特征后，检查CDS是否被设置过
+                    if transcript['cdsStart'] == float('inf'):  # 如果没有CDS,或者没有完整的cds，只有start，或者只有end
+                        transcript['cdsStart'] = 0
+                        transcript['cdsEnd'] = 0
                     transcript['cdsRegions'].append((cds_start, cds_end))
-                    
+                        
                     # 更新protein_id，如果CDS行中有更准确的信息
                     if not transcript['protein_id'] and 'protein_id' in attr_dict:
                         transcript['protein_id'] = attr_dict['protein_id']
@@ -977,18 +982,18 @@ def load_gxf_to_dataframe(input_file, file_type='auto'):
 if __name__ == '__main__':
     main()
     
-    
-    input_gff = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311.gff'
-    output_prefix = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311_tracks'
-    add_header = 1
-    genomic_df, rna_df = convert_gxf_to_refflat(input_gff, output_prefix, file_type='auto', add_header=True)
+    # input_file = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311.gff'    
+    # input_gff = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311.gff'
+    # output_prefix = r'\\fs2\D\DATA\Zhaojing\202209数据汇缴\0.Ref_seqs\20251024Oryza_sativa.IRGSP_9311_tracks'
+    # add_header = 1
+    # genomic_df, rna_df = convert_gxf_to_refflat(input_gff, output_prefix, file_type='auto', add_header=True)
 
-    genomic_df, rna_df =  convert_gxf_to_refflat_with_tracks(input_gff, output_prefix, file_type='auto', add_header=True)
+    # genomic_df, rna_df =  convert_gxf_to_refflat_with_tracks(input_gff, output_prefix, file_type='auto', add_header=True)
 
 
-    # 基本使用
-    rna_gtf = convert_gxf_to_unified_gtf(
-        input_file= input_gff , 
-        output_prefix = output_prefix ,
-        file_type="auto"
-    )
+    # # 基本使用
+    # rna_gtf = convert_gxf_to_unified_gtf(
+    #     input_file= input_gff , 
+    #     output_prefix = output_prefix ,
+    #     file_type="auto"
+    # )
