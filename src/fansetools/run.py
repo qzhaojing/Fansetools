@@ -685,10 +685,10 @@ class FanseRunner:
     def build_command(self, input_file: Path, output_file: Path,
                       refseq: Path, params: Dict[str, Union[int, str]],
                       options: List[str]) -> str:
-        """构建FANSe3命令 - 优化引号使用"""
+        """构建FANSe3命令 - 保证路径的引号使用，避免出错"""
         fanse_path = self.get_fanse3_path()
         if not fanse_path:
-            raise RuntimeError("未配置FANSe路径")
+            raise RuntimeError("未配置FANSe路径，请使用fanse run --set-path /path    添加fanse.exe路径或所在文件夹"   )
 
         # 验证路径存在
         if not input_file.exists():
@@ -804,10 +804,6 @@ class FanseRunner:
         self.logger.info(f"  选项: {final_options}")
         self.logger.info("="*50)
 
-        # 统计处理进度
-        total = len(file_map)
-        success = 0
-        failed = []
 
         # 统计处理进度
         total = len(file_map)
@@ -862,15 +858,15 @@ class FanseRunner:
 
                 # 准备任务信息
                 task_info = f"""
-                            {'='*48}
+                            {'='*50}
                             任务 {i}/{total}: {original_input_file.name}
-                            {'='*48}
+                            {'='*50}
                             原始输入文件: {original_input_file}
                             输出文件: {output_file}
                             参考序列: {refseq}
                             参数: {final_params}
                             选项: {final_options}
-                            {'-'*48}
+                            {'-'*50}
                             """
                 # 命令: {cmd}
                 # {'临时文件: ' + str(temp_file) if temp_file else 'None'}
@@ -1038,6 +1034,7 @@ def add_run_subparser(subparsers):
         description='''FANSe3 批量运行工具
 支持多种输入输出模式:  单个文件与目录形式均可，可批量运行
   -i sample.fq 文件: 直接处理单个或多个文件。/path/sample.fastq;/path/sample.fq.支持gz读取，会先解压到本地临时目录后输入fanse3比对。可输入多个文件，用逗号隔开
+  本地临时目录默认在系统盘，可用 -w dir 指定硬盘空间大的文件夹
 
   -i /path/ 目录: 如输入目录，则处理目录下所有fastq/fq/fq.gz/fastq.gz。可同时输入多个目录，用逗号隔开
 
@@ -1098,7 +1095,7 @@ def add_run_subparser(subparsers):
 
     # FANSe3参数
     parser.add_argument(
-        '-O', type=int, metavar='output',
+        '-O', type=str, metavar='output',
         help='结果输出文件夹 (不指定：输入文件夹)'
     )
     parser.add_argument(
@@ -1114,7 +1111,7 @@ def add_run_subparser(subparsers):
         help='Seed长度 (默认: 13)，不建议设置低于10，速度很慢'
     )
     parser.add_argument(
-        '-H', type=int, metavar='MILLION READS',
+        '-H', type=float, metavar='MILLION READS',
         help='比对时每批次读取fastq的reads数(百万) (默认: 1)，可以为小数，例如0.01'
     )
     parser.add_argument(

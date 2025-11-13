@@ -16,7 +16,12 @@ from typing import List, Generator
 
 @dataclass
 class FANSeRecord:
-    """存储FANSe3单条记录的类"""
+    """
+    存储FANSe3单条记录的类
+    使用slots减少内存开销
+    """
+    #__slots__ = ['header', 'seq', 'alignment', 'strands', 'ref_names', 'mismatches', 'positions', 'multi_count']
+    
     header: str               # Read名称
     seq: str                  # Read序列
     alignment: str = ''       # 比对结果(可选)
@@ -55,7 +60,7 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     """
     # tab_split = re.compile(r'\t+').split
     
-    with open(file_path, 'r', buffering=1024 * 1024*10 ) as f:  #  1 MB缓冲区
+    with open(file_path, 'r', buffering=1024 * 1024*16 ) as f:  #  16 MB缓冲区
         while True:
             # 读取两行作为一个完整记录
             line1 = f.readline().rstrip()
@@ -78,17 +83,15 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
             if len(fields2) < 5:
                 continue  # 跳过无效行而不是抛出异常
                 # raise ValueError(f"无效的第二行格式: {line2}")
+            
             multi_count = int(fields2[4])
             # 处理可能的多值字段
             if multi_count!=1:
                 strands = fields2[0].split(',')
                 ref_names = fields2[1].split(',')
-                # mismatches = list(map(int, fields2[2].split(',')))
-                # positions = list(map(int, fields2[3].split(',')))
-                # mismatches = [int(x) for x in fields2[2].split(',')]
                 mismatches = [int(fields2[2])]    #fanse 文件中此字段只有一个而非多个用逗号分割，因此测试注释掉上面行
                 positions = [int(x) for x in fields2[3].split(',')]
-                # multi_count = int(fields2[4])
+
             else:  # single-mapping reads
                 # 单映射reads，直接使用字段值
                 strands = [fields2[0]]
@@ -97,8 +100,7 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
                 positions = [int(fields2[3])]
             
             # 验证字段一致性并处理可能的长度不一致，这里主要是提供给fanse2sam 使用，没有貌似会报错。
-            # len_ref_names   =  len(ref_names)
-            # len_strands   =  len(strands)
+
             len_mismatches   =  len(mismatches)
             len_positions   =  len(positions)            
             # max_len = max(len_ref_names, len_strands,
@@ -125,6 +127,94 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
 
             yield record
 
+def fanse_parser_high_performance(file_path: str) -> Generator[FANSeRecord, None, None]:
+    """
+    高性能版本 - 最大限度减少重复操作
+    """
+    # 预编译分割器（小幅度提升）
+    comma_split = re.compile(',').split
+    
+    with open(file_path, 'r', buffering=1024 * 1024 * 16) as f:  # 更大缓冲区
+        batch = []  # 批量处理减少yield开销
+        batch_size = 5000
+        
+        while True:
+            line1 = f.readline()
+            line2 = f.readline()
+            if not line1 or not line2:
+                # 处理剩余批次
+                for record in batch:
+                    yield record
+                break
+            
+            # 去除换行符
+            line1 = line1.rstrip()
+            line2 = line2.rstrip()
+            
+            # 快速分割并缓存
+            fields1 = line1.split('\t')
+            if len(fields1) < 2:
+                continue
+                
+            fields2 = line2.split('\t')  
+            if len(fields2) < 5:
+                continue
+            
+            # 缓存所有需要的字段, 免得后面来回读取开销大
+            header_val = fields1[0]
+            seq_val = fields1[1]
+            alignment_val = fields1[2] if len(fields1) > 2 else ''
+            
+            strand_field = fields2[0]
+            ref_field = fields2[1]
+            mismatch_val = int(fields2[2])  # 提前转换int
+            position_field = fields2[3]
+            multi_count = int(fields2[4])   # 提前转换int
+            
+            # 根据multi_count分支处理
+            if multi_count != 1:
+                # 多映射：使用预编译分割器
+                strands = comma_split(strand_field)
+                ref_names = comma_split(ref_field)
+                positions = [int(x) for x in comma_split(position_field)]
+                mismatches = [mismatch_val] * len(positions)
+            else:
+                # 单映射：直接使用缓存值
+                strands = [strand_field]
+                ref_names = [ref_field] 
+                positions = [int(position_field)]
+                mismatches = [mismatch_val]
+            
+            # 验证字段一致性并处理可能的长度不一致，这里主要是提供给fanse2sam 使用，没有貌似会报错。忘记为啥要有这段了，先留着吧 -20251113
+            # len_ref_names   =  len(ref_names)
+            # len_strands   =  len(strands)
+            len_mismatches   =  len(mismatches)
+            len_positions   =  len(positions)            
+            # max_len = max(len_ref_names, len_strands,
+            #                len_mismatches, len_positions)
+            mismatches += [mismatch_val] * (len_positions - len_mismatches)
+            # 延迟处理alignment字段
+            alignment_processed = alignment_val.split(',') if alignment_val else ''
+            
+            record = FANSeRecord(
+                header=header_val,
+                seq=seq_val,
+                alignment=alignment_processed,
+                strands=strands, 
+                ref_names=ref_names,
+                mismatches=mismatches,
+                positions=positions,
+                multi_count=multi_count
+            )
+            
+            batch.append(record)
+            
+            # 批量处理减少yield开销
+            if len(batch) >= batch_size:
+                for record in batch:
+                    yield record
+                batch.clear()
+                
 
 @dataclass
 class UnmappedRecord:
