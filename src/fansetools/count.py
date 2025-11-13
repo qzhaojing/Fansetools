@@ -27,7 +27,7 @@ from pathlib import Path
 # 导入新的路径处理器
 from fansetools.utils.path_utils import PathProcessor
 # 导入新的fanse_parser
-from fansetools.parser import fanse_parser, FANSeRecord
+from fansetools.parser import fanse_parser, FANSeRecord,fanse_parser_high_performance
 from fansetools.gxf2refflat_plus import convert_gxf_to_refflat, load_annotation_to_dataframe
 
 
@@ -365,6 +365,14 @@ class FanseCounter:
             'multi_EM_cannot_allocate_tpm': multi 中的所有ID，均没有unique reads的部分。
         
         """
+        
+        # 选择优化版本
+        if self.input_file.stat().st_size > 1024 * 1024 * 1024:  # 大于1024 MB
+            fanse_parser = fanse_parser_high_performance
+        else:
+            fanse_parser = fanse_parser
+    
+    
         print(f'Parsing {self.input_file.name}')
         start_time = time.time()
         
