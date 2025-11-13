@@ -25,10 +25,292 @@ from pathlib import Path
 # import defaultdict
 
 # 导入新的路径处理器
-from .utils.path_utils import PathProcessor
+from fansetools.utils.path_utils import PathProcessor
 # 导入新的fanse_parser
-from .parser import fanse_parser, FANSeRecord
-from .gxf2refflat_plus import convert_gxf_to_refflat, load_annotation_to_dataframe
+from fansetools.parser import fanse_parser, FANSeRecord
+from fansetools.gxf2refflat_plus import convert_gxf_to_refflat, load_annotation_to_dataframe
+
+
+# 在您的FanseCounter类中添加并行处理方法
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm.contrib.concurrent import process_map
+
+class ParallelFanseCounter:
+    """并行处理多个fanse3文件的计数器"""
+    
+    def __init__(self, max_workers=None):
+        self.max_workers = max_workers or min(mp.cpu_count(), 8)  # 限制最大进程数
+        print(f"初始化并行处理器: {self.max_workers} 个进程")
+    
+    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None):
+        """并行处理多个文件 - 修复版本"""
+        print(f"🎯 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
+        
+        # 准备任务参数
+        tasks = []
+        for input_file in file_list:
+            # 为每个文件创建独立的输出目录
+            file_stem = input_file.stem
+            output_dir = Path(output_base_dir) / file_stem
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            task = {
+                'input_file': str(input_file),
+                'output_dir': str(output_dir),
+                'gxf_file': gxf_file,
+                'level': level,
+                'paired_end': paired_end,
+                'file_stem': file_stem  # 用于进度显示
+            }
+            tasks.append(task)
+        
+        # 使用进程池并行处理
+        results = []
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # 提交所有任务
+            future_to_task = {}
+            for task in tasks:
+                future = executor.submit(self._process_single_file, task, annotation_df)
+                future_to_task[future] = task
+            
+            # 使用tqdm显示总体进度
+            with tqdm(total=len(tasks), desc="总体进度", position=0) as pbar:
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    try:
+                        result = future.result()
+                        results.append((task['input_file'], True, result))
+                        pbar.set_description(f"✅ 完成: {task['file_stem']}")
+                    except Exception as e:
+                        results.append((task['input_file'], False, str(e)))
+                        pbar.set_description(f"❌ 失败: {task['file_stem']}")
+                    finally:
+                        pbar.update(1)
+        
+        return results
+    
+    def _process_single_file(self, task, annotation_df=None):
+        """处理单个文件（工作进程函数）"""
+        try:
+            # 在工作进程中重新加载注释数据（如果需要）
+            if task['gxf_file'] and annotation_df is None:
+                # 这里可以添加在工作进程中加载注释的逻辑
+                pass
+            
+            counter = FanseCounter(
+                input_file=task['input_file'],
+                output_dir=task['output_dir'],
+                gxf_file=task['gxf_file'],
+                level=task['level'],
+                paired_end=task['paired_end'],
+                annotation_df=annotation_df  # 传递已加载的注释数据
+            )
+            
+            # 运行计数处理
+            result = counter.run()
+            return f"成功处理 {task['file_stem']}"
+            
+        except Exception as e:
+            raise Exception(f"处理文件 {task['input_file']} 失败: {str(e)}")
+
+def count_main_parallel(args):
+    """支持并行的主函数 - 修复版本"""
+    print_mini_fansetools()
+    processor = PathProcessor()
+    
+    try:
+        # 1. 解析输入文件
+        input_files = processor.parse_input_paths(args.input, ['.fanse','.fanse3', '.fanse3.gz', '.fanse.gz'])
+        if not input_files:
+            print("错误: 未找到有效的输入文件")
+            return
+        
+        print(f"找到 {len(input_files)} 个输入文件")
+        
+        # 2. 加载注释文件（主进程加载，然后传递给工作进程）
+        annotation_df = None
+        if args.gxf:
+            annotation_df = load_annotation_data(args)
+            if annotation_df is None:
+                print("错误: 无法加载注释数据")
+                return
+            print(f"已加载注释数据: {len(annotation_df)} 个转录本")
+        else:
+            print("警告: 未提供注释文件，将只生成isoform水平计数")
+        
+        # 3. 设置输出目录
+        output_dir = Path(args.output) if args.output else Path.cwd() / "fansetools_results"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"输出目录: {output_dir}")
+        
+        # 4. 断点续传检查
+        files_to_process = []
+        skipped_files = 0
+        
+        for input_file in input_files:
+            file_stem = input_file.stem
+            individual_output_dir = output_dir / file_stem
+            
+            # 检查输出文件是否存在
+            output_files_to_check = []
+            if args.level in ['isoform', 'both']:
+                output_files_to_check.append(individual_output_dir / f"{file_stem}_isoform_level.counts.csv")
+            if args.level in ['gene', 'both'] and args.gxf:
+                output_files_to_check.append(individual_output_dir / f"{file_stem}_gene_level.counts.csv")
+            
+            # 检查文件是否存在
+            all_files_exist = all(f.exists() for f in output_files_to_check)
+            
+            if args.resume and all_files_exist:
+                print(f"  跳过: {input_file.name} - 输出文件已存在")
+                skipped_files += 1
+            else:
+                files_to_process.append(input_file)
+        
+        if not files_to_process:
+            print("所有文件均已处理完成")
+            return
+        
+        print(f"断点续传: 跳过 {skipped_files} 个文件，剩余 {len(files_to_process)} 个文件待处理")
+        
+        # 5. 并行处理
+        max_workers = args.processes if hasattr(args, 'processes') and args.processes > 1 else min(mp.cpu_count(), len(files_to_process))
+        
+        if max_workers == 1:
+            print("使用串行处理模式")
+            return count_main_serial(args)  # 回退到串行处理
+        
+        parallel_counter = ParallelFanseCounter(max_workers=max_workers)
+        
+        print("🚀 开始并行处理...")
+        print("=" * 60)
+        
+        start_time = time.time()
+        results = parallel_counter.process_files_parallel(
+            file_list=files_to_process,
+            output_base_dir=output_dir,
+            gxf_file=args.gxf,
+            level=args.level,
+            paired_end=args.paired_end,
+            annotation_df=annotation_df
+        )
+        
+        duration = time.time() - start_time
+        
+        # 6. 输出结果摘要
+        print("\n" + "=" * 60)
+        print("📊 处理结果摘要")
+        print("=" * 60)
+        
+        success_count = sum(1 for _, success, _ in results if success)
+        failed_count = len(results) - success_count
+        
+        print(f"✅ 成功: {success_count} 个文件")
+        print(f"❌ 失败: {failed_count} 个文件")
+        print(f"⏱️  总耗时: {duration:.2f} 秒")
+        
+        if failed_count > 0:
+            print("\n失败详情:")
+            for input_file, success, result in results:
+                if not success:
+                    print(f"  - {Path(input_file).name}: {result}")
+        
+        print(f"\n🎉 处理完成! 结果保存在: {output_dir}")
+        
+    except Exception as e:
+        print(f"错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+def count_main_serial(args):
+    """串行处理版本（原有的count_main函数）"""
+    print("使用单任务处理模式...")
+    processor = PathProcessor()
+    
+    try:
+        # 原有的串行处理逻辑...
+        input_files = processor.parse_input_paths(args.input, ['.fanse','.fanse3', '.fanse3.gz', '.fanse.gz'])       
+        if not input_files:
+            print("错误: 未找到有效的输入文件")
+            return
+            
+        # 加载注释文件
+        annotation_df = None
+        if args.gxf:
+            annotation_df = load_annotation_data(args)
+            if annotation_df is None:
+                print("错误: 无法加载注释数据")
+                return  
+        else:
+            print("警告: 未提供注释文件，将只生成isoform水平计数")
+            
+        # 生成输出映射
+        output_map = processor.generate_output_mapping(input_files, args.output, '.counts.csv')
+
+        # 断点续传检查
+        skipped_files = 0
+        if args.resume:
+            print("启用断点续传模式，检查已存在的输出文件...")
+            files_to_process = {}
+            
+            for input_file, output_file in output_map.items():
+                output_dir = Path(output_file).parent
+                input_stem = input_file.stem
+                
+                output_files_to_check = []
+                if args.level in ['isoform', 'both']:
+                    output_files_to_check.append(output_dir / f"{input_stem}_isoform_level.counts.csv")
+                if args.level in ['gene', 'both']:
+                    output_files_to_check.append(output_dir / f"{input_stem}_gene_level.counts.csv")
+                    output_files_to_check.append(output_dir / f"{input_stem}_multi_genes_level.counts.csv")
+                
+                all_files_exist = all(f.exists() for f in output_files_to_check)
+                if all_files_exist:
+                    print(f"  跳过: {input_file.name} - 输出文件已存在")
+                    skipped_files += 1
+                else:
+                    files_to_process[input_file] = output_file
+            
+            output_map = files_to_process
+            print(f"断点续传: 跳过 {skipped_files} 个文件，剩余 {len(output_map)} 个文件待处理")
+            
+            if not output_map:
+                print("所有文件均已处理完成")
+                return
+        
+        # 串行处理每个文件
+        for i, (input_file, output_file) in enumerate(output_map.items(), 1):
+            print(f"\n[{i + skipped_files}/{len(input_files)}] 处理: {input_file.name}")
+            print(f"  输出: {output_file}")
+            
+            try:
+                counter = FanseCounter(
+                    input_file=str(input_file),
+                    output_dir=str(output_file.parent),
+                    output_filename=output_file.name,                    
+                    gxf_file=args.gxf,
+                    level=args.level if annotation_df is not None else 'isoform',
+                    paired_end=args.paired_end,
+                    annotation_df=annotation_df,
+                )
+                count_files = counter.run()
+                print("✅ 完成")
+            except Exception as e:
+                print(f"❌ 处理失败: {str(e)}")
+        
+        print(f"\n处理完成: 总共 {len(input_files)} 个文件")
+        
+    except Exception as e:
+        print(f"错误: {str(e)}")
+
+def count_main(args):
+    """主入口函数，根据参数选择并行或串行"""
+    if hasattr(args, 'processes') and args.processes != 1:
+        return count_main_parallel(args)
+    else:
+        return count_main_serial(args)
+
 
 
 class FanseCounter:
@@ -154,6 +436,187 @@ class FanseCounter:
         print(f"Parsing completed in {parsing_time:.2f} seconds, {total_count} records")
         
         return counts_data, total_count
+
+
+
+    def calculate_average_record_size(self, file_path, sample_size=100000):
+        """
+        通过采样计算fanse3文件的平均记录大小
+        
+        参数:
+            file_path: 文件路径
+            sample_size: 采样记录数（默认10000条）
+        
+        返回:
+            平均每条记录的字节数
+        """
+        print(f"采样计算平均记录大小，采样数: {sample_size}")
+        
+        try:
+            total_bytes = 0
+            record_count = 0
+            
+            # 使用fanse_parser进行采样
+            for i, record in enumerate(fanse_parser(str(file_path))):
+                if i >= sample_size:
+                    break
+                    
+                # 估算当前记录的大小（基于记录内容的字符串长度）
+                record_size = len(str(record))  # 基本估算
+                total_bytes += record_size
+                record_count += 1
+            
+            if record_count > 0:
+                avg_size = total_bytes / record_count
+                print(f"采样完成: {record_count} 条记录，平均大小: {avg_size:.1f} 字节")
+                return avg_size
+            else:
+                print("警告: 无法采样记录，使用默认值527")
+                return 527
+                
+        except Exception as e:
+            print(f"采样失败: {e}，使用默认值527")
+            return 527
+    
+    def calculate_file_record_estimate(self, file_path, sample_size=100000):
+        """
+        综合估算文件中的记录数量
+        
+        参数:
+            file_path: 文件路径
+            sample_size: 采样大小
+        
+        返回:
+            估计的记录数量
+        """
+        if not file_path.exists():
+            return 0
+        
+        # 获取文件大小
+        file_size = file_path.stat().st_size
+        
+        # 如果是小文件，直接解析计数
+        if file_size < 100 * 1024 * 1024:  # 小于10MB的文件
+            print("小文件，直接计数...")
+            try:
+                record_count = sum(1 for _ in fanse_parser(str(file_path)))
+                print(f"直接计数完成: {record_count} 条记录")
+                return record_count
+            except:
+                pass
+        
+        # 对于大文件，使用采样估算
+        avg_size = self.calculate_average_record_size(file_path, sample_size)-50   #经验减去50字节，人为增大一点估算的reads总数，反而比较符合实际
+        estimated_records = max(1, int(file_size / avg_size))
+        
+        print(f"文件大小: {file_size} 字节")
+        print(f"平均记录大小: {avg_size:.1f} 字节")
+        print(f"估计Fanse记录数: {estimated_records} 条")
+        
+        return estimated_records
+
+    def parse_fanse_file_optimized_final(self, position=0):
+        """综合优化版本"""
+        print(f'Parsing {self.input_file.name}')
+        start_time = time.time()
+        
+        # 预初始化数据结构
+        counts_data = {
+            'raw': Counter(), 'multi': Counter(), 'unique': Counter(),
+            'firstID': Counter(), 'multi2all': Counter()
+        }
+        
+        total_count = 0
+        batch_size = 600000
+        # update_interval = 10000
+        
+        # 使用局部变量加速
+        raw, multi, unique, firstID, multi2all = (
+            counts_data['raw'], counts_data['multi'], counts_data['unique'],
+            counts_data['firstID'], counts_data['multi2all']
+        )
+        
+        for position, fanse_file in enumerate([self.input_file] + ([Path(self.paired_end)] if self.paired_end else []) ):
+            if not fanse_file.exists():
+                continue
+                
+            try:
+                batch = []
+                # last_update = 0
+                
+                # file_size = fanse_file.stat().st_size
+                # estimated_records = max(1, file_size // 527)
+                # 智能估算记录数
+                sample_size = 100000    #采样数目，用来估算总reads数
+                estimated_records = self.calculate_file_record_estimate(fanse_file, sample_size)
+                
+                with tqdm(total=estimated_records, unit='reads', mininterval=5, unit_scale=True, position=position, leave=False) as pbar:
+                    #进度条更新频率控制
+                    update_interval = 1000
+                    update_counter = 0
+                    
+                    for i, record in enumerate(fanse_parser(str(fanse_file))):
+                        if record.ref_names:
+                            total_count += 1
+                            
+                            # 批量处理
+                            batch.append(record)
+                            if len(batch) >= batch_size:
+                                self._fast_batch_process(batch, raw, multi, unique, firstID, multi2all)
+                                batch = []
+                            
+                            # 智能更新
+                            update_counter += 1
+                            if update_counter >= update_interval:
+                                pbar.update(update_counter)
+                                update_counter = 0
+                            # 减少进度更新频率
+                            # if i - last_update >= update_interval:
+                            #     print(f"Processed {i} records...", end='\r')
+                            #     last_update = i
+                        else:
+                            update_counter += 1
+                    
+                    # 更新剩余的进度
+                    if update_counter > 0:
+                        pbar.update(update_counter)
+                        # pbar.update(1)
+                    # 处理剩余批次
+                    if batch:
+                        self._fast_batch_process(batch, raw, multi, unique, firstID, multi2all)
+                    
+            except Exception as e:
+                print(f"Error: {e}")
+                continue
+        
+        duration = time.time() - start_time
+        print(f"Completed: {total_count} records in {duration:.2f}s ({total_count/duration:.0f} rec/sec)")
+        
+        return counts_data, total_count
+    
+    def _fast_batch_process(self, batch, raw, multi, unique, firstID, multi2all):
+        """快速批量处理"""
+        for record in batch:
+            ids = record.ref_names
+            is_multi = record.is_multi
+            
+            # 最小化字符串操作
+            first_id = ids[0]
+            raw_id = first_id if len(ids) == 1 else ','.join(ids)
+            
+            raw[raw_id] += 1
+            firstID[first_id] += 1
+            
+            if is_multi:
+                multi[raw_id] += 1
+                # 使用集合操作优化多ID处理
+                for tid in ids:
+                    multi2all[tid] += 1
+            else:
+                unique[raw_id] += 1
+
+
+
 
     def generate_isoform_level_counts(self, counts_data, total_count):
         """
@@ -365,7 +828,7 @@ class FanseCounter:
         """
         if self.annotation_df is None:
             print("Warning: Cannot aggregate gene level counts without annotation data")
-            return None
+            return {}, {}
         
         print("Aggregating gene level counts...")
         start_time = time.time()
@@ -462,7 +925,7 @@ class FanseCounter:
         
         # 添加注释信息（如果有）
         if self.annotation_df is not None:
-            annotation_subset = self.annotation_df[['txname', 'geneName', 'txLength', 'cdsLength']]
+            annotation_subset = self.annotation_df[['txname', 'geneName', 'txLength', 'cdsLength',]]
             combined_df = combined_df.merge(
                 annotation_subset, 
                 left_on='Transcript', 
@@ -471,7 +934,7 @@ class FanseCounter:
             ).drop('txname', axis=1)
         
         combined_filename = self.output_dir / f'{base_name}_isoform_level.counts.csv'
-        combined_df.to_csv(combined_filename, index=False)
+        combined_df.to_csv(combined_filename, index=False, float_format='%.2f')
         isoform_files['isoform'] = combined_filename
         
         return isoform_files
@@ -481,6 +944,12 @@ class FanseCounter:
     #20251111
     def _generate_gene_level_files(self, base_name):
         """生成基因水平计数文件 - 根据新的返回结构修改"""
+        if self.annotation_df is None:
+            print("没有注释信息，跳过基因水平文件生成")
+            return {} 
+        # 检查实际的列名
+        print(f"Annotation DataFrame 列名: {list(self.annotation_df.columns)}")
+        
         if not hasattr(self, 'gene_level_counts_unique_genes') or not self.gene_level_counts_unique_genes:
             print("Warning: No gene level counts available")
             return {}
@@ -533,14 +1002,60 @@ class FanseCounter:
         else:
             multi_genes_df = None
         
+        
+        # # 添加基因注释信息和转录本信息
+        # if self.annotation_df is not None:
+        #     # 获取基因到转录本的映射
+        #     gene_to_transcripts = defaultdict(list)
+        #     for _, row in self.annotation_df.iterrows():
+        #         # gene_to_transcripts[row['geneName']].append(row['txname'])
+        #         gene_name = row.get('geneName', row.get('gene_name', ''))  # 处理不同的列名
+        #         tx_name = row.get('txname', row.get('transcript_id', ''))  # 处理不同的列名
+        #         if gene_name and tx_name:
+        #             gene_to_transcripts[gene_name].append(tx_name)
+            
+        #     # 为单个基因文件添加转录本信息
+        #     single_gene_df['Transcripts'] = single_gene_df['Gene'].map(
+        #         lambda x: ','.join(gene_to_transcripts.get(x, [])) if x in gene_to_transcripts else ''
+        #     )
+        #     single_gene_df['Transcript_Count'] = single_gene_df['Gene'].map(
+        #         lambda x: len(gene_to_transcripts.get(x, []))
+        #     )
+            
+        #     # 为多基因组合文件添加转录本信息
+        #     if multi_genes_df is not None and not multi_genes_df.empty:
+        #         multi_genes_df['Transcripts'] = multi_genes_df['Gene_Combination'].map(
+        #             lambda x: ','.join([','.join(gene_to_transcripts.get(g, [])) for g in x.split(',')])
+        #         )
+        #         multi_genes_df['Transcript_Count'] = multi_genes_df['Gene_Combination'].map(
+        #             lambda x: sum(len(gene_to_transcripts.get(g, [])) for g in x.split(','))
+        #         )
+        
+        # # 添加其他基因注释信息
+        # if self.annotation_df is not None:
+        #     gene_annotation = self.annotation_df[['geneName', 'symbol', 'txLength', 'cdsLength','genelongesttxLength','genelongestcdsLength']].drop_duplicates()
+        #     # gene_annotation = annotation_df[['geneName', 'symbol', 'txLength', 'cdsLength']].drop_duplicates()
+        #     gene_annotation = gene_annotation.groupby('geneName').agg({
+        #         # 'symbol': 'first',
+        #         'txLength': 'max',
+        #         'cdsLength': 'max'
+        #     }).reset_index()
+            
+        #     single_gene_df = single_gene_df.merge(
+        #         gene_annotation, 
+        #         left_on='Gene', 
+        #         right_on='geneName', 
+        #         how='left'
+        #     ).drop('geneName', axis=1)
+        
         # 添加基因注释信息和转录本信息
         if self.annotation_df is not None:
             # 获取基因到转录本的映射
             gene_to_transcripts = defaultdict(list)
             for _, row in self.annotation_df.iterrows():
-                # gene_to_transcripts[row['geneName']].append(row['txname'])
-                gene_name = row.get('geneName', row.get('gene_name', ''))  # 处理不同的列名
-                tx_name = row.get('txname', row.get('transcript_id', ''))  # 处理不同的列名
+                # 处理不同的列名可能性
+                gene_name = row.get('geneName', row.get('gene_name', ''))
+                tx_name = row.get('txname', row.get('transcript_id', ''))
                 if gene_name and tx_name:
                     gene_to_transcripts[gene_name].append(tx_name)
             
@@ -552,41 +1067,75 @@ class FanseCounter:
                 lambda x: len(gene_to_transcripts.get(x, []))
             )
             
-            # 为多基因组合文件添加转录本信息
-            if multi_genes_df is not None and not multi_genes_df.empty:
-                multi_genes_df['Transcripts'] = multi_genes_df['Gene_Combination'].map(
-                    lambda x: ','.join([','.join(gene_to_transcripts.get(g, [])) for g in x.split(',')])
-                )
-                multi_genes_df['Transcript_Count'] = multi_genes_df['Gene_Combination'].map(
-                    lambda x: sum(len(gene_to_transcripts.get(g, [])) for g in x.split(','))
-                )
-        
-        # 添加其他基因注释信息
-        if self.annotation_df is not None:
-            gene_annotation = self.annotation_df[['geneName', 'symbol', 'txLength', 'cdsLength']].drop_duplicates()
-            # gene_annotation = annotation_df[['geneName', 'symbol', 'txLength', 'cdsLength']].drop_duplicates()
-            gene_annotation = gene_annotation.groupby('geneName').agg({
-                # 'symbol': 'first',
-                'txLength': 'max',
-                'cdsLength': 'max'
-            }).reset_index()
+            # 修复：动态检查并选择可用的列
+            available_columns = self.annotation_df.columns.tolist()
             
+            # 检查并选择基因注释列
+            gene_annotation_cols = ['geneName']
+            symbol_cols = ['symbol', 'genename', 'gene_name']
+            txlength_cols = ['genelongesttxLength', 'genelonesttxlength', 'txLength']
+            cdslength_cols = ['genelongestcdsLength', 'genelongestcdslength', 'cdsLength']
+            
+            # 选择实际存在的列
+            selected_cols = ['geneName']
+            
+            # 添加symbol列（如果存在）
+            for col in symbol_cols:
+                if col in available_columns:
+                    selected_cols.append(col)
+                    break
+            
+            # 添加txLength列（如果存在）
+            for col in txlength_cols:
+                if col in available_columns:
+                    selected_cols.append(col)
+                    break
+            
+            # 添加cdsLength列（如果存在）
+            for col in cdslength_cols:
+                if col in available_columns:
+                    selected_cols.append(col)
+                    break
+            
+            print(f"使用的基因注释列: {selected_cols}")
+            
+            # 去重并合并
+            gene_annotation = self.annotation_df[selected_cols].drop_duplicates()
+            
+            # 重命名列以保持一致性
+            rename_map = {}
+            if 'genename' in gene_annotation.columns:
+                rename_map['genename'] = 'symbol'
+            if 'genelonesttxlength' in gene_annotation.columns:
+                rename_map['genelonesttxlength'] = 'genelongesttxLength'
+            if 'genelongestcdslength' in gene_annotation.columns:
+                rename_map['genelongestcdslength'] = 'genelongestcdsLength'
+            
+            if rename_map:
+                gene_annotation = gene_annotation.rename(columns=rename_map)
+            
+            # 合并到结果数据框
             single_gene_df = single_gene_df.merge(
                 gene_annotation, 
                 left_on='Gene', 
                 right_on='geneName', 
                 how='left'
-            ).drop('geneName', axis=1)
+            )
+            
+            # 移除重复的geneName列（如果存在）
+            if 'geneName' in single_gene_df.columns and 'Gene' in single_gene_df.columns:
+                single_gene_df = single_gene_df.drop('geneName', axis=1)        
         
-        # 保存文件
+        
+        # 保存unique genes文件
         single_gene_filename = self.output_dir / f'{base_name}_gene_level.counts.csv'
-        single_gene_df.to_csv(single_gene_filename, index=False)
+        single_gene_df.to_csv(single_gene_filename, index=False, float_format='%.2f')
         gene_files['gene'] = single_gene_filename
         
-        # 保存多基因组合文件（如果有数据）
+        # 保存multi genes组合文件（如果有数据）
         if multi_genes_df is not None and not multi_genes_df.empty:
             multi_genes_filename = self.output_dir / f'{base_name}_multi_genes_level.counts.csv'
-            multi_genes_df.to_csv(multi_genes_filename, index=False)
+            multi_genes_df.to_csv(multi_genes_filename, index=False, float_format='%.2f')
             gene_files['multi_genes'] = multi_genes_filename
         
         return gene_files
@@ -614,7 +1163,7 @@ class FanseCounter:
  
     def generate_count_files(self):
         """
-        生成isoform和gene level 计数文件
+        生成isoform 和 gene level 计数文件
         
         """
         if self.output_filename:
@@ -629,24 +1178,23 @@ class FanseCounter:
             try:
                 isoform_files = self._generate_isoform_level_files(base_name)
                 count_files.update(isoform_files)
-                print(" 转录本水平计数文件生成完成")
+                print(" isoform 水平计数文件生成完成")
             except Exception as e:
                 print(f"转录本水平计数文件生成失败: {e}")
         
         
         # 生成基因水平计数文件
-        if self.level in ['gene', 'both']:
+        if self.annotation_df is not None and self.level in ['gene', 'both']:
             try:
                 # # 更健壮的条件检查
-                # if (hasattr(self, 'gene_level_counts_unique_genes') and 
-                #     self.gene_level_counts_unique_genes and 
-                #     isinstance(self.gene_level_counts_unique_genes, dict)):
-                    
-                gene_files = self._generate_gene_level_files(base_name)
-                count_files.update(gene_files)
-                print("基因水平计数文件生成完成")
-                # else:
-                #     print("没有基因水平计数数据，跳过基因水平文件生成")
+                if (hasattr(self, 'gene_level_counts_unique_genes') and \
+                    self.gene_level_counts_unique_genes):
+     
+                    gene_files = self._generate_gene_level_files(base_name)
+                    count_files.update(gene_files)
+                    print("基因水平计数文件生成完成")
+                else:
+                    print("没有基因水平计数数据，跳过基因水平文件生成")
             except Exception as e:
                 print(f" 基因水平计数文件生成失败: {e}")
         
@@ -684,8 +1232,9 @@ class FanseCounter:
         print("fansetools count - Starting processing")
         print("=" * 60)
         
-        # 1. 解析fanse3文件并直接计数
-        counts_data, total_count = self.parse_fanse_file()
+        # 1. 解析fanse3文件并直接获得计数
+        counts_data, total_count = self.parse_fanse_file_optimized_final()
+        # counts_data, total_count = self.parse_fanse_file()
         
         # 2. 生成isoform水平计数
         self.generate_isoform_level_counts(counts_data, total_count)
@@ -694,8 +1243,10 @@ class FanseCounter:
         if self.annotation_df is not None:
             # self.gene_counts = self.aggregate_gene_level_counts()
             self.gene_level_counts_unique_genes, self.gene_level_counts_multi_genes  = self.aggregate_gene_level_counts()
-            print(f"Gene level aggregation completed: {len(self.gene_level_counts_unique_genes)} unique-gene count types")
-            print(f"Gene level aggregation completed: {len(self.gene_level_counts_multi_genes)} multi-gene count types")
+            if self.gene_level_counts_unique_genes:
+                print(f"Gene level aggregation completed: {len(self.gene_level_counts_unique_genes)} unique-gene count types")
+            if self.gene_level_counts_multi_genes:
+                print(f"Gene level aggregation completed: {len(self.gene_level_counts_multi_genes)} multi-gene count types")
         else:
             print("No annotation provided, skipping gene level aggregation")
             # self.gene_counts = {}
@@ -752,87 +1303,138 @@ def print_mini_fansetools():
     最小的可识别版本
     https://www.ascii-art-generator.org/
     """
-    mini_art = [
-        '''
-        #######                                #######                             
-        #         ##   #    #  ####  ######       #     ####   ####  #       ####  
-        #        #  #  ##   # #      #            #    #    # #    # #      #      
-        #####   #    # # #  #  ####  #####        #    #    # #    # #       ####  
-        #       ###### #  # #      # #            #    #    # #    # #           # 
-        #       #    # #   ## #    # #            #    #    # #    # #      #    # 
-        #       #    # #    #  ####  ######       #     ####   ####  ######  ####  
-        '''                                                                        
-
-    ]
+    # mini_art = [
+    #     '''
+    #     #######                                #######                             
+    #     #         ##   #    #  ####  ######       #     ####   ####  #       ####  
+    #     #        #  #  ##   # #      #            #    #    # #    # #      #      
+    #     #####   #    # # #  #  ####  #####        #    #    # #    # #       ####  
+    #     #       ###### #  # #      # #            #    #    # #    # #           # 
+    #     #       #    # #   ## #    # #            #    #    # #    # #      #    # 
+    #     #       #    # #    #  ####  ######       #     ####   ####  ######  ####  
+    #     '''                                                                        
+    # ]
+    
+    mini_art =  ['''
+     FANSeTools - Functional ANnotation SEquence Tools
+     ''']
     
     for line in mini_art:
         print(line)
         
-def count_main(args):
-    """使用新路径处理器的count主函数"""
-    #打印个logo
-    print_mini_fansetools()
+# def count_main(args):
+#     """使用新路径处理器的count主函数"""
+#     #打印个logo
+#     print_mini_fansetools()
     
-    processor = PathProcessor()
+#     processor = PathProcessor()
     
-    try:
-        # 1. 解析输入路径
-        input_files = processor.parse_input_paths(args.input, ['.fanse','.fanse3', '.fanse3.gz', '.fanse.gz'])
-        if not input_files:
-            print("错误: 未找到有效的输入文件")
-            sys.exit(1)
+#     try:
+#         # 1. 解析输入路径
+#         input_files = processor.parse_input_paths(args.input, ['.fanse','.fanse3', '.fanse3.gz', '.fanse.gz'])
+#         # input_files = processor.parse_input_paths(input_file, ['.fanse','.fanse3', '.fanse3.gz', '.fanse.gz'])        
+#         if not input_files:
+#             print("错误: 未找到有效的输入文件")
+#             sys.exit(1)
             
-        # 2. 加载注释文件
-        annotation_df = load_annotation_data(args)
-        if annotation_df is None:
-            print("错误: 无法加载注释数据")
-            sys.exit(1)             
+#         # 2. 加载注释文件
+#         annotation_df = None
+#         if args.gxf:
+#             annotation_df = load_annotation_data(args)
+#             if annotation_df is None:
+#                 print("错误: 无法加载注释数据")
+#                 sys.exit(1)  
+#         else:
+#             print("警告: 未提供注释文件，将只生成isoform水平计数")
             
-        # 2. 生成输出映射
-        output_map = processor.generate_output_mapping(input_files, args.output, '.counts.csv')
-        
-        # 3. 验证路径
-        validation_checks = []
-        for input_file in input_files:
-            validation_checks.append((input_file, "输入文件", {'must_exist': True, 'must_be_file': True}))
-        
-        is_valid, errors = processor.validate_paths(*validation_checks)
-        if not is_valid:
-            print("路径验证失败:")
-            for error in errors:
-                print(f"  - {error}")
-            sys.exit(1)
-        
-        # 4. 批量处理文件
-        print(f"找到 {len(input_files)} 个输入文件，开始处理...")
-        
-        for i, (input_file, output_file) in enumerate(output_map.items(), 1):
-            print(f"\n[{i}/{len(input_files)}] 处理: {input_file.name}")
-            print(f"  输出: {output_file}")
+#         # 3. 生成输出映射
+#         output_map = processor.generate_output_mapping(input_files, args.output, '.counts.csv')
+
+#         # 4. 断点续传: 检查已存在的输出文件
+#         skipped_files = 0
+#         if args.resume:
+#             print("启用断点续传模式，检查已存在的输出文件...")
+#             files_to_process = {}
             
-            try:
-                counter = FanseCounter(
-                    input_file=str(input_file),
-                    output_dir=str(output_file.parent),
-                    output_filename=output_file.name,                    
-                    # minreads=args.minreads,
-                    # rpkm=args.rpkm,
-                    gxf_file=args.gxf,
-                    level=args.level,
-                    paired_end=args.paired_end,
-                    annotation_df=annotation_df  # 传递注释数据
-                )
-                count_files = counter.run()
-                print("  ✓ 完成")
-                print(f"  生成文件: {list(count_files.keys())}")
-            except Exception as e:
-                print(f"  ✗ 处理失败: {str(e)}")
+#             for input_file, output_file in output_map.items():
+#                 # 检查输出目录中是否已存在相应的结果文件
+#                 output_dir = Path(output_file).parent
+#                 input_stem = input_file.stem
+                
+#                 # 根据level参数检查相应的输出文件
+#                 output_files_to_check = []
+                
+#                 if args.level in ['isoform', 'both']:
+#                     output_files_to_check.append(output_dir / f"{input_stem}.counts_isoform_level.counts.csv")
+                
+#                 if args.level in ['gene', 'both']:
+#                     output_files_to_check.append(output_dir / f"{input_stem}.counts_gene_level.counts.csv")
+#                     output_files_to_check.append(output_dir / f"{input_stem}.counts_multi_genes_level.counts.csv")
+                
+#                     print(output_files_to_check)
+#                 # 检查所有相关文件是否存在
+#                 all_files_exist = any(f.exists() for f in output_files_to_check)
+#                 print(all_files_exist)
+#                 if all_files_exist:
+#                     print(f"  跳过: {input_file.name} - 输出文件已存在")
+#                     skipped_files += 1
+#                 else:
+#                     files_to_process[input_file] = output_file
+            
+#             output_map = files_to_process
+#             print(f"断点续传: 跳过 {skipped_files} 个已处理的文件，剩余 {len(output_map)} 个文件待处理")
+            
+#             if not output_map:
+#                 print("所有文件均已处理完成，无需继续运行；重新生成结果请另设文件夹，或删除已有结果")
+#                 return
+#         else:
+#             print(f"找到 {len(input_files)} 个输入文件，开始处理...")
+            
         
-        print(f"\n处理完成: {len(input_files)} 个文件")
         
-    except Exception as e:
-        print(f"错误: {str(e)}")
-        sys.exit(1)
+        
+#         # 5. 验证路径
+#         validation_checks = []
+#         for input_file in input_files:
+#             validation_checks.append((input_file, "输入文件", {'must_exist': True, 'must_be_file': True}))
+        
+#         is_valid, errors = processor.validate_paths(*validation_checks)
+#         if not is_valid:
+#             print("路径验证失败:")
+#             for error in errors:
+#                 print(f"  - {error}")
+#             sys.exit(1)
+        
+#         # 4. 批量处理文件
+#         # print(f"找到 {len(output_map)} / len(input_files)个输入文件，开始处理...")   #有多少个输出，就肯定有多少个输入，没错的，这样更合理
+        
+#         for i, (input_file, output_file) in enumerate(output_map.items(), 1):
+#             print(f"\n[{ skipped_files + i }/{len(input_files)}] 处理: {input_file.name}")
+#             print(f"  输出: {output_file}")
+            
+#             try:
+#                 counter = FanseCounter(
+#                     input_file=str(input_file),
+#                     output_dir=str(output_file.parent),
+#                     output_filename=output_file.name,                    
+#                     # minreads=args.minreads,
+#                     # rpkm=args.rpkm,
+#                     gxf_file= args.gxf,
+#                     level= args.level if annotation_df is not None else 'isoform',  # 没有注释时强制使用isoform水平
+#                     paired_end= args.paired_end,
+#                     annotation_df= annotation_df,  # 传递注释数据
+#                 )
+#                 count_files = counter.run()
+#                 print(" 完成")
+#                 print(f"生成文件: {list(count_files.keys())}")
+#             except Exception as e:
+#                 print(f"处理失败: {str(e)}")
+        
+#         print(f"\n处理完成: 总共 {len(input_files)} 个文件")
+        
+#     except Exception as e:
+#         print(f"错误: {str(e)}")
+#         sys.exit(1)
 
 
 def load_annotation_data(args):
@@ -911,6 +1513,7 @@ def add_count_subparser(subparsers):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
         使用示例:
+            默认isoform level
           单个文件处理:
             fanse count -i sample.fanse3 -o results/ --gxf annotation.gtf
           
@@ -920,11 +1523,21 @@ def add_count_subparser(subparsers):
           双端测序数据:
             fanse count -i R1.fanse3 -r R2.fanse3 -o results/ --gxf annotation.gtf
           
+        **如需要基因水平计数，需要输入gtf/gff/refflat/简单g-t对应文件，--gxf都可以解析
           基因水平计数:
             fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level gene
           
           同时输出基因和转录本水平:
             fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level both
+        
+          处理中断后重新运行（自动跳过已处理的文件[输出文件夹中存在对应结果文件，需重新运行请删除]）
+            fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --resume
+            
+            # 指定4个并行进程
+            fanse count -i "*.fanse3" -o results --gxf annotation.gtf --p 4
+            
+            使用所有CPU核心并行处理:
+            fanse count -i *.fanse3 -o results --gxf annotation.gtf -p 0
                 """
     )
     
@@ -932,7 +1545,7 @@ def add_count_subparser(subparsers):
                        help='Input fanse3 file,输入FANSe3文件/目录/通配符（支持批量处理）')
     parser.add_argument('-r', '--paired-end', 
                        help='Paired-end fanse3 file (optional)')
-    parser.add_argument('-o', '--output', required=True,
+    parser.add_argument('-o', '--output', required=False,
                        help='Output directory,输出路径（文件或目录，自动检测）')
     
     # parser.add_argument('--minreads', type=int, default=0,
@@ -940,12 +1553,24 @@ def add_count_subparser(subparsers):
     parser.add_argument('--rpkm', type=float, default=0,
                        help='RPKM threshold for filtering，尚未完成')
     
-    parser.add_argument('--gxf', required=True, help='Input GXF file (GTF or GFF3),if not provided, just give out isoform level readcounts')
+    parser.add_argument('--gxf', required=False, help='Input GXF file (GTF or GFF3),if not provided, just give out isoform level readcounts')
     parser.add_argument('--annotation-output', help='Output refFlat file prefix (optional)')
     
     parser.add_argument('--level', choices=['gene', 'isoform', 'both'], default='gene',
                        help='Counting level')
     
+    parser.add_argument('--resume', required=False, action='store_true', help='可从上次运行断掉的地方自动开始，自动检测文件夹中是否有输入文件对应的结果文件，有则跳过')
+
+    parser.add_argument('--processes', '-p', type=int, default=1,
+                       help='并行进程数 (默认: CPU核心数, 1=串行)')
+
+    # 根据是否并行选择执行函数
+    def count_main_wrapper(args):
+        if getattr(args, 'processes', None) != 1:  # 不是明确设置为1
+            return count_main_parallel(args)
+        else:
+            return count_main(args)  # 原有的串行版本
+        
     # 关键修复：设置处理函数，而不是直接解析参数
     parser.set_defaults(func=count_main)
 

@@ -15,6 +15,8 @@ import re
 import pandas as pd
 from collections import defaultdict
 
+
+#%% common ops
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Convert GXF (GTF/GFF3) file to extended refFlat format.')
@@ -63,7 +65,7 @@ def parse_attributes(attr_str, file_type):
         # GFF3: key=value;
         for field in attr_str.split(';'):
             field = field.strip()
-            if not field:
+            if not field  or '=' not in field:
                 continue
             if '=' in field:
                 key, value = field.split('=', 1)
@@ -217,6 +219,7 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
     genes_info = {}
     current_transcripts = {}
     
+    # 第一阶段：收集基因信息
     with open(input_file, 'r') as f:
         for line_num, line in enumerate(f, 1):
             if line.startswith('#'):
@@ -242,7 +245,7 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
                 gene_id = extract_id(attr_dict.get('gene_id', ''), file_type)
                 gene_name = attr_dict.get('gene_name', gene_id)
                 biotype = attr_dict.get('gene_biotype', attr_dict.get('biotype', ''))
-                
+                description = attr_dict.get('description', '')  # ✅ 添加这行修复
             else:   #当是gff时
                 feature_id = extract_id(attr_dict.get('ID', ''), file_type)
                 gene_id = feature_id
@@ -453,14 +456,7 @@ def save_refflat_dataframe(df, output_file, add_header=False, is_rna=False):
     with open(output_file, 'w') as f:
         if add_header:
             header_columns = output_columns 
-            # [
-            #     "geneName", "txname", "chrom", "strand", "txStart", "txEnd", 
-            #     "cdsStart", "cdsEnd", "exonCount", "exonStarts", "exonEnds",
-            #     "genename", "g_biotype", "t_biotype", "protein_id",
-            #     "txLength", "cdsLength", "utr5Length", "utr3Length",
-            #     "genelonesttxlength", "genelongestcdslength", "geneEffectiveLength",
-            #      'description'
-            # ]
+
             f.write("#" + "\t".join(header_columns) + "\n")
         
         df[output_columns].to_csv(f, sep='\t', index=False, header=False)
@@ -529,6 +525,7 @@ def add_exon_numbering_to_rna_refflat(rna_df):
     
     return enhanced_df.apply(add_exon_numbers, axis=1)
 
+#%%  IGV tracks file generation
 def generate_exon_bed_track(genomic_df, output_file):
     """
     生成外显子BED轨道文件，用于IGV中显示外显子边界
@@ -795,80 +792,6 @@ def generate_unified_rna_gtf(genomic_df, output_file):
     return gtf_df
 
 
-# def generate_enhanced_rna_gtf(genomic_df, output_file, include_splicing_events=True):
-#     """
-#     生成增强版的RNA坐标GTF文件，支持选择性剪接可视化，，以后再增强吧，现在先不了
-#     """
-#     gtf_records = []
-#     splicing_events = defaultdict(list) if include_splicing_events else None
-    
-#     for _, transcript in genomic_df.iterrows():
-#         tx_id = transcript['txname']
-#         gene_id = transcript['geneName']
-        
-#         # 基本转录本记录
-#         transcript_record = create_transcript_record(transcript)
-#         gtf_records.append(transcript_record)
-        
-#         # 外显子记录（带颜色编码）
-#         exon_records = create_exon_records(transcript, color_by='type')
-#         gtf_records.extend(exon_records)
-        
-#         # CDS和UTR记录
-#         cds_utr_records = create_cds_utr_records(transcript)
-#         gtf_records.extend(cds_utr_records)
-        
-#         # 选择性剪接标记（如果启用）
-#         if include_splicing_events:
-#             splicing_markers = create_splicing_markers(transcript, splicing_events)
-#             gtf_records.extend(splicing_markers)
-    
-#     # 添加选择性剪接事件汇总
-#     if include_splicing_events and splicing_events:
-#         event_records = create_splicing_event_summary(splicing_events, genomic_df)
-#         gtf_records.extend(event_records)
-    
-#     # 保存文件
-#     gtf_df = pd.DataFrame(gtf_records)
-#     gtf_df.to_csv(output_file, sep='\t', header=False, index=False, 
-#                   quoting=csv.QUOTE_NONE)
-    
-#     return gtf_df
-
-# def create_exon_records(transcript, color_by='type'):
-#     """创建外显子记录，支持不同的颜色编码方案"""
-#     records = []
-#     tx_id = transcript['txname']
-#     gene_id = transcript['geneName']
-    
-#     if not transcript.get('exonStarts_list'):
-#         return records
-    
-#     for i, (start, end) in enumerate(zip(transcript['exonStarts_list'], 
-#                                         transcript['exonEnds_list'])):
-#         # 确定外显子类型和颜色
-#         exon_type, color = classify_exon(transcript, i, color_by)
-        
-#         attributes = (
-#             f'gene_id "{gene_id}"; transcript_id "{tx_id}"; '
-#             f'exon_number "{i+1}"; exon_type "{exon_type}"; '
-#             f'color "{color}"; length "{end - start}"'
-#         )
-        
-#         record = {
-#             'seqname': tx_id,
-#             'source': 'gxf_converter',
-#             'feature': 'exon',
-#             'start': start + 1,
-#             'end': end,
-#             'score': '.',
-#             'strand': '+',
-#             'frame': '.',
-#             'attributes': attributes
-#         }
-#         records.append(record)
-    
-#     return records
 
 def classify_exon(transcript, exon_index, color_by):
     """分类外显子并分配颜色"""
@@ -943,7 +866,7 @@ def convert_gxf_to_unified_gtf(input_file, output_prefix, file_type='auto',
     return gtf_df
 
 
-
+#%% main function
 def main():
     """Command line interface."""
     args = parse_arguments()
