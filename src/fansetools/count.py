@@ -633,10 +633,10 @@ class FanseCounter:
         print("Generating isoform level counts...")
         start_time = time.time()
         
-        # 第二阶段：高级多映射计数
+        # 第二阶段：高级多映射计数rescue multi mapped reads
         if counts_data['multi']:
             print("Starting advanced multi-mapping analysis...")
-            self._process_advanced_multi_mapping(counts_data)
+            self._rescue_multi_mappings_by_tpm(counts_data)
             print("Advanced multi-mapping analysis completed.")
         
         #第三阶段:计算正确的counts，合并raw和multi_em，以及multi_equal 的counts
@@ -699,7 +699,7 @@ class FanseCounter:
         print(f"  - counts_em: {len(counts_data['counts_em'])} 个转录本, {total_em} 条reads")
         print(f"  - counts_eq: {len(counts_data['counts_eq'])} 个转录本, {total_eq} 条reads")
 
-    def _process_advanced_multi_mapping(self, counts_data):
+    def _rescue_multi_mappings_by_tpm(self, counts_data):
         """完整的修复版：处理高级多映射计数
         multi部分，和unique部分是否有重叠？
          - 没有。unique是单独的reads，multi部分处理得到的reads可以和unique部分加和，才是最终应该的reads。
@@ -741,7 +741,7 @@ class FanseCounter:
                 multi_equal_counter[tid] += event_count * equal_share_per_read
             
         # multi_EM: 按TPM比例分配，只有具有unique reads的才参与分配；没有的暂时另存一个columns，可考虑平均分配，作为参考。这部分可能是序列高度重叠的基因，但是无法区分，也不能完全认为基因不表达。
-            allocation = self._allocate_by_tpm(transcript_ids, tpm_values)
+            allocation = self._allocate_multi_reads_by_tpm_rescue(transcript_ids, tpm_values)
             if allocation:
                 for tid, share_ratio in allocation.items():
                     multi_em_counter[tid] += event_count * share_ratio
@@ -751,7 +751,7 @@ class FanseCounter:
                 
             processed_events += 1
             if processed_events % 10000 == 0:
-                print(f"已处理 {processed_events} 个多映射事件")
+                print(f"已处理 {processed_events} 个multi-mapped 多映射事件")
         
         # 更新计数器
         counts_data['multi_equal'] = multi_equal_counter
@@ -793,7 +793,7 @@ class FanseCounter:
         
         return tpm_values
 
-    def _allocate_by_tpm(self, transcript_ids, tpm_values):
+    def _allocate_multi_reads_by_tpm_rescue(self, transcript_ids, tpm_values):
         """根据unique 计算的  TPM值分配多映射reads"""
         allocation = {}
         

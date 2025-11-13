@@ -8,33 +8,33 @@ v0.2 优化的FANSe到SAM转换，包含精确MAPQ计算
 主要新增功能说明：
 1. 区域解析功能 (parse_region_string)
 支持samtools兼容的区域格式
-
 自动处理边界检查和错误处理
-
 返回结构化的区域字典
 
 2. 记录过滤功能 (is_record_in_region)
 高效检查记录是否在指定区域内
-
 支持多重比对的区域检查
 
 3. 命令行参数集成
 使用 -R/--region参数（参考samtools习惯）
-
 保持向后兼容性
 
 4. 统计信息输出
 显示过滤前后的记录数量
-
 便于用户了解过滤效果
+
+
+#后续加入
+1. unmapped reads 也纳入sam格式
+2. 双端reads如何匹配到一起：
+    - 1. -1, -2端reads去接头时候即采用配对模式，保留所有双端reads。然后比对后，进行fanse+unmapped合并，然后排序（需要硬盘，内存双多，不太合适的感觉），双端reads理论上可以实现按顺序排列。然后顺序读取两个文件中的reads，判断是双端后，确定pos是否唯一
+    - 2， 转化sam/bam时候，纳入unmapped reads，然后给定文件-1-2的方向信息存入对应文件的tag；然后两个bam进行排序候，进行配对修复samtools fixmate？如此得到配对的双端reads---好像更简单，不用修改很多代码，利用现有工具实现双端
+
 
 支持的区域格式：
 chr1- 整个染色体
-
 chr1:1000- 单点位置
-
 chr1:1000-2000- 区间位置
-
 chr1,chr2:500-1000- 多区域组合
 
 Jinan University
@@ -137,7 +137,7 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
         I: 插入 (仅消耗查询序列)
         D: 缺失 (仅消耗参考序列)
         N: 跳过 (同D但用于mRNA比对)
-        S: soft-clip (仅消耗查询序列)
+        S: soft-clip (仅消耗查询序列)   #fanse不支持？
         H: hard-clip (不消耗序列)
         =: 完全匹配
         X: 错配
@@ -1018,7 +1018,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             print('Write SAM header down.')
             
             # 处理记录
-            batch_size = 1000
+            batch_size = 10000
             batch_count = 0
             batch_lines = []
             filtered_count = 0
@@ -1029,7 +1029,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
                 for record in fanse_parser(fanse_file):
                     total_count += 1
                     
-                    # 区域过滤
+                    # 区域过滤，没有过滤信息则直接跳过（regions为None）
                     if regions and not is_record_in_region(record, regions):
                         filtered_count += 1
                         pbar.update(1)
@@ -1126,9 +1126,6 @@ def add_sam_subparser(subparsers):
     sam_parser.set_defaults(func=run_sam_command)
 
 
-
-#后续还可以加入需要查看的位置信息，即只输出这个部分的sam文件，提升速度。位置支持单个位置，多个位置，单染色体，单基因，单转录本
-#sort可以直接支持最好了，单独的那边已经有命令，这里可以集成那个命令直接用。
 
 # 使用示例
 if __name__ == "__main__":

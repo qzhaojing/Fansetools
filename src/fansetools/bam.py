@@ -217,5 +217,10 @@ def add_bam_subparser(subparsers):
 		'--no-index', action='store_true',
 		help='不创建BAM索引'
 	)
+
+	#bam_parser.add_argument(
+	#	'--fanse3', action='store_true',
+	#	help='生成fanse3文件不删除'
+	#)
 	
 	bam_parser.set_defaults(func=bam_command)
