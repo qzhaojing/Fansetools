@@ -311,14 +311,17 @@ def main():
     base_parser.add_argument('-v', '--version', action='store_true', help='显示版本信息')
     base_parser.add_argument('--version-info', action='store_true', help='显示详细的版本和更新信息')
     
-    # 只解析版本相关参数
-    try:
-        base_args, remaining_args = base_parser.parse_known_args(remaining_args)
-    except SystemExit:
-        return 1
-    except:
+    # 只解析版本相关参数，仅当第一个参数是选项（以 '-' 开头）时才解析基础参数。这样设置可以正确解析samtools等的-help参数
+    if remaining_args and remaining_args[0].startswith('-'):
+        try:
+            base_args, remaining_args = base_parser.parse_known_args(remaining_args)
+        except SystemExit:
+            return 1
+        except:
+            base_args = argparse.Namespace(help=False, version=False, version_info=False)
+            remaining_args = sys.argv[1:]
+    else:
         base_args = argparse.Namespace(help=False, version=False, version_info=False)
-        remaining_args = sys.argv[1:]
     
     # 处理版本信息请求（优先处理）
     if base_args.version or base_args.version_info:
