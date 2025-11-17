@@ -46,8 +46,9 @@ setup(
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
         'pandas', 
         'biopython',
-         
-        
+         'packaging', 
+        'requests', 
+        'cutadapt', 
     ],
 
     extras_require={
