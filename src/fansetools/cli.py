@@ -226,15 +226,16 @@ def show_detailed_version_info():
 def create_parser():
     """创建主解析器"""
     # 延迟导入子命令模块
+    from .trim import add_trim_subparser
     from .run import add_run_subparser
     from .count import add_count_subparser
     from .sam import add_sam_subparser
     from .bam import add_bam_subparser
     from .bed import add_bed_subparser
     from .fastx import add_fastx_subparser
-    from .mpileup import add_mpileup_subparser
     from .sort import add_sort_subparser
-    
+    from .mpileup import add_mpileup_subparser
+    from .install import add_install_subparser, handle_install_command  # 新增导入
     # 创建主解析器
     parser = argparse.ArgumentParser(
         prog='fanse',
@@ -264,9 +265,12 @@ def create_parser():
         description='解析 FANSe3 文件并输出结构化数据'
     )
     parser_parser.add_argument('input_file', help='输入文件路径（FANSe3 格式）')
+    #子命令  get()  
+    #getref() 获得下载sra等数据
+    #getdata() 获得基因组数据
     
-    # 子命令：count
-    add_count_subparser(subparsers)
+    # 子命令：trim
+    add_trim_subparser(subparsers)
     
     # 子命令：sam
     add_sam_subparser(subparsers)
@@ -276,6 +280,9 @@ def create_parser():
     
     # 子命令：sort
     add_sort_subparser(subparsers)
+    
+    # 子命令：count
+    add_count_subparser(subparsers)
 
     # 子命令：bed
     add_bed_subparser(subparsers)
@@ -285,6 +292,12 @@ def create_parser():
 
     # 子命令：mpileup
     add_mpileup_subparser(subparsers)
+    
+    
+    
+    # 子命令：install (新增)
+    install_parser = add_install_subparser(subparsers)
+    install_parser.set_defaults(func=handle_install_command)
     
     # 子命令：update
     update_parser = subparsers.add_parser(
@@ -324,43 +337,43 @@ def main():
         base_args = argparse.Namespace(help=False, version=False, version_info=False)
     
     # 处理版本信息请求（优先处理）
-    if base_args.version or base_args.version_info:
-        try:
-            from fansetools.utils.version_check import DualVersionChecker, get_installation_method
-            from fansetools import __version__, __github_repo__
-            
-            if base_args.version:
-                # 显示当前版本和最新版本号
-                checker = DualVersionChecker(
-                    current_version=__version__,
-                    package_name="fansetools",
-                    github_repo=__github_repo__,
-                    check_interval_days=0
-                )
-                version_info = checker.check_version()
-                
-                if version_info and version_info.get('pypi_latest'):
-                    print(f"fansetools {__version__} → {version_info['pypi_latest']} (最新)")
-                else:
-                    print(f"fansetools {__version__}")
-                return
-                
-            elif base_args.version_info:
-                show_detailed_version_info()
-                return
-                
-        except ImportError:
-            try:
-                from fansetools import __version__
-                if base_args.version:
-                    print(f"fansetools {__version__}")
-                    return
-                elif base_args.version_info:
-                    print(f"fansetools {__version__} (版本检查模块不可用)")
-                    return
-            except ImportError:
-                print("fansetools 版本信息不可用")
-                return
+    #if base_args.version or base_args.version_info:
+    #    try:
+    #        from fansetools.utils.version_check import DualVersionChecker, get_installation_method
+    #        from fansetools import __version__, __github_repo__
+        #        
+    #        if base_args.version:
+    #             显示当前版本和最新版本号
+    #            checker = DualVersionChecker(
+    #                current_version=__version__,
+    #                package_name="fansetools",
+    #                github_repo=__github_repo__,
+    #                check_interval_days=0
+    #            )
+    #            version_info = checker.check_version()
+        #            
+    #            if version_info and version_info.get('pypi_latest'):
+    #                print(f"fansetools {__version__} → {version_info['pypi_latest']} (最新)")
+    #            else:
+    #                print(f"fansetools {__version__}")
+    #            return
+        #            
+    #        elif base_args.version_info:
+    #            show_detailed_version_info()
+    #            return
+        #            
+    #    except ImportError:
+    #        try:
+    #            from fansetools import __version__
+    #            if base_args.version:
+    #                print(f"fansetools {__version__}")
+    #                return
+    #            elif base_args.version_info:
+    #                print(f"fansetools {__version__} (版本检查模块不可用)")
+    #                return
+    #        except ImportError:
+    #            print("fansetools 版本信息不可用")
+    #            return
     
     # 检查是否是直接调用二进制文件
     if remaining_args and not getattr(base_args, 'help', False):
@@ -391,6 +404,14 @@ def main():
     
     # 执行对应的函数
     if hasattr(args, 'func'):
+        # 如果是install命令，直接执行
+        if args.command == 'install':
+            try:
+                return args.func(args)
+            except Exception as e:
+                print(f"安装过程中发生错误: {e}")
+                return 1
+                
         # 如果是update命令，跳过版本检查（避免循环）
         if args.command == 'update':
             try:

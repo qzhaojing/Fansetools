@@ -425,56 +425,196 @@ class FanseRunner:
             for file in directory.glob(f'*{ext.upper()}'):
                 if file.is_file() and file not in file_list:
                     file_list.append(file)
-
+#%% gzip and pigz
     def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
-        """处理gzipped输入文件，返回实际输入文件路径和临时文件（如果有）
-
-        Args:
-            input_file: 输入文件路径
-            temp_dir: 可选的自定义临时文件夹目录（防止系统盘空间满）
-
-        Returns:
-            (实际输入文件路径, 临时文件路径)
-        """
-
-        # 1. 检查是否需要解压
+        """使用并行工具加速gzip解压缩"""
         if input_file.suffix != '.gz' and not (len(input_file.suffixes) > 1 and input_file.suffixes[-1] == '.gz'):
             return input_file, None
-
+    
         try:
-            # 在 _handle_gzipped_input 中添加
-            # 2. 创建自定义临时目录（如果需要）
-            custom_temp_dir = self.work_dir if self.work_dir else None
-            if custom_temp_dir:
-                custom_temp_dir.mkdir(parents=True, exist_ok=True)
-                input_size = input_file.stat().st_size
-                disk_free = shutil.disk_usage(custom_temp_dir).free
-                if disk_free < input_size * 6:  # 预留6倍空间
-                    raise RuntimeError("磁盘空间不足,请用-w,--work_dir 设置到其他位置")
-
-            # 3. 创建临时文件（带自定义目录支持）
-            with tempfile.NamedTemporaryFile(
-                prefix=f"{input_file.stem}_",
-                suffix=".fastq",
-                dir=custom_temp_dir,  # 添加自定义目录参数
-                delete=False
-            ) as temp_file:
-                temp_path = Path(temp_file.name)
-
-                # 4. 解压文件
-                self.logger.info(f"解压文件: {input_file} -> {temp_path}")
-                with gzip.open(input_file, 'rb') as f_in, \
-                        open(temp_path, 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-
-                # 添加到临时文件列表
-                self.temp_files.append(temp_path)
-                return temp_path, temp_path
-
+            # 检查系统是否安装并行解压工具
+            if self._check_pigz_available():
+                return self._decompress_with_pigz(input_file)
+            else:
+                # 回退到标准gzip
+                return self._decompress_with_standard_gzip(input_file)
+                
         except Exception as e:
             self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
             raise
 
+    # def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+    #     """处理gzipped输入文件，返回实际输入文件路径和临时文件（如果有）
+
+    #     Args:
+    #         input_file: 输入文件路径
+    #         temp_dir: 可选的自定义临时文件夹目录（防止系统盘空间满）
+
+    #     Returns:
+    #         (实际输入文件路径, 临时文件路径)
+    #     """
+
+    #     # 1. 检查是否需要解压
+    #     if input_file.suffix != '.gz' and not (len(input_file.suffixes) > 1 and input_file.suffixes[-1] == '.gz'):
+    #         return input_file, None
+
+    #     try:
+    #         # 在 _handle_gzipped_input 中添加
+    #         # 2. 创建自定义临时目录（如果需要）
+    #         custom_temp_dir = self.work_dir if self.work_dir else None
+    #         if custom_temp_dir:
+    #             custom_temp_dir.mkdir(parents=True, exist_ok=True)
+    #             input_size = input_file.stat().st_size
+    #             disk_free = shutil.disk_usage(custom_temp_dir).free
+    #             if disk_free < input_size * 6:  # 预留6倍空间
+    #                 raise RuntimeError("磁盘空间不足,请用-w,--work_dir 设置到其他位置")
+
+    #         # 3. 创建临时文件（带自定义目录支持）
+    #         with tempfile.NamedTemporaryFile(
+    #             prefix=f"{input_file.stem}_",
+    #             suffix=".fastq",
+    #             dir=custom_temp_dir,  # 添加自定义目录参数
+    #             delete=False
+    #         ) as temp_file:
+    #             temp_path = Path(temp_file.name)
+
+    #             # 4. 解压文件
+    #             self.logger.info(f"解压文件: {input_file} -> {temp_path}")
+    #             with gzip.open(input_file, 'rb') as f_in, \
+    #                     open(temp_path, 'wb') as f_out:
+    #                 shutil.copyfileobj(f_in, f_out)
+
+    #             # 添加到临时文件列表
+    #             self.temp_files.append(temp_path)
+    #             return temp_path, temp_path
+
+    #     except Exception as e:
+    #         self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
+    #         raise
+
+    def _handle_gzipped_input_with_cache(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+        """带缓存机制的gzip解压"""
+        if input_file.suffix != '.gz':
+            return input_file, None
+        
+        # 计算文件哈希作为缓存标识
+        file_hash = self._get_file_hash(input_file)
+        cache_dir = self.work_dir / "cache" if self.work_dir else Path(tempfile.gettempdir()) / "fanse_cache"
+        cache_file = cache_dir / f"{file_hash}_{input_file.stem}.fastq"
+        
+        # 检查缓存是否存在且有效
+        if cache_file.exists() and self._is_cache_valid(input_file, cache_file):
+            self.logger.info(f"使用缓存文件: {cache_file}")
+            return cache_file, None
+        
+        # 解压并缓存
+        result_path, temp_path = self._decompress_with_pigz(input_file)  # 或标准gzip
+        
+        # 将解压结果保存到缓存
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(result_path, cache_file)
+            self.logger.info(f"缓存已更新: {cache_file}")
+        except Exception as e:
+            self.logger.warning(f"缓存保存失败: {str(e)}")
+        
+        return result_path, temp_path
+
+
+    
+    def _check_pigz_available(self) -> bool:
+        """检查系统是否安装pigz（并行gzip工具）"""
+        try:
+            import subprocess
+            result = subprocess.run(['which', 'pigz'], capture_output=True, text=True)
+            return result.returncode == 0
+        except:
+            return False
+    
+    def _decompress_with_pigz(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+        """使用pigz进行并行解压缩"""
+        custom_temp_dir = self.work_dir if self.work_dir else None
+        if custom_temp_dir:
+            custom_temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        with tempfile.NamedTemporaryFile(
+            prefix=f"{input_file.stem}_",
+            suffix=".fastq",
+            dir=custom_temp_dir,
+            delete=False
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+        
+        try:
+            import subprocess
+            self.logger.info(f"使用pigz并行解压: {input_file} -> {temp_path}")
+            
+            # 使用pigz并行解压，-d表示解压，-c输出到stdout，-p指定线程数
+            cpu_count = min(os.cpu_count(), 8)  # 限制最大线程数
+            cmd = ['pigz', '-dc', '-p', str(cpu_count), str(input_file)]
+            
+            with open(temp_path, 'wb') as f_out:
+                result = subprocess.run(cmd, stdout=f_out, check=True)
+            
+            self.temp_files.append(temp_path)
+            return temp_path, temp_path
+            
+        except subprocess.CalledProcessError as e:
+            # pigz失败时回退到标准gzip
+            self.logger.warning("pigz解压失败，回退到标准gzip")
+            try:
+                temp_path.unlink()  # 删除可能不完整的文件
+            except:
+                pass
+            return self._decompress_with_standard_gzip(input_file)
+    
+    def _decompress_with_standard_gzip(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+        """标准gzip解压（优化缓冲区大小）"""
+        custom_temp_dir = self.work_dir if self.work_dir else None
+        if custom_temp_dir:
+            custom_temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        with tempfile.NamedTemporaryFile(
+            prefix=f"{input_file.stem}_",
+            suffix=".fastq",
+            dir=custom_temp_dir,
+            delete=False
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+        
+        self.logger.info(f"解压文件: {input_file} -> {temp_path}")
+        
+        # 优化：使用更大的缓冲区提高IO效率
+        buffer_size = 1024 * 1024  # 1MB缓冲区
+        
+        with gzip.open(input_file, 'rb') as f_in, \
+                open(temp_path, 'wb') as f_out:
+            while True:
+                chunk = f_in.read(buffer_size)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+        
+        self.temp_files.append(temp_path)
+        return temp_path, temp_path
+    
+    def _get_file_hash(self, file_path: Path) -> str:
+        """计算文件哈希值"""
+        import hashlib
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    
+    def _is_cache_valid(self, original_file: Path, cache_file: Path) -> bool:
+        """检查缓存是否有效（基于文件修改时间）"""
+        try:
+            original_mtime = original_file.stat().st_mtime
+            cache_mtime = cache_file.stat().st_mtime
+            return cache_mtime > original_mtime
+        except:
+            return False
     # def generate_output_mapping(self, input_paths: List[Path],
     #                             output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
     #     """        
@@ -1025,7 +1165,7 @@ class FanseRunner:
                     print(f"  - {name}")
 
 
-# 命令行接口
+#%% 命令行接口
 def add_run_subparser(subparsers):
     """添加run子命令到主解析器"""
     parser = subparsers.add_parser(
