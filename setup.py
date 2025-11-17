@@ -48,7 +48,7 @@ setup(
         'biopython',
          'packaging', 
         'requests', 
-        'cutadapt', 
+        #'cutadapt', 
     ],
 
     extras_require={
