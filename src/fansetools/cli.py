@@ -236,6 +236,8 @@ def create_parser():
     from .sort import add_sort_subparser
     from .mpileup import add_mpileup_subparser
     from .install import add_install_subparser, handle_install_command  # 新增导入
+    from .cluster import add_cluster_subparser, cluster_command
+    
     # 创建主解析器
     parser = argparse.ArgumentParser(
         prog='fanse',
@@ -243,7 +245,7 @@ def create_parser():
         epilog='使用 "fanse <command> -h" 查看具体命令的帮助信息',
         formatter_class=CustomHelpFormatter,
         add_help=False,
-        usage='fanse [-h] [-v] [--version-info] <command> [<args>]'
+        #usage='fanse [-h] [-v] [--version-info] <command> [<args>]'
     )
     
     # 添加帮助选项
@@ -265,6 +267,8 @@ def create_parser():
         description='解析 FANSe3 文件并输出结构化数据'
     )
     parser_parser.add_argument('input_file', help='输入文件路径（FANSe3 格式）')
+    
+
     #子命令  get()  
     #getref() 获得下载sra等数据
     #getdata() 获得基因组数据
@@ -293,7 +297,12 @@ def create_parser():
     # 子命令：mpileup
     add_mpileup_subparser(subparsers)
     
+    #子命令：cluster
+    #add_cluster_subparser(subparsers)
     
+    # 子命令：cluster
+    cluster_parser = add_cluster_subparser(subparsers)
+    cluster_parser.set_defaults(func=cluster_command)  # 添加这行：设置处理函数
     
     # 子命令：install (新增)
     install_parser = add_install_subparser(subparsers)
