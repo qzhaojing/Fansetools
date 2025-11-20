@@ -117,6 +117,122 @@ class ConfigManager:
         except Exception as e:
             print(f"保存配置失败: {str(e)}", file=sys.stderr)
 
+    def _parse_ssh_path(self, path_str: str) -> Dict[str, str]:
+        """解析SSH路径格式: user@host:/path/to/fanse3.exe"""
+        import re
+        pattern = r'^(?P<user>[^@]+)@(?P<host>[^:]+):(?P<path>.+)$'
+        match = re.match(pattern, path_str)
+        if match:
+            return match.groupdict()
+        return None
+
+    def save_ssh_config(self, ssh_path: str, ssh_key: str = None, password: str = None):
+        """保存SSH连接配置"""
+        ssh_info = self._parse_ssh_path(ssh_path)
+        if not ssh_info:
+            raise ValueError(f"无效的SSH路径格式: {ssh_path}")
+        
+        self.save_config('fanse3_ssh_user', ssh_info['user'])
+        self.save_config('fanse3_ssh_host', ssh_info['host'])
+        self.save_config('fanse3_ssh_path', ssh_info['path'])
+        
+        if ssh_key:
+            self.save_config('fanse3_ssh_key', ssh_key)
+        if password:
+            # 注意：密码存储需要加密，这里简化处理
+            self.save_config('fanse3_ssh_password', password)
+
+    def load_ssh_config(self) -> Optional[Dict[str, str]]:
+        """加载SSH配置"""
+        user = self.load_config('fanse3_ssh_user')
+        host = self.load_config('fanse3_ssh_host')
+        path = self.load_config('fanse3_ssh_path')
+        
+        if all([user, host, path]):
+            return {
+                'user': user,
+                'host': host,
+                'path': path,
+                'key': self.load_config('fanse3_ssh_key'),
+                'password': self.load_config('fanse3_ssh_password')
+            }
+        return None
+
+   
+# 替换现有的 SSHConnectionManager 类
+class SSHConnectionManager:
+    """简化版SSH连接管理器"""
+    
+    def __init__(self, logger):
+        self.logger = logger
+        self.connection = None
+        self.sftp = None
+        
+    def connect(self, ssh_config: Dict[str, str]) -> bool:
+        """建立SSH连接 - 简化版本"""
+        try:
+            import paramiko
+            
+            self.logger.info(f"正在连接SSH: {ssh_config['user']}@{ssh_config['host']}")
+            
+            # 创建SSH客户端
+            self.connection = paramiko.SSHClient()
+            self.connection.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            # 简化认证逻辑
+            connect_kwargs = {
+                'hostname': ssh_config['host'],
+                'username': ssh_config['user'],
+                'timeout': 30
+            }
+            
+            # 优先尝试密码认证
+            if ssh_config.get('password'):
+                connect_kwargs['password'] = ssh_config['password']
+            # 其次尝试密钥
+            elif ssh_config.get('key'):
+                key_file = Path(ssh_config['key']).expanduser()
+                if key_file.exists():
+                    private_key = paramiko.RSAKey.from_private_key_file(str(key_file))
+                    connect_kwargs['pkey'] = private_key
+            
+            self.connection.connect(**connect_kwargs)
+            self.sftp = self.connection.open_sftp()
+            
+            self.logger.info("✅ SSH连接成功")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ SSH连接失败: {str(e)}")
+            return False
+    
+    def execute_command(self, command: str) -> Tuple[bool, str]:
+        """执行远程命令"""
+        if not self.connection:
+            return False, "SSH未连接"
+        
+        try:
+            stdin, stdout, stderr = self.connection.exec_command(command, timeout=3600)
+            exit_status = stdout.channel.recv_exit_status()
+            output = stdout.read().decode('utf-8', errors='ignore')
+            error_output = stderr.read().decode('utf-8', errors='ignore')
+            
+            full_output = output + ("\n" + error_output if error_output else "")
+            
+            if exit_status == 0:
+                return True, full_output.strip()
+            else:
+                return False, f"Exit {exit_status}: {full_output}"
+                
+        except Exception as e:
+            return False, f"命令执行失败: {str(e)}"
+    
+    def close(self):
+        """关闭连接"""
+        if self.sftp:
+            self.sftp.close()
+        if self.connection:
+            self.connection.close()              
 
 class FanseRunner:
     """FANSe3 批量运行器 - 支持多种输入输出模式和交互菜单"""
@@ -145,7 +261,7 @@ class FanseRunner:
         elif len(output_paths) > 1:
             self.logger.info(f"多文件输出模式: {len(output_paths)} 个输出路径")
         
-    def __init__(self, debug=False, log_path: Optional[Path] = None):
+    def __init__(self, debug=False, log_path: Optional[Path] = None, show_progress: bool = True):
         # 如果没有colorama，提示
 
         # 默认参数配置
@@ -178,6 +294,135 @@ class FanseRunner:
         # 处理工作目录
         self.temp_files: List[Path] = []  # 添加临时文件跟踪
         self.work_dir: Optional[Path] = None  # 添加work_dir属性
+        self.ssh_manager = SSHConnectionManager(self.logger)
+        self.remote_mode = False  # 新增远程模式标志
+        self.show_progress = show_progress  # 新增参数控制是否显示进度条
+
+
+# =============================================================================
+# 配置集群SSH相关路径
+# =============================================================================
+    def set_remote_fanse3_path(self, ssh_path: str, ssh_key: str = None, 
+                              password: str = None, port: int = 22):
+        """设置远程FANSe3路径（改进错误处理）"""
+        try:
+            # 验证SSH路径格式
+            if not ssh_path or '@' not in ssh_path or ':' not in ssh_path:
+                raise ValueError(f"SSH路径格式不正确。正确格式: user@host:/path/to/fanse3.exe")
+            
+            # 记录认证方式
+            auth_method = "密码" if password else ("密钥" if ssh_key else "自动检测")
+            self.logger.info(f"尝试使用{auth_method}认证连接SSH...")
+            
+            # 保存SSH配置
+            self.config.save_ssh_config(ssh_path, ssh_key, password)
+            
+            # 测试连接
+            ssh_config = self.config.load_ssh_config()
+            if not ssh_config:
+                raise ValueError("SSH配置保存失败")
+            
+            if self.ssh_manager.connect(ssh_config):
+                self.remote_mode = True
+                
+                # 验证远程FANSe3可执行文件
+                remote_path = ssh_config['path']
+                self.logger.info(f"验证远程FANSe3可执行文件: {remote_path}")
+                
+                success, output = self.ssh_manager.execute_command(f'"{remote_path}" --version')
+                
+                if success:
+                    version_info = output.strip() if output else "版本信息不可用"
+                    self.logger.info(f"✅ 远程FANSe3验证成功: {version_info}")
+                else:
+                    self.logger.warning(f"⚠️ 远程FANSe3版本检查失败: {output}")
+                    # 不阻止继续，可能版本命令不支持
+                    
+                self.logger.info(f"✅ 远程FANSe3模式已启用: {ssh_path}")
+                
+            else:
+                raise ConnectionError("SSH连接测试失败")
+                
+        except Exception as e:
+            self.logger.error(f"❌ 设置远程路径失败: {str(e)}")
+            # 提供详细的错误解决建议
+            self._provide_ssh_troubleshooting(ssh_path, e)
+            raise
+    
+    def _provide_ssh_troubleshooting(self, ssh_path: str, error: Exception):
+        """提供SSH连接故障排除建议"""
+        self.logger.info("\n🔧 SSH连接故障排除建议:")
+        self.logger.info("1. 检查网络连接和服务器地址")
+        self.logger.info("2. 验证用户名和密码/密钥是否正确")
+        self.logger.info("3. 确保服务器SSH服务正在运行")
+        self.logger.info("4. 检查防火墙设置")
+        self.logger.info("5. 尝试手动SSH连接测试:")
+        self.logger.info(f"   ssh {ssh_path.split(':')[0]}")
+        
+    
+    def build_remote_command(self, input_file: Path, output_file: Path,
+                           refseq: Path, params: Dict[str, Union[int, str]],
+                           options: List[str]) -> str:
+        """构建远程执行命令"""
+        ssh_config = self.config.load_ssh_config()
+        if not ssh_config:
+            raise RuntimeError("未配置远程SSH路径")
+        
+        remote_path = ssh_config['path']
+        
+        # 处理路径映射（本地路径到远程路径）
+        # 这里需要根据您的mount配置来映射路径
+        remote_input = self._map_local_to_remote_path(input_file)
+        remote_output = self._map_local_to_remote_path(output_file)
+        remote_refseq = self._map_local_to_remote_path(refseq)
+        
+        # 构建远程命令
+        cmd_parts = [
+            f'"{remote_path}"',
+            f'-R"{remote_refseq}"',
+            f'-D"{remote_input}"',
+            f'-O"{remote_output}"'
+        ]
+        
+        # 添加参数和选项
+        for param, value in params.items():
+            cmd_parts.append(f"-{param}{value}")
+        cmd_parts.extend(options)
+        
+        remote_command = " ".join(cmd_parts)
+        
+        # 记录调试信息
+        self.logger.debug(f"远程命令: {remote_command}")
+        return remote_command
+    
+    def _map_local_to_remote_path(self, local_path: Path) -> str:
+        """将本地路径映射到远程路径"""
+        local_str = str(local_path)
+        
+        # 添加您的具体映射规则
+        mapping_rules = [
+            # (本地路径前缀, 远程路径前缀)
+            (r"\\fs2\D\DATA", "C:\\data"),  # 示例：将网络路径映射到C盘
+            (r"/mnt/fs2/D", "/data"),        # Linux路径映射
+        ]
+        
+        for local_prefix, remote_prefix in mapping_rules:
+            if local_str.startswith(local_prefix):
+                remaining = local_str[len(local_prefix):]
+                remote_path = remote_prefix + remaining.replace('/', '\\')
+                self.logger.info(f"路径映射: {local_str} -> {remote_path}")
+                return remote_path
+        
+        # 如果没有匹配的规则，返回原路径
+        self.logger.warning(f"没有找到路径映射规则，使用原路径: {local_str}")
+        return local_str
+    
+    def run_remote_command(self, command: str) -> Tuple[bool, str, float]:
+        """执行远程命令"""
+        start_time = time.time()
+        success, output = self.ssh_manager.execute_command(command)
+        elapsed = time.time() - start_time
+        return success, output, elapsed 
 # =============================================================================
 # 配置工作目录tmp_dir
 # =============================================================================
@@ -275,35 +520,25 @@ class FanseRunner:
         except Exception as e:
             self.logger.error(f"无法创建日志文件: {str(e)}")
 
-        # # 文件处理器
-        # log_file = self.config.config_dir / 'fanse_run.log'
-        # try:
-        #     file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        #     file_handler.setFormatter(formatter)
-        #     self.logger.addHandler(file_handler)
-        # except Exception as e:
-        #     self.logger.error(f"无法创建日志文件: {str(e)}")
-
-    # def _format_path_for_system(self, path: Path) -> str:
-    #     """根据操作系统类型返回适配的路径字符串"""
-    #     path_str = str(path.resolve())
-    #     if os.name == 'nt':  # Windows系统
-    #         # 转换为Windows原生反斜杠，并确保引号包裹
-    #         return f'"{path_str.replace("/", "\\")}"'
-    #     else:  # Linux/macOS
-    #         # 保持正斜杠，并确保引号包裹
-    #         return f'"{path_str}"'
-
+   
     def _normalize_path(self, path: Union[str, Path]) -> Path:
-        """规范化路径处理，完全支持UNC和所有Windows路径"""
+        """规范化路径处理，完全支持UNC和所有Windows路径（添加引号处理）"""
+        # 如果是字符串，先去除两端的引号和空格
+        if isinstance(path, str):
+            path = path.strip().strip('"').strip("'")
+        
+        # 特别处理UNC路径（Windows网络路径）
+        if isinstance(path, str) and path.startswith('\\\\'):
+            return Path(path)  # 直接返回，不进行任何修改
+            
         path = Path(path)
 
         # 处理网络路径（UNC）的特殊情况
-        path_str = str(path)
-        if path_str.startswith(('\\\\', '//')):
-            # 手动构建UNC路径
-            unc_path = path_str.replace('/', '\\')
-            return Path(unc_path)
+        #path_str = str(path)
+        #if path_str.startswith(('\\\\', '//')):
+        #     手动构建UNC路径
+        #    unc_path = path_str.replace('/', '\\')
+        #    return Path(unc_path)
 
         try:
             # 优先尝试解析路径
@@ -315,7 +550,6 @@ class FanseRunner:
             except:
                 # 最后尝试处理原始路径
                 return path
-
 # =============================================================================
 # set the FANSe3 folder position
 # =============================================================================
@@ -349,14 +583,14 @@ class FanseRunner:
                 return None
 
         # 路径不存在
-        self.logger.warning(f"配置的FANSe路径不存在: {path}")
+        self.logger.warning(f"配置的FANSe路径不存在: {path}，\n请输入 'dir {path}' 检查文件是否存在，或路径是否可访问")
         return None
 
     def set_fanse3_path(self, path: Union[str, Path]):
         """设置FANSe3路径（自动查找可执行文件）"""
         path = self._normalize_path(path)
         if not path.exists():
-            raise FileNotFoundError(f"路径不存在: {path}")
+            raise FileNotFoundError(f"路径不存在: {path}，\n请输入 'dir {path}' 检查文件是否存在，或路径是否可访问")
 
         # 如果是目录，查找可执行文件
         if path.is_dir():
@@ -373,18 +607,36 @@ class FanseRunner:
 # =============================================================================
 
     def parse_input(self, input_str: str) -> List[Path]:
-        """解析输入路径字符串，支持多种格式（修正目录处理）"""
-        input_items = [item.strip()
-                       for item in input_str.split(',') if item.strip()]
+        """解析输入路径字符串，支持多种格式（修正Windows路径处理）"""
+        self.logger.debug(f"原始输入字符串: {repr(input_str)}")  # 添加调试信息
+        
+        input_items = [item.strip() for item in input_str.split(',') if item.strip()]
         input_paths = []
 
         for item in input_items:
-            # 移除可能包裹在路径两端的引号（单引号或双引号），引号容易引发问题，干脆都去掉，还有末尾的'/'
+            # 移除可能包裹在路径两端的引号（单引号或双引号）
             item = item.strip('\'"')
+            self.logger.debug(f"处理项: {repr(item)}")  # 添加调试信息
+            
             try:
+                # 特别处理Windows UNC路径（以\\开头的网络路径）
+                if item.startswith('\\\\'):
+                    # 直接使用原始路径，不进行额外的处理
+                    p = Path(item)
+                    self.logger.debug(f"UNC路径处理: {p}")
+                    
+                    if p.exists():
+                        if p.is_file():
+                            input_paths.append(p)
+                        elif p.is_dir():
+                            self._add_fastq_files(p, input_paths)
+                    else:
+                        self.logger.warning(f"UNC路径不存在: {item}，\n请输入 'dir {item}' 检查文件是否存在，或路径是否可访问")
+                    continue
+                        
                 # 处理通配符
                 if '*' in item or '?' in item:
-                    matched_paths = glob.glob(item)  # 查找  path/*.fq
+                    matched_paths = glob.glob(item)
                     if not matched_paths:
                         self.logger.warning(f"未找到匹配的文件: {item}")
                         continue
@@ -394,37 +646,37 @@ class FanseRunner:
                             if p.is_file():
                                 input_paths.append(p)
                             elif p.is_dir():
-                                # 目录：添加目录下所有fastq文件
                                 self._add_fastq_files(p, input_paths)
                         else:
-                            self.logger.warning(f"这路径需要再检查一下: {mp}")
+                            self.logger.warning(f"路径不存在: {mp}，\n请输入 'dir {mp}' 检查文件是否存在，或路径是否可访问")
                 else:  # 没有通配符，只是单纯文件或者文件夹列表
                     p = self._normalize_path(item)
+                    
                     if p.exists():
-                        if p.is_file():  # 如果是文件
+                        if p.is_file():
                             input_paths.append(p)
-                        elif p.is_dir():  # 如果是目录
-                            # 目录：添加目录下所有fastq,fq,gz.fq.fastq.gz等等文件
+                        elif p.is_dir():
                             self._add_fastq_files(p, input_paths)
                     else:
-                        self.logger.warning(f"这路径需要再检查一下: {item}")
+                        self.logger.warning(f"路径不存在: {item}，\n请输入 'dir {item}' 检查文件是否存在，或路径是否可访问")
             except Exception as e:
-                self.logger.error(f"解析输入input的路径失败了: {item} - {str(e)}")
+                self.logger.error(f"解析输入路径失败: {item} - {str(e)}")
 
+        self.logger.debug(f"最终解析的路径: {[str(p) for p in input_paths]}")
         return input_paths
 
-    def _add_fastq_files(self, directory: Path, file_list: list):
-        """将目录下的fastq文件添加到文件列表"""
-        # 支持的fastq文件扩展名
-        fastq_exts = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
-        for ext in fastq_exts:
-            for file in directory.glob(f'*{ext}'):
-                if file.is_file():
-                    file_list.append(file)
-            # 考虑可能有大写扩展名
-            for file in directory.glob(f'*{ext.upper()}'):
-                if file.is_file() and file not in file_list:
-                    file_list.append(file)
+        def _add_fastq_files(self, directory: Path, file_list: list):
+            """将目录下的fastq文件添加到文件列表"""
+            # 支持的fastq文件扩展名
+            fastq_exts = ['.fastq', '.fq', '.fastq.gz', '.fq.gz', '.fqc']
+            for ext in fastq_exts:
+                for file in directory.glob(f'*{ext}'):
+                    if file.is_file():
+                        file_list.append(file)
+                # 考虑可能有大写扩展名
+                for file in directory.glob(f'*{ext.upper()}'):
+                    if file.is_file() and file not in file_list:
+                        file_list.append(file)
 #%% gzip and pigz
     def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
         """使用并行工具加速gzip解压缩"""
@@ -443,54 +695,7 @@ class FanseRunner:
             self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
             raise
 
-    # def _handle_gzipped_input(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
-    #     """处理gzipped输入文件，返回实际输入文件路径和临时文件（如果有）
-
-    #     Args:
-    #         input_file: 输入文件路径
-    #         temp_dir: 可选的自定义临时文件夹目录（防止系统盘空间满）
-
-    #     Returns:
-    #         (实际输入文件路径, 临时文件路径)
-    #     """
-
-    #     # 1. 检查是否需要解压
-    #     if input_file.suffix != '.gz' and not (len(input_file.suffixes) > 1 and input_file.suffixes[-1] == '.gz'):
-    #         return input_file, None
-
-    #     try:
-    #         # 在 _handle_gzipped_input 中添加
-    #         # 2. 创建自定义临时目录（如果需要）
-    #         custom_temp_dir = self.work_dir if self.work_dir else None
-    #         if custom_temp_dir:
-    #             custom_temp_dir.mkdir(parents=True, exist_ok=True)
-    #             input_size = input_file.stat().st_size
-    #             disk_free = shutil.disk_usage(custom_temp_dir).free
-    #             if disk_free < input_size * 6:  # 预留6倍空间
-    #                 raise RuntimeError("磁盘空间不足,请用-w,--work_dir 设置到其他位置")
-
-    #         # 3. 创建临时文件（带自定义目录支持）
-    #         with tempfile.NamedTemporaryFile(
-    #             prefix=f"{input_file.stem}_",
-    #             suffix=".fastq",
-    #             dir=custom_temp_dir,  # 添加自定义目录参数
-    #             delete=False
-    #         ) as temp_file:
-    #             temp_path = Path(temp_file.name)
-
-    #             # 4. 解压文件
-    #             self.logger.info(f"解压文件: {input_file} -> {temp_path}")
-    #             with gzip.open(input_file, 'rb') as f_in, \
-    #                     open(temp_path, 'wb') as f_out:
-    #                 shutil.copyfileobj(f_in, f_out)
-
-    #             # 添加到临时文件列表
-    #             self.temp_files.append(temp_path)
-    #             return temp_path, temp_path
-
-    #     except Exception as e:
-    #         self.logger.error(f"解压文件失败: {input_file} - {str(e)}")
-    #         raise
+  
 
     def _handle_gzipped_input_with_cache(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
         """带缓存机制的gzip解压"""
@@ -522,21 +727,76 @@ class FanseRunner:
 
 
     
+    #def _check_pigz_available(self) -> bool:
+    #    """检查系统是否安装pigz（并行gzip工具）"""
+    #    try:
+    #        # 方法1: 使用shutil.which（更高效，无需创建子进程）
+    #        import shutil
+    #        if shutil.which('pigz') is not None:
+    #            print('pigz is available')
+    #            self._pigz_available_cache = True
+    #            return True
+    #    #except:
+    #        import subprocess
+    #        result = subprocess.run(['fanse', 'pigz'], capture_output=True, text=True)
+    #        print('use pigz to unzip')
+    #        return result.returncode == 0
+    #    except:
+    #        return False
+    
     def _check_pigz_available(self) -> bool:
-        """检查系统是否安装pigz（并行gzip工具）"""
+        """检查系统是否安装pigz（并行gzip工具）- 优先检查fanse pigz命令"""
         try:
             import subprocess
-            result = subprocess.run(['which', 'pigz'], capture_output=True, text=True)
+            import shutil
+            
+            # 方法0: 优先检查fanse pigz命令（新增）
+            try:
+                # 使用fanse pigz --version检查
+                result = subprocess.run(
+                    ['fanse', 'pigz', '--version'],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore',
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    self.logger.info("✅ 检测到 fanse pigz 命令可用")
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass  # 继续尝试其他方法
+            
+            # 方法1: 使用shutil.which检查系统pigz
+            if shutil.which('pigz') is not None:
+                return True
+            
+            # 方法2: 直接运行pigz --version（备用方案）
+            result = subprocess.run(
+                ['pigz', '--version'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=5
+            )
             return result.returncode == 0
-        except:
+            
+        except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
+            # 只捕获特定异常
+            return False
+        except Exception:
+            # 其他异常也返回False
             return False
     
-    def _decompress_with_pigz(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
-        """使用pigz进行并行解压缩"""
+ 
+
+    def _decompress_with_standard_gzip(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+        """标准gzip解压 - 添加进度条版本"""
         custom_temp_dir = self.work_dir if self.work_dir else None
         if custom_temp_dir:
             custom_temp_dir.mkdir(parents=True, exist_ok=True)
-        
+            
         with tempfile.NamedTemporaryFile(
             prefix=f"{input_file.stem}_",
             suffix=".fastq",
@@ -544,59 +804,290 @@ class FanseRunner:
             delete=False
         ) as temp_file:
             temp_path = Path(temp_file.name)
-        
+            
+        self.logger.info(f"使用gzip解压: {input_file} -> {temp_path}")
+            
+        try:
+            # 获取输入文件大小用于进度条
+            total_size = input_file.stat().st_size
+                
+            # 使用tqdm进度条
+            try:
+                from tqdm import tqdm
+            except ImportError:
+                self.logger.warning("未安装tqdm，无法显示进度条")
+                # 回退到无进度条版本
+                with gzip.open(input_file, 'rb') as f_in:
+                    with open(temp_path, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+            else:
+                # 使用tqdm显示进度条
+                with gzip.open(input_file, 'rb') as f_in:
+                    with open(temp_path, 'wb') as f_out:
+                        with tqdm(total=total_size*5, unit='B', unit_scale=True, 
+                                 desc=f"解压 {input_file.name}", ncols=80) as pbar:
+                            # 分块读取和写入，每块更新进度条
+                            chunk_size = 1024 * 1024  # 1MB
+                            while True:
+                                chunk = f_in.read(chunk_size)
+                                if not chunk:
+                                    break
+                                f_out.write(chunk)
+                                pbar.update(len(chunk))
+                
+            # 验证解压结果
+            if not temp_path.exists() or temp_path.stat().st_size == 0:
+                raise ValueError("gzip解压失败")
+                
+            self.temp_files.append(temp_path)
+            self.logger.info(f"✅ gzip解压成功")
+            return temp_path, temp_path
+                
+        except Exception as e:
+            self.logger.error(f"❌ gzip解压失败: {str(e)}")
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except:
+                pass
+            raise
+
+    def _decompress_with_pigz(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+        """使用pigz并行解压 - 添加进度条版本, 预估压缩比为5倍，gz文件大小*5，尝试"""
+        custom_temp_dir = self.work_dir if self.work_dir else None
+        if custom_temp_dir:
+            custom_temp_dir.mkdir(parents=True, exist_ok=True)
+            
+        with tempfile.NamedTemporaryFile(
+            prefix=f"{input_file.stem}_",
+            suffix=".fastq",
+            dir=custom_temp_dir,
+            delete=False
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            
         try:
             import subprocess
             self.logger.info(f"使用pigz并行解压: {input_file} -> {temp_path}")
-            
-            # 使用pigz并行解压，-d表示解压，-c输出到stdout，-p指定线程数
-            cpu_count = min(os.cpu_count(), 8)  # 限制最大线程数
-            cmd = ['pigz', '-dc', '-p', str(cpu_count), str(input_file)]
-            
-            with open(temp_path, 'wb') as f_out:
-                result = subprocess.run(cmd, stdout=f_out, check=True)
-            
-            self.temp_files.append(temp_path)
-            return temp_path, temp_path
-            
-        except subprocess.CalledProcessError as e:
-            # pigz失败时回退到标准gzip
-            self.logger.warning("pigz解压失败，回退到标准gzip")
+                
+            # 使用fanse pigz命令
+            cpu_count = min(os.cpu_count(), 8)
+            cmd = ['fanse', 'pigz', '-d', '-c', '-p', str(cpu_count), str(input_file)]
+                
+            # 获取输入文件大小用于进度条（进度可能不准确，但提供视觉反馈）
+            total_size = input_file.stat().st_size
+                
             try:
-                temp_path.unlink()  # 删除可能不完整的文件
-            except:
-                pass
+                from tqdm import tqdm
+            except ImportError:
+                self.logger.warning("未安装tqdm，无法显示进度条")
+                # 回退到无进度条版本
+                with open(temp_path, 'wb') as f_out:
+                    result = subprocess.run(cmd, stdout=f_out, check=True, timeout=3600)
+            else:
+                # 使用tqdm显示进度条
+                with open(temp_path, 'wb') as f_out:
+                    # 启动进程
+                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        
+                    with tqdm(total=total_size*5, unit='B', unit_scale=True, 
+                             desc=f"pigz解压 {input_file.name}", ncols=80) as pbar:
+                        # 分块读取输出并更新进度条
+                        chunk_size = 1024 * 1024  # 1MB
+                        while True:
+                            chunk = process.stdout.read(chunk_size)
+                            if not chunk:
+                                break
+                            f_out.write(chunk)
+                            pbar.update(len(chunk))
+                        
+                    # 等待进程完成并检查返回值
+                    stdout, stderr = process.communicate()
+                    if process.returncode != 0:
+                        raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
+                
+            # 验证解压结果
+            if not temp_path.exists() or temp_path.stat().st_size == 0:
+                raise ValueError("pigz解压失败")
+                
+            self.temp_files.append(temp_path)
+            self.logger.info(f"✅ pigz解压成功")
+            return temp_path, temp_path
+                
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"❌ pigz解压失败，返回码: {e.returncode}")
+            if e.stderr:
+                self.logger.error(f"错误输出: {e.stderr.decode()}")
             return self._decompress_with_standard_gzip(input_file)
+        except subprocess.TimeoutExpired:
+            self.logger.error("❌ pigz解压超时")
+            return self._decompress_with_standard_gzip(input_file)
+        except Exception as e:
+            self.logger.error(f"❌ pigz解压异常: {str(e)}")
+            return self._decompress_with_standard_gzip(input_file)
+
+
+#######解压不带进度条，带的是速度指示
+    #def _decompress_with_standard_gzip(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+    #    """标准gzip解压 - 使用不确定进度条"""
+    #    custom_temp_dir = self.work_dir if self.work_dir else None
+    #    if custom_temp_dir:
+    #        custom_temp_dir.mkdir(parents=True, exist_ok=True)
+        #    
+    #    with tempfile.NamedTemporaryFile(
+    #        prefix=f"{input_file.stem}_",
+    #        suffix=".fastq",
+    #        dir=custom_temp_dir,
+    #        delete=False
+    #    ) as temp_file:
+    #        temp_path = Path(temp_file.name)
+        #    
+    #    self.logger.info(f"使用gzip解压: {input_file} -> {temp_path}")
+        #    
+    #    try:
+    #        # 使用不确定进度条（不显示百分比）
+    #        try:
+    #            from tqdm import tqdm
+    #        except ImportError:
+    #            self.logger.warning("未安装tqdm，无法显示进度条")
+    #            # 回退到无进度条版本
+    #            with gzip.open(input_file, 'rb') as f_in:
+    #                with open(temp_path, 'wb') as f_out:
+    #                    shutil.copyfileobj(f_in, f_out)
+    #        else:
+    #            # 使用不确定进度条
+    #            with gzip.open(input_file, 'rb') as f_in:
+    #                with open(temp_path, 'wb') as f_out:
+    #                    with tqdm(total=None, unit='B', unit_scale=True, 
+    #                             desc=f"解压 {input_file.name}", ncols=80) as pbar:
+    #                        # 分块读取和写入，更新进度条但不显示百分比
+    #                        chunk_size = 1024 * 1024  # 1MB
+    #                        while True:
+    #                            chunk = f_in.read(chunk_size)
+    #                            if not chunk:
+    #                                break
+    #                            f_out.write(chunk)
+    #                            pbar.update(len(chunk))
+        #        
+    #        # 验证解压结果
+    #        if not temp_path.exists() or temp_path.stat().st_size == 0:
+    #            raise ValueError("gzip解压失败")
+        #        
+    #        self.temp_files.append(temp_path)
+    #        self.logger.info(f"✅ gzip解压成功，解压后大小: {temp_path.stat().st_size} 字节")
+    #        return temp_path, temp_path
+        #        
+    #    except Exception as e:
+    #        self.logger.error(f"❌❌ gzip解压失败: {str(e)}")
+    #        try:
+    #            if temp_path.exists():
+    #                temp_path.unlink()
+    #        except:
+    #            pass
+    #        raise
+    #
+    #def _decompress_with_pigz(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
+    #    """使用pigz并行解压 - 使用不确定进度条"""
+    #    custom_temp_dir = self.work_dir if self.work_dir else None
+    #    if custom_temp_dir:
+    #        custom_temp_dir.mkdir(parents=True, exist_ok=True)
+        #    
+    #    with tempfile.NamedTemporaryFile(
+    #        prefix=f"{input_file.stem}_",
+    #        suffix=".fastq",
+    #        dir=custom_temp_dir,
+    #        delete=False
+    #    ) as temp_file:
+    #        temp_path = Path(temp_file.name)
+        #    
+    #    try:
+    #        import subprocess
+    #        self.logger.info(f"使用pigz并行解压: {input_file} -> {temp_path}")
+        #        
+    #        # 使用fanse pigz命令
+    #        cpu_count = min(os.cpu_count(), 50)
+    #        cmd = ['fanse', 'pigz', '-d', '-c', '-p', str(cpu_count), str(input_file)]
+        #        
+    #        try:
+    #            from tqdm import tqdm
+    #        except ImportError:
+    #            self.logger.warning("未安装tqdm，无法显示进度条")
+    #            # 回退到无进度条版本
+    #            with open(temp_path, 'wb') as f_out:
+    #                result = subprocess.run(cmd, stdout=f_out, check=True, timeout=3600)
+    #        else:
+    #            # 使用不确定进度条
+    #            with open(temp_path, 'wb') as f_out:
+    #                # 启动进程
+    #                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        #                
+    #                with tqdm(total=None, unit='B', unit_scale=True, 
+    #                         desc=f"pigz解压 {input_file.name}", ncols=80) as pbar:
+    #                    # 分块读取输出并更新进度条（不确定模式）
+    #                    chunk_size = 1024 * 1024  # 1MB
+    #                    while True:
+    #                        chunk = process.stdout.read(chunk_size)
+    #                        if not chunk:
+    #                            break
+    #                        f_out.write(chunk)
+    #                        pbar.update(len(chunk))
+        #                
+    #                # 等待进程完成并检查返回值
+    #                stdout, stderr = process.communicate()
+    #                if process.returncode != 0:
+    #                    raise subprocess.CalledProcessError(process.returncode, cmd, stdout, stderr)
+        #        
+    #        # 验证解压结果
+    #        if not temp_path.exists() or temp_path.stat().st_size == 0:
+    #            raise ValueError("pigz解压失败")
+        #        
+    #        self.temp_files.append(temp_path)
+    #        self.logger.info(f"✅ pigz解压成功，解压后大小: {temp_path.stat().st_size} 字节")
+    #        return temp_path, temp_path
+        #        
+    #    except subprocess.CalledProcessError as e:
+    #        self.logger.error(f"❌❌ pigz解压失败，返回码: {e.returncode}")
+    #        if e.stderr:
+    #            self.logger.error(f"错误输出: {e.stderr.decode()}")
+    #        return self._decompress_with_standard_gzip(input_file)
+    #    except subprocess.TimeoutExpired:
+    #        self.logger.error("❌❌ pigz解压超时")
+    #        return self._decompress_with_standard_gzip(input_file)
+    #    except Exception as e:
+    #        self.logger.error(f"❌❌ pigz解压异常: {str(e)}")
+    #        return self._decompress_with_standard_gzip(input_file)
+
+    def _validate_decompressed_file(self, file_path: Path) -> bool:
+        """验证解压后的文件是否有效"""
+        try:
+            if not file_path.exists():
+                self.logger.error("解压文件不存在")
+                return False
+            
+            file_size = file_path.stat().st_size
+            if file_size == 0:
+                self.logger.error("解压文件为空")
+                return False
+            
+            self.logger.info(f"✅ 解压文件验证通过，大小: {file_size} 字节")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"文件验证失败: {str(e)}")
+            return False
     
-    def _decompress_with_standard_gzip(self, input_file: Path) -> Tuple[Path, Optional[Path]]:
-        """标准gzip解压（优化缓冲区大小）"""
-        custom_temp_dir = self.work_dir if self.work_dir else None
-        if custom_temp_dir:
-            custom_temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        with tempfile.NamedTemporaryFile(
-            prefix=f"{input_file.stem}_",
-            suffix=".fastq",
-            dir=custom_temp_dir,
-            delete=False
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-        
-        self.logger.info(f"解压文件: {input_file} -> {temp_path}")
-        
-        # 优化：使用更大的缓冲区提高IO效率
-        buffer_size = 1024 * 1024  # 1MB缓冲区
-        
-        with gzip.open(input_file, 'rb') as f_in, \
-                open(temp_path, 'wb') as f_out:
-            while True:
-                chunk = f_in.read(buffer_size)
-                if not chunk:
-                    break
-                f_out.write(chunk)
-        
-        self.temp_files.append(temp_path)
-        return temp_path, temp_path
+    def _is_likely_fastq(self, data: bytes) -> bool:
+        """检查数据是否可能是FASTQ格式"""
+        try:
+            text = data.decode('utf-8', errors='ignore')
+            # 简单的FASTQ格式检查
+            if '@' in text and '+' in text:
+                return True
+            return False
+        except:
+            return False
+    
+    
     
     def _get_file_hash(self, file_path: Path) -> str:
         """计算文件哈希值"""
@@ -615,83 +1106,7 @@ class FanseRunner:
             return cache_mtime > original_mtime
         except:
             return False
-    # def generate_output_mapping(self, input_paths: List[Path],
-    #                             output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
-    #     """        
-    #     生成输入输出路径映射（支持文件和文件夹输入）
 
-    #     参数:
-    #         input_paths: 输入路径列表（可以是文件或文件夹）
-    #         output_paths: 可选输出路径列表
-
-    #     返回:
-    #         输入路径到输出路径的映射字典
-
-    #     """
-
-    #     path_map = OrderedDict()
-
-    #     # 展开所有输入路径（处理文件夹情况）
-    #     expanded_inputs = []
-    #     for path in input_paths:
-    #         if path.is_file():
-    #             expanded_inputs.append(path)
-    #         elif path.is_dir():
-    #             # 收集文件夹下所有文件（不递归）
-    #             expanded_inputs.extend(
-    #                 [f for f in path.iterdir() if f.is_file()])
-    #         else:
-    #             raise ValueError(f"路径既不是文件也不是文件夹: {path}")
-
-    #     # 辅助函数：智能生成输出文件名
-    #     def get_output_filename(input_file: Path) -> str:
-    #         """根据输入文件名生成输出文件名，处理压缩文件扩展名"""
-    #         stem = input_file.stem
-
-    #         # 处理常见的压缩文件扩展名
-    #         compress_exts = ['.gz', '.bz2', '.zip']
-    #         for ext in compress_exts:
-    #             if stem.endswith(ext):
-    #                 stem = stem[:-len(ext)]
-
-    #         # 处理常见的测序文件扩展名
-    #         seq_exts = ['.fastq', '.fq', '.fa', '.fna', '.fasta']
-    #         for ext in seq_exts:
-    #             if stem.endswith(ext):
-    #                 stem = stem[:-len(ext)]
-
-    #         return f"{stem}.fanse3"
-
-    #     if output_paths is None:
-    #         for path in expanded_inputs:
-    #             # 使用智能文件名生成
-    #             output_file = path.with_name(get_output_filename(path))
-    #             path_map[path] = output_file
-
-    #     # 2. 指定单个输出路径
-    #     elif len(output_paths) == 1:
-    #         output_dir = self._normalize_path(output_paths[0])
-            
-    #         output_dir.mkdir(parents=True, exist_ok=True)
-    #         for path in expanded_inputs:
-    #             # 使用智能文件名生成
-    #             output_file = output_dir / get_output_filename(path)
-    #             path_map[path] = output_file
-
-    #     # 3. 多个输出路径（必须与输入数量匹配）
-    #     else:
-    #         if len(expanded_inputs) != len(output_paths):
-    #             raise ValueError(
-    #                 f"输入路径({len(expanded_inputs)})和输出路径({len(output_paths)})数量不匹配")
-
-    #         for input_path, output_dir in zip(expanded_inputs, output_paths):
-    #             output_dir = self._normalize_path(output_dir)
-    #             output_dir.mkdir(parents=True, exist_ok=True)
-    #             # 使用智能文件名生成
-    #             output_file = output_dir / get_output_filename(input_path)
-    #             path_map[input_path] = output_file
-
-    #     return path_map
 
     def generate_output_mapping(self, input_paths: List[Path],
                                output_paths: Optional[List[Path]] = None) -> Dict[Path, Path]:
@@ -926,6 +1341,7 @@ class FanseRunner:
                   resume: bool = False  # 新增-r选项
                   ):
         """批量运行FANSe3（添加执行确认选项）"""
+        """批量运行FANSe3 - 支持远程模式"""
         # 合并参数和选项
         final_params = {**self.default_params, **(params or {})}
         final_options = [*self.default_options, *(options or [])]
@@ -935,8 +1351,9 @@ class FanseRunner:
             raise FileNotFoundError(f"参考序列文件不存在: {refseq}")
 
         # 显示配置信息
+        mode_info = " 远程模式" if self.remote_mode else " 本地模式"
         self.logger.info("\n" + "="*50)
-        self.logger.info("FANSe3 运行配置:")
+        self.logger.info("FANSe3 运行配置- {mode_info}")
         self.logger.info(f"  参考序列: {refseq}")
         # self.logger.info(f"  输入文件夹: {len(file_map)} 个")
         self.logger.info(f"  输入文件: {len(file_map)} 个")
@@ -1080,63 +1497,61 @@ class FanseRunner:
                 # 只有在需要执行任务时才处理文件
                 if user_action in (None, 'y', 'a'):
                     try:
-                        # 处理可能的gzipped输入
-                        input_file, temp_file = self._handle_gzipped_input(
-                            original_input_file)
-                    except Exception as e:
-                        self.logger.error(f"文件处理失败: {str(e)}")
-                        failed.append(original_input_file.name)
-                        continue
-
-                    # 构建命令
-                    cmd = self.build_command(
-                        input_file, output_file, refseq,
-                        final_params, final_options
-                    )
-
-                    # 显示完整命令信息
-                    cmd_info = f"命令: {cmd}"
-                    self.logger.info(cmd_info)
-                    if HAS_COLORAMA:
-                        print(Fore.YELLOW + cmd_info + Style.RESET_ALL)
-                    else:
-                        print(cmd_info)
-
-                try:
-                    # 执行命令
-                    self.logger.info("开始执行命令...")
-                    cmd_start_time = time.time()
-                    ret = os.system(cmd)
-                    elapsed = time.time() - cmd_start_time
-
-                    if ret == 0:
-                        success += 1
-                        self.logger.info(f"  完成了! 耗时: {elapsed:.2f}秒")
-
-                        # 检查预期的输出文件
-                        expected_output = output_file
-                        if expected_output.exists():
-                            self.logger.info(f"  找到输出文件: {expected_output}")
+                        # 处理gzipped输入
+                        input_file, temp_file = self._handle_gzipped_input(original_input_file)
+                        
+                        if self.remote_mode:
+                            # 🌐🌐🌐🌐 远程模式执行 - 修复：这里必须实际执行远程命令
+                            self.logger.info("🚀🚀 进入远程执行模式")
+                            
+                            # 构建远程命令
+                            remote_cmd = self.build_remote_command(
+                                input_file, output_file, refseq, final_params, final_options
+                            )
+                            
+                            self.logger.info(f"🌐 远程命令: {remote_cmd}")
+                            
+                            # 执行远程命令
+                            success_flag, output, elapsed = self.run_remote_command(remote_cmd)
+                            
+                            if success_flag:
+                                success += 1
+                                self.logger.info(f"✅ 远程任务完成! 耗时: {elapsed:.2f}秒")
+                                if output:
+                                    self.logger.debug(f"远程输出: {output}")
+                            else:
+                                failed.append(original_input_file.name)
+                                self.logger.error(f"❌❌ 远程任务失败! 错误: {output}, 耗时: {elapsed:.2f}秒")
+                                
                         else:
-                            self.logger.warning(
-                                f"  警告: 未找到预期输出文件 {expected_output}")
-                    else:
-                        failed.append(input_file.name)
-                        self.logger.error(
-                            f"  失败! 返回码: {ret}, 耗时: {elapsed:.2f}秒")
+                            # 💻💻 本地模式执行
+                            cmd = self.build_command(input_file, output_file, refseq, final_params, final_options)
+                            cmd_info = f"命令: {cmd}"
+                            self.logger.info(cmd_info)
+                            
+                            self.logger.info("开始执行命令...")
+                            cmd_start_time = time.time()
+                            ret = os.system(cmd)
+                            elapsed = time.time() - cmd_start_time
 
-                except Exception as e:
-                    failed.append(original_input_file.name)
-                    self.logger.error(f"  处理异常: {str(e)}")
-                finally:
-                    # 清理临时文件（如果创建了）
-                    if temp_file and temp_file.exists():
-                        try:
-                            temp_file.unlink()
-                            self.logger.info(f"已清理临时文件: {temp_file}")
-                        except Exception as e:
-                            self.logger.error(
-                                f"清理临时文件失败: {temp_file} - {str(e)}")
+                            if ret == 0:
+                                success += 1
+                                self.logger.info(f"✅ 本地任务完成! 耗时: {elapsed:.2f}秒")
+                            else:
+                                failed.append(original_input_file.name)
+                                self.logger.error(f"❌❌ 本地任务失败! 返回码: {ret}, 耗时: {elapsed:.2f}秒")
+                    except Exception as e:
+                        failed.append(original_input_file.name)
+                        self.logger.error(f"  处理异常: {str(e)}")
+                    finally:
+                        # 清理临时文件（如果创建了）
+                        if temp_file and temp_file.exists():
+                            try:
+                                temp_file.unlink()
+                                self.logger.info(f"已清理临时文件: {temp_file}")
+                            except Exception as e:
+                                self.logger.error(
+                                    f"清理临时文件失败: {temp_file} - {str(e)}")
 
         # 汇总统计（美化显示）
         total_elapsed = time.time() - start_time
@@ -1164,6 +1579,278 @@ class FanseRunner:
                 else:
                     print(f"  - {name}")
 
+# 在 FanseRunner 类中添加远程命令执行方法
+def build_remote_command(self, input_file: Path, output_file: Path,
+                       refseq: Path, params: Dict[str, Union[int, str]],
+                       options: List[str]) -> str:
+    """构建远程执行命令"""
+    ssh_config = self.config.load_ssh_config()
+    if not ssh_config:
+        raise RuntimeError("未配置远程SSH路径")
+    
+    remote_path = ssh_config['path']
+    
+    # 构建远程命令
+    cmd_parts = [
+        f'"{remote_path}"',
+        f'-R"{refseq}"',
+        f'-D"{input_file}"',
+        f'-O"{output_file}"'
+    ]
+    
+    # 添加参数和选项
+    for param, value in params.items():
+        cmd_parts.append(f"-{param}{value}")
+    cmd_parts.extend(options)
+    
+    remote_command = " ".join(cmd_parts)
+    self.logger.info(f"🌐 远程命令: {remote_command}")
+    return remote_command
+
+def run_remote_command(self, command: str) -> Tuple[bool, str, float]:
+    """执行远程命令"""
+    start_time = time.time()
+    success, output = self.ssh_manager.execute_command(command)
+    elapsed = time.time() - start_time
+    return success, output, elapsed
+
+# 修改 run_batch 方法，添加远程执行逻辑
+def run_batch(self, file_map: Dict[Path, Path], refseq: Path,
+              params: Optional[Dict[str, Union[int, str]]] = None,
+              options: Optional[List[str]] = None,
+              debug: bool = False,
+              yes: bool = False,
+              resume: bool = False):
+    """批量运行FANSe3 - 支持远程模式"""
+    # 合并参数和选项
+    final_params = {**self.default_params, **(params or {})}
+    final_options = [*self.default_options, *(options or [])]
+
+    # 验证参考序列存在
+    if not refseq.exists():
+        raise FileNotFoundError(f"参考序列文件不存在: {refseq}")
+
+    # 显示配置信息
+    mode_info = "🌐 远程模式" if self.remote_mode else "💻 本地模式"
+    self.logger.info("\n" + "="*50)
+    self.logger.info(f"FANSe3 运行配置 - {mode_info}")
+    self.logger.info(f"  参考序列: {refseq}")
+    self.logger.info(f"  输入文件: {len(file_map)} 个")
+    self.logger.info(f"  参数: {final_params}")
+    self.logger.info(f"  选项: {final_options}")
+    self.logger.info("="*50)
+
+    # 统计处理进度
+    total = len(file_map)
+    success = 0
+    skipped = 0
+    failed = []
+
+    # 执行模式控制
+    run_mode = "confirm" if not yes else "auto"
+
+    if not debug:
+        print("\n执行模式说明：")
+        print(" - [y] 执行当前任务并继续")
+        print(" - [a] 执行当前任务并切换到自动模式（执行所有剩余任务）")
+        print(" - [n] 跳过当前任务，继续下一个")
+        print(" - [q] 退出整个批处理")
+
+    # 断点续运行模式
+    if resume:
+        filtered_map = OrderedDict()
+        for input_path, output_path in file_map.items():
+            if output_path.exists():
+                self.logger.info(f"跳过已存在输出文件: {output_path}")
+                skipped += 1
+            else:
+                filtered_map[input_path] = output_path
+        file_map = filtered_map
+        total = len(file_map)
+        self.logger.info(f"断点续运行模式: 跳过 {skipped} 个已完成任务，剩余 {total} 个任务")
+
+    if debug:
+        run_mode = "auto"
+        self.logger.info("调试模式激活，进入自动执行模式")
+
+    # 开始处理
+    start_time = time.time()
+    with self:
+        for i, (original_input_file, output_file) in enumerate(file_map.items(), 1):
+            # 准备任务信息
+            task_info = f"""
+                        {'='*50}
+                        任务 {i}/{total}: {original_input_file.name}
+                        {'='*50}
+                        输入文件: {original_input_file}
+                        输出文件: {output_file}
+                        参考序列: {refseq}
+                        参数: {final_params}
+                        选项: {final_options}
+                        {'-'*50}
+                        """
+            
+            # 显示任务信息
+            if not debug:
+                self._print_task_info(task_info)
+            else:
+                print(task_info)
+
+            # 调试模式路径验证
+            if debug:
+                self.logger.info("调试模式激活 - 开始路径验证")
+                all_errors = []
+                for path, name, check_type in [
+                    (original_input_file, "输入文件", {"is_file": True}),
+                    (refseq, "参考序列", {"is_file": True}),
+                ]:
+                    is_valid, errors = self.validate_paths(path, name, **check_type)
+                    all_errors.extend(errors)
+                
+                if not all_errors:
+                    self.logger.info("✅ 所有路径验证通过")
+                else:
+                    self.logger.error("🚫 路径验证失败：")
+                    for error in all_errors:
+                        self.logger.error(f"   - {error}")
+                return
+
+            # 模式处理逻辑
+            user_action = None
+            if run_mode == "confirm":
+                response = ""
+                while response not in ['y', 'a', 'n', 'q']:
+                    response = input("请选择操作 [y]自动执行所有/[a]执行本条/[n]跳过本条/[q]退出: ").strip().lower()
+                    user_action = response
+
+                if user_action == 'y':
+                    self.logger.info("切换到自动模式，执行所有剩余任务")
+                    run_mode = "auto"
+                elif response == 'a':
+                    self.logger.info("用户选择执行此单条任务")
+                elif user_action == 'q':
+                    self.logger.info("用户选择退出批处理")
+                    break
+                elif user_action == 'n':
+                    self.logger.info(f"跳过任务: {original_input_file.name}")
+                    continue
+
+            # 执行任务
+            if user_action in (None, 'y', 'a'):
+                try:
+                    # 处理gzipped输入
+                    input_file, temp_file = self._handle_gzipped_input(original_input_file)
+                    
+                    if self.remote_mode:
+                        # 🌐🌐 远程模式执行
+                        remote_cmd = self.build_remote_command(
+                            input_file, output_file, refseq, final_params, final_options
+                        )
+                        self.logger.info(f"🚀 开始远程执行...")
+                        
+                        success_flag, output, elapsed = self.run_remote_command(remote_cmd)
+                        
+                        if success_flag:
+                            success += 1
+                            self.logger.info(f"✅ 远程任务完成! 耗时: {elapsed:.2f}秒")
+                            if output:
+                                self.logger.debug(f"远程输出: {output}")
+                        else:
+                            failed.append(original_input_file.name)
+                            self.logger.error(f"❌ 远程任务失败! 错误: {output}, 耗时: {elapsed:.2f}秒")
+                            
+                    else:
+                        # 💻 本地模式执行
+                        cmd = self.build_command(input_file, output_file, refseq, final_params, final_options)
+                        cmd_info = f"命令: {cmd}"
+                        self.logger.info(cmd_info)
+                        
+                        self.logger.info("开始执行命令...")
+                        cmd_start_time = time.time()
+                        ret = os.system(cmd)
+                        elapsed = time.time() - cmd_start_time
+
+                        if ret == 0:
+                            success += 1
+                            self.logger.info(f"✅ 本地任务完成! 耗时: {elapsed:.2f}秒")
+                        else:
+                            failed.append(original_input_file.name)
+                            self.logger.error(f"❌ 本地任务失败! 返回码: {ret}, 耗时: {elapsed:.2f}秒")
+
+                except Exception as e:
+                    failed.append(original_input_file.name)
+                    self.logger.error(f"❌ 处理异常: {str(e)}")
+                finally:
+                    # 清理临时文件
+                    if 'temp_file' in locals() and temp_file and temp_file.exists():
+                        try:
+                            temp_file.unlink()
+                            self.logger.info(f"已清理临时文件: {temp_file}")
+                        except Exception as e:
+                            self.logger.error(f"清理临时文件失败: {temp_file} - {str(e)}")
+
+    # 汇总统计
+    total_elapsed = time.time() - start_time
+    summary = f"\n{'='*50}\n处理完成: {success} 成功, {len(failed)} 失败"
+    if resume:
+        summary += f", {skipped} 跳过"
+    summary += f"\n总耗时: {total_elapsed:.2f}秒\n"
+    
+    self.logger.info(summary)
+    if HAS_COLORAMA:
+        print(Fore.CYAN + summary + Style.RESET_ALL)
+    else:
+        print(summary)
+
+    if failed:
+        self.logger.info("失败文件列表:")
+        for name in failed:
+            self.logger.info(f"  - {name}")
+            
+
+class PathMapper:
+    """路径映射器 - 处理本地与远程路径的转换"""
+    
+    def __init__(self, mapping_rules: List[Tuple[str, str]] = None):
+        self.mapping_rules = mapping_rules or []
+        
+    def add_mapping(self, local_prefix: str, remote_prefix: str):
+        """添加路径映射规则"""
+        self.mapping_rules.append((local_prefix, remote_prefix))
+        
+    def local_to_remote(self, local_path: Union[str, Path]) -> str:
+        """本地路径转远程路径"""
+        local_str = str(local_path)
+        
+        for local_prefix, remote_prefix in self.mapping_rules:
+            if local_str.startswith(local_prefix):
+                remaining = local_str[len(local_prefix):]
+                # 处理路径分隔符转换
+                if remote_prefix.upper().startswith('C:'):
+                    # Windows路径
+                    remote_path = remote_prefix + remaining.replace('/', '\\')
+                else:
+                    # Linux路径
+                    remote_path = remote_prefix + remaining
+                return remote_path
+        
+        return local_str  # 默认返回原路径
+    
+    def remote_to_local(self, remote_path: str) -> Path:
+        """远程路径转本地路径"""
+        for local_prefix, remote_prefix in self.mapping_rules:
+            if remote_path.startswith(remote_prefix):
+                remaining = remote_path[len(remote_prefix):]
+                if remote_prefix.upper().startswith('C:'):
+                    # 从Windows路径转换
+                    local_path = local_prefix + remaining.replace('\\', '/')
+                else:
+                    local_path = local_prefix + remaining
+                return Path(local_path)
+        
+        return Path(remote_path)  # 默认返回原路径
+        
+
 
 #%% 命令行接口
 def add_run_subparser(subparsers):
@@ -1173,12 +1860,12 @@ def add_run_subparser(subparsers):
         help='批量运行FANSe3',
         description='''FANSe3 批量运行工具
 支持多种输入输出模式:  单个文件与目录形式均可，可批量运行
-  -i sample.fq 文件: 直接处理单个或多个文件。/path/sample.fastq;/path/sample.fq.支持gz读取，会先解压到本地临时目录后输入fanse3比对。可输入多个文件，用逗号隔开
-  本地临时目录默认在系统盘，可用 -w dir 指定硬盘空间大的文件夹
+  -i sample.fq 文件: 直接处理单个或多个文件。/path/sample.fastq;/path/sample.fq.支持gz读取，会先解压到本地/服务器临时目录后输入fanse3比对。可输入多个文件，用逗号隔开
+  本地临时目录默认在系统盘，可用 -w dir 指定硬盘空间大的文件夹, 或任意位置，包括服务器等
 
   -i /path/ 目录: 如输入目录，则处理目录下所有fastq/fq/fq.gz/fastq.gz。可同时输入多个目录，用逗号隔开
 
-  -i /*.fq 通配符: 使用通配符选择文件   为高效筛选目录中所需文件，可使用*号进行筛选。例如   /path/*R1.fastq.gz
+  -i /*_R1.fq 通配符: 使用通配符选择文件   为高效筛选目录中所需文件，可使用*号进行筛选。例如   /path/*R1.fastq.gz
 
 输出目录控制:
   不指定: 输出到输入文件所在目录
@@ -1190,16 +1877,13 @@ def add_run_subparser(subparsers):
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    # 路径配置
-    parser.add_argument(
-        '--set-path',
-        metavar='PATH',
-        help='配置FANSe可执行文件路径 (文件或目录)'
-    )
+    #parser = subparsers.add_parser('run', help='批量运行FANSe3')
+    
+
 
     # 添加work_dir配置 (新增)
     parser.add_argument(
-        '-w', '--work_dir',
+        '-w', '--work-dir',
         type=str,
         default=None,
         help="配置临时工作目录，用于存放解压等操作产生的临时文件"
@@ -1311,6 +1995,192 @@ def add_run_subparser(subparsers):
         help='断点续运行模式（跳过已存在的输出文件）'
     )
 
+
+
+    # 新增SSH相关参数============================================================
+
+    # 创建互斥组，确保不同模式不冲突
+    path_mode_group = parser.add_mutually_exclusive_group()
+    
+    # 本地路径配置
+    path_mode_group.add_argument(
+        '--set-path',
+        metavar='PATH',
+        help='配置本地FANSe可执行文件路径'
+    )
+    
+    # SSH路径配置
+    path_mode_group.add_argument(
+        '--set-ssh-path',
+        metavar='USER@HOST:PATH',
+        help='配置远程FANSe3路径 (格式: user@host:/path/to/fanse3.exe)'
+    )
+    
+    #==========================
+    # SSH认证参数组
+    ssh_auth_group = parser.add_argument_group('SSH认证选项')
+    
+    ssh_auth_group.add_argument(
+        '--ssh-key',
+        metavar='PATH',
+        help='SSH私钥文件路径（优先使用密钥认证）'
+    )
+    
+    ssh_auth_group.add_argument(
+        '--ssh-password',
+        help='SSH密码（如果提供密钥，则忽略密码）'
+    )
+    
+    ssh_auth_group.add_argument(
+        '--ssh-port',
+        type=int,
+        default=22,
+        help='SSH端口 (默认: 22)'
+    )
+    # 路径配置
+    #parser.add_argument(
+    #    '--set-path',
+    #    metavar='PATH',
+    #    help='配置FANSe可执行文件路径 (文件或目录)'
+    #)
+    
+    # 修改现有的set-path处理逻辑
+    def run_command(args):
+        # 处理日志路径
+        log_path = Path(args.log) if args.log else None
+        if args.log:
+            try:
+                log_path = Path(args.log)
+                if log_path.is_dir():
+                    log_path = log_path / 'fanse_run.log'
+            except Exception as e:
+                print(f"警告: 指定的日志路径无效 - {str(e)}")
+
+        # 创建运行器实例 - 移到函数内部
+        runner = FanseRunner(log_path=log_path, debug=args.debug)
+        try:
+            # ========== 第一步：处理路径配置 ==========
+            # 处理SSH路径配置
+            if args.set_ssh_path:
+                runner.set_remote_fanse3_path(
+                    args.set_ssh_path,
+                    args.ssh_key,
+                    args.ssh_password,
+                    args.ssh_port
+                )
+                #return
+            
+            # 处理本地路径配置（原有逻辑）
+            if args.set_path:
+                runner.set_fanse3_path(args.set_path)
+                #return
+            
+            # # ========== 第二步：检查运行模式 ==========
+            ssh_config = runner.config.load_ssh_config()
+            #if ssh_config:
+            if ssh_config and not args.set_path:  # 只有当没有设置本地路径时才使用远程模式
+                runner.remote_mode = True
+                runner.logger.info("🌐 使用远程FANSe3模式")
+                
+                # 建立SSH连接
+                if runner.ssh_manager.connect(ssh_config):
+                    runner.logger.info("✅ SSH连接就绪")
+                else:
+                    runner.logger.warning("⚠️ SSH连接失败，切换到本地模式")
+                    runner.remote_mode = False
+            else:
+                # 检查本地FANSe路径
+                fanse_path = runner.get_fanse3_path()
+                if fanse_path:
+                    runner.logger.info(f"💻 使用本地FANSe3模式: {fanse_path}")
+                else:
+                    runner.logger.error("❌ 未找到可用的FANSe3路径")
+                    sys.exit(1)
+                    # ========== 第三步：必须的运行参数检查 ==========
+            if not args.input or not args.refseq:
+                runner.logger.error("❌ 必须提供 -i/--input 和 -r/--refseq 参数")
+                sys.exit(1)
+                    # ========== 第四步：处理工作目录 ==========
+            if args.work_dir:
+                runner.set_work_dir(args.work_dir)
+
+            # ========== 第五步：解析输入输出路径 ==========
+            # 解析输入数据的路径
+            input_paths = runner.parse_input(args.input)
+            if not input_paths:
+                runner.logger.error("未找到有效的输入文件")
+                sys.exit(1)
+
+            # 检查是否指定了结果输出目录
+            output_paths = None
+            if args.output:
+                # 支持多种分隔符处理：逗号/分号/空格
+                separators = [',', ';', ' ']
+                output_list = args.output
+
+                # 尝试找到最适合的分隔符
+                for sep in separators:
+                    if sep in args.output:
+                        output_list = [d.strip() for d in args.output.split(sep) if d.strip()]
+                        break
+                else:  # 没有分隔符时视为单个路径
+                    output_list = [args.output.strip()]
+
+                output_paths = [Path(d) for d in output_list]
+
+            # 生成路径映射
+            path_map = runner.generate_output_mapping(input_paths, output_paths)
+            
+            # ========== 第六步：准备参数和选项 ==========
+            # 准备参数
+            params = {
+                key: value for key, value in [
+                    ('O', args.O), 
+                    ('L', args.L), 
+                    ('E', args.E), 
+                    ('S', args.S),
+                    ('H', args.H), 
+                    ('C', args.C), 
+                    ('T', args.T),
+                ] if value is not None
+            }
+
+            # 准备选项
+            options = [
+                opt for opt, flag in [
+                    ('--all', args.all), 
+                    ('--unique', args.unique),
+                    ('--showalign', args.showalign), 
+                    ('--test', args.test),
+                    ('--indel', args.indel), 
+                    ('--rename', args.rename)
+                ] if flag
+            ]
+
+            # ========== 第七步：执行比对 ==========
+            runner.logger.info("🚀 开始执行FANSe3比对...")
+            
+            runner.run_batch(
+                file_map=path_map,
+                refseq=Path(args.refseq),
+                params=params,
+                options=options,
+                debug=args.debug,
+                yes=args.yes,
+                resume=args.resume
+            )
+
+        except Exception as e:
+            runner.logger.error(f"运行失败: {str(e)}")
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
+        finally:
+            runner._cleanup()
+        
+
+
     parser.set_defaults(func=run_command)
 
 
@@ -1321,42 +2191,69 @@ def run_command(args):
     if args.log:
         try:
             log_path = Path(args.log)
-            # 如果是目录，添加默认文件名
             if log_path.is_dir():
                 log_path = log_path / 'fanse_run.log'
         except Exception as e:
             print(f"警告: 指定的日志路径无效 - {str(e)}")
 
-    # 创建运行器实例，传入日志路径
+    # 创建运行器实例
     runner = FanseRunner(log_path=log_path, debug=args.debug)
 
     try:
-        # 处理fanse路径配置
+        # ========== 第一步：处理路径配置 ==========
+        
+        # 1. 处理SSH路径配置（需要先创建runner实例）
+        if args.set_ssh_path:
+            runner.set_remote_fanse3_path(
+                args.set_ssh_path,
+                args.ssh_key,
+                args.ssh_password,
+                args.ssh_port
+            )
+            runner.logger.info("✅ SSH路径配置完成")
+            return
+        
+        # 2. 处理本地路径配置（原有逻辑）
         if args.set_path:
             runner.set_fanse3_path(args.set_path)
+            runner.logger.info("✅ 本地路径配置完成")
             return
-        # 设置工作目录
+        
+        # ========== 第二步：处理工作目录 ==========
         if args.work_dir:
             runner.set_work_dir(args.work_dir)
 
         # 如果设置了工作目录，记录日志
         if args.work_dir:
             work_dir = Path(args.work_dir)
-
-            # 确保目录存在
             if not work_dir.exists():
                 runner.logger.info(f"创建工作目录: {work_dir}")
                 work_dir.mkdir(parents=True, exist_ok=True)
             runner.work_dir = work_dir
             runner.logger.info(f"设置工作目录: {runner.work_dir}")
-        runner.logger.info(f"使用设置的工作路径: {runner.work_dir}")
-        # 检查FANSe路径
-        fanse_path = runner.get_fanse3_path()
-        if not fanse_path:
-            runner.logger.error("未配置FANSe路径，请先使用 --set-path 配置")
-            sys.exit(1)
-        runner.logger.info(f"使用FANSe路径: {fanse_path}")
-
+        
+        # ========== 第三步：检查运行模式 ==========
+        
+        # 检查是否配置了SSH（用于后续运行）
+        ssh_config = runner.config.load_ssh_config()
+        if ssh_config:
+            runner.remote_mode = True
+            runner.logger.info("🌐 使用远程FANSe3模式")
+            
+            # 建立SSH连接
+            if not runner.ssh_manager.connect(ssh_config):
+                runner.logger.error("SSH连接失败，回退到本地模式")
+                runner.remote_mode = False
+        else:
+            # 检查本地FANSe路径
+            fanse_path = runner.get_fanse3_path()
+            if not fanse_path:
+                runner.logger.error("未配置FANSe路径，请先使用 --set-path 或 --set-ssh-path 配置")
+                sys.exit(1)
+            runner.logger.info(f"💻 使用本地FANSe3模式: {fanse_path}")
+        
+        # ========== 第四步：检查运行参数 ==========
+        
         # 检查是否提供了够运行的最少运行参数
         if not args.input or not args.refseq:
             runner.logger.error("需至少提供 -i/--input 和 -r/--refseq 参数")
@@ -1378,74 +2275,70 @@ def run_command(args):
             # 尝试找到最适合的分隔符
             for sep in separators:
                 if sep in args.output:
-                    output_list = [d.strip()
-                                   for d in args.output.split(sep) if d.strip()]
+                    output_list = [d.strip() for d in args.output.split(sep) if d.strip()]
                     break
             else:  # 没有分隔符时视为单个路径
                 output_list = [args.output.strip()]
 
             output_paths = [Path(d) for d in output_list]
 
-        # 关键点：生成路径映射必须保留
+        # 生成路径映射
         path_map = runner.generate_output_mapping(input_paths, output_paths)
-
-        # # 添加用户确认提示
-        # if not args.yes and not args.debug:
-        #     print("\n输出路径确认:")
-        #     for i, (input_path, output_path) in enumerate(path_map.items(), 1):
-        #         print(f"{i}. {input_path.name}")
-        #         print(f"   输出到: {output_path}")
-        #         if output_path.exists() and output_path.is_dir():
-        #             print(f"  警告: 输出路径是目录")
-        #         print()
-            
-        #     response = input("确认输出路径是否正确? [y/n]: ").strip().lower()
-        #     if response != 'y':
-        #         runner.logger.info("用户取消执行")
-        #         return
         
         # 准备参数
         params = {
             key: value for key, value in [
-                ('O', args.O),
-                ('L', args.L),
-                ('E', args.E),
-                ('S', args.S),
-                ('H', args.H),
-                ('C', args.C),
-                ('T', args.T),
-                # ('I', args.I),
+                ('O', args.O), ('L', args.L), ('E', args.E), ('S', args.S),
+                ('H', args.H), ('C', args.C), ('T', args.T),
             ] if value is not None
         }
 
         # 准备选项
         options = [
             opt for opt, flag in [
-                ('--all', args.all),
-                ('--unique', args.unique),
-                ('--showalign', args.showalign),
-                ('--test', args.test),
-                ('--indel', args.indel),
+                ('--all', args.all), ('--unique', args.unique),
+                ('--showalign', args.showalign), ('--test', args.test),
+                ('--indel', args.indel), ('--rename', args.rename)
             ] if flag
         ]
 
-        # 运行批处理
-        runner.run_batch(
-            file_map=path_map,
-            refseq=Path(args.refseq),
-            params=params,
-            options=options,
-            debug=args.debug,  # 添加debug参数
-            yes=args.yes,      # 传递-y选项
-            resume=args.resume  # 传递-c选项
-        )
+        # ========== 第五步：选择运行模式并执行 ==========
+        
+        if runner.remote_mode:
+            # 远程模式运行
+            # 这里需要实现远程运行逻辑
+            runner.logger.info("🚀 开始远程FANSe3运行...")
+            # 暂时回退到本地模式
+            runner.run_batch(
+                file_map=path_map,
+                refseq=Path(args.refseq),
+                params=params,
+                options=options,
+                debug=args.debug,
+                yes=args.yes,
+                resume=args.resume
+            )
+        else:
+            # 本地模式运行
+            runner.run_batch(
+                file_map=path_map,
+                refseq=Path(args.refseq),
+                params=params,
+                options=options,
+                debug=args.debug,
+                yes=args.yes,
+                resume=args.resume
+            )
 
     except Exception as e:
-        runner.logger.error(f"运行失败，命令行末尾加上--debug试一下: {str(e)}")
+        runner.logger.error(f"运行失败: {str(e)}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
     finally:
-        # 结束后确保清理临时文件
         runner._cleanup()
+
 
 
 # 如果独立运行，则测试

@@ -255,6 +255,15 @@ class OptimizedClusterManager:
             except Exception as e:
                 print(f"❌ ({e})")
                 return False
+        # 在路径验证失败时尝试自动拷贝
+        if not path_exists:
+            print(f"  📦📦 目标路径不存在，尝试自动部署FANSe3...")
+            if self._deploy_fanse_to_remote(node, ssh):
+                print("  ✅ FANSe3部署成功")
+                path_exists = True
+            else:
+                print("  ❌❌ 自动部署失败")
+                return False
         
         # 保存节点配置
         self.nodes[name] = node
@@ -266,6 +275,56 @@ class OptimizedClusterManager:
         print(f"   路径: {fanse_path}")
         print("=" * 60)
         return True
+    
+    def _deploy_fanse_to_remote(self, node: ClusterNode, ssh: paramiko.SSHClient) -> bool:
+        """自动部署FANSe3到远程节点"""
+        try:
+            # 1. 查找本地FANSe3可执行文件
+            local_fanse = self._find_local_fanse_executable()
+            if not local_fanse:
+                print("  ❌❌ 未找到本地FANSe3可执行文件")
+                return False
+                
+            # 2. 通过SFTP上传文件
+            sftp = ssh.open_sftp()
+            remote_dir = os.path.dirname(node.fanse_path)
+            
+            # 3. 确保远程目录存在
+            self._ensure_remote_directory(sftp, remote_dir)
+            
+            # 4. 上传文件
+            sftp.put(str(local_fanse), node.fanse_path)
+            
+            # 5. 设置执行权限（Linux系统）
+            if not self._is_windows_system(ssh):
+                ssh.exec_command(f'chmod +x "{node.fanse_path}"')
+                
+            sftp.close()
+            return True
+            
+        except Exception as e:
+            print(f"  ❌❌ 部署失败: {e}")
+            return False
+
+    def _find_local_fanse_executable(self) -> Optional[Path]:
+        """查找本地FANSe3可执行文件"""
+        # 搜索常见位置
+        search_paths = [
+            Path.cwd(),
+            Path.home() / 'fanse',
+            Path.home() / 'FANSe3',
+            Path('/opt/fanse'),
+            Path('/usr/local/fanse')
+        ]
+        
+        for path in search_paths:
+            if path.exists():
+                for executable in ['FANSe3g.exe', 'FANSe3.exe', 'FANSe3g', 'FANSe3']:
+                    exe_path = path / executable
+                    if exe_path.exists():
+                        return exe_path
+        return None
+    
     
     def remove_node(self, name: str):
         """移除节点"""
@@ -296,6 +355,54 @@ class OptimizedClusterManager:
                     print(f"节点 {node_name} 检查异常: {e}")
             
             return results
+
+    # 在OptimizedClusterManager中添加以下方法
+    def execute_with_monitoring(self, node_name: str, command: str) -> bool:
+        """带实时监控的远程命令执行"""
+        return self.monitor_node_execution(node_name, command)
+
+    def deploy_to_node(self, node_name: str) -> bool:
+        """部署FANSe3到指定节点"""
+        node = self.nodes.get(node_name)
+        ssh = self._create_ssh_connection(node)
+        return self._deploy_fanse_to_remote(node, ssh)
+    def monitor_node_execution(self, node_name: str, command: str):
+        """实时监控远程节点执行"""
+        node = self.nodes.get(node_name)
+        if not node:
+            raise ValueError(f"节点不存在: {node_name}")
+        
+        ssh = self._create_ssh_connection(node)
+        if not ssh:
+            return False
+        
+        try:
+            # 创建交互式会话
+            transport = ssh.get_transport()
+            channel = transport.open_session()
+            
+            # 设置伪终端以获得实时输出
+            channel.get_pty()
+            channel.exec_command(command)
+            
+            # 实时读取输出
+            while True:
+                if channel.recv_ready():
+                    data = channel.recv(1024).decode('utf-8')
+                    print(data, end='', flush=True)
+                if channel.recv_stderr_ready():
+                    data = channel.recv_stderr(1024).decode('utf-8')
+                    print(f"[STDERR] {data}", end='', flush=True)
+                if channel.exit_status_ready():
+                    break
+                time.sleep(0.1)
+                    
+            exit_status = channel.recv_exit_status()
+            return exit_status == 0
+            
+        finally:
+            ssh.close()
+
 
 # 优化后的cluster_command函数
 def cluster_command(args):
@@ -493,6 +600,18 @@ FANSe3 集群管理工具
     test_parser.add_argument('name', help='要测试的节点名称')
 
     return cluster_parser
+    
+    # 在add_cluster_subparser中添加新命令
+    deploy_parser = cluster_subparsers.add_parser('deploy', 
+        help='部署FANSe3到节点')
+    deploy_parser.add_argument('name', help='节点名称')
+
+    monitor_parser = cluster_subparsers.add_parser('monitor', 
+        help='实时监控节点')
+    monitor_parser.add_argument('name', help='节点名称')
+    monitor_parser.add_argument('--command', help='要执行的命令')
+    
+    
 def get_config_dir() -> Path:
     """获取配置目录"""
     if os.name == 'nt':  # Windows
