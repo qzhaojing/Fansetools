@@ -39,7 +39,7 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
         # 构建samtools命令
         samtools_cmd = [bin_manager.get_samtools_path(), 'view', '-bS', '-']
         if sort:
-            samtools_sort_cmd = [bin_manager.get_samtools_path(), 'sort', '-o', str(output_bam)]
+            samtools_sort_cmd = [bin_manager.get_samtools_path(), 'sort', '-@ 4', '-o', str(output_bam)]
             samtools_index_cmd = [bin_manager.get_samtools_path(), 'index', str(output_bam)] if index else None
         else:
             samtools_cmd.extend(['-o', str(output_bam)])
@@ -90,37 +90,8 @@ def bam_command(args):
         keep_sam=getattr(args, 'sam', False)
     )
 
-#def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True):
-#    """Windows专用版本（处理管道限制）"""
-#    if output_bam is None:
-#        output_bam = Path(fanse_file).with_suffix('.bam')
-#    
-#    temp_sam = Path(output_bam).with_suffix('.temp.sam')
-#    
-#    try:
-#        
-#        # 生成临时SAM文件
-#        subprocess.run(['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path), '-o', str(temp_sam)], check=True)
-#        
-#        # 转换为BAM
-#        if sort:
-#            subprocess.run([bin_manager.get_samtools_path(), 'view', '-bS', str(temp_sam)], 
-#                          stdout=subprocess.PIPE, check=True)
-#            subprocess.run([bin_manager.get_samtools_path(), 'sort', '-o', str(output_bam)], 
-#                          stdin=subprocess.PIPE, check=True)
-#            if index:
-#                subprocess.run([bin_manager.get_samtools_path(), 'index', str(output_bam)], check=True)
-#        else:
-#            subprocess.run([bin_manager.get_samtools_path(), 'view', '-bS', str(temp_sam), '-o', str(output_bam)], check=True)
-#            if index:
-#                subprocess.run([bin_manager.get_samtools_path(), 'index', str(output_bam)], check=True)
-#                
-#        return output_bam
-#        
-#    finally:
-#        if temp_sam.exists():
-#            temp_sam.unlink()
 def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True):
+    #直接原位生成BAM文件，并进行排序索引
     if output_bam is None:
         output_bam = Path(fanse_file).with_suffix('.bam')
     try:
@@ -131,41 +102,78 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         # 检测samtools版本是否为旧版(0.x)，旧版不支持 '-o'
         legacy = False
         try:
-            ver = subprocess.run([samtools_path, '--version'], capture_output=True, text=True)
-            legacy = ('samtools 0.' in (ver.stdout + ver.stderr))
-        except Exception:
-            legacy = True  # 无法检测时按旧版处理，提升兼容性
+            ver_cmd = [samtools_path, '']
+            ver_result = subprocess.run(ver_cmd, capture_output=True, text=True, check=True)
+            legacy = ('samtools 0.' in ver_result.stdout) or ('samtools 0.' in ver_result.stderr)
+            print(f"Samtools version check: legacy={legacy}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Samtools version detection failed ({e}). Assuming legacy for compatibility.")
+            legacy = True  # If --version fails or samtools not found, assume legacy or problematic
+        except Exception as e:
+            print(f"Unexpected error during samtools version detection ({e}). Assuming legacy for compatibility.")
+            legacy = True # Fallback for other unexpected errors
 
         samtools_view = [samtools_path, 'view', '-bS', '-']
         if sort and not legacy:
-            samtools_sort = [samtools_path, 'sort', '-o', str(output_bam)]
+            samtools_sort = [samtools_path, 'sort', '-o', str(output_bam), '-']
         print(f"Converting {fanse_file} to BAM via pipe...")
         p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
         if sort and not legacy:
-            # fanse sam | samtools view -bS - | samtools sort -o output.bam
+            # fanse sam | fanse samtools view -bS - | fanse samtools sort -o output.bam
             p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE)
             p3 = subprocess.Popen(samtools_sort, stdin=p2.stdout)
-            p1.stdout.close(); p2.stdout.close()
+            p1.stdout.close()
+            p2.stdout.close()
             rc = p3.wait()
             if rc != 0:
                 raise RuntimeError('samtools sort failed')
-        elif sort and legacy:
-            # 旧版：写入临时BAM再排序（避免SAM中间文件）
+
+        elif sort and legacy and  False:     
+            # 旧版：写入临时BAM再排序（避免SAM中间文件），保证兼容性
+            print("Using legacy samtools with temporary file for sorting...")
             temp_bam = Path(output_bam).with_suffix('.temp.bam')
-            samtools_view_to_file = [samtools_path, 'view', '-bS', '-', '-o', str(temp_bam)]
+            samtools_view_to_file = [samtools_path, 'view', '-bS', '-o', str(temp_bam), '-']
+            
             p2 = subprocess.Popen(samtools_view_to_file, stdin=p1.stdout)
             p1.stdout.close()
             rc = p2.wait()
             if rc != 0:
                 raise RuntimeError('samtools view failed')
+
             output_prefix = str(output_bam).replace('.bam', '')
-            rc2 = subprocess.call([samtools_path, 'sort', str(temp_bam), output_prefix])
-            if rc2 != 0:
+            rc2 = subprocess.run([samtools_path, 'sort', str(temp_bam), output_prefix], capture_output=True, text=True)
+            if rc2.returncode != 0:
+                print(f"Samtools sort (legacy) failed with error: {rc2.stderr}")
                 raise RuntimeError('samtools sort (legacy) failed')
+
             try:
                 temp_bam.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Warning: Could not delete temporary file {temp_bam}: {e}")
+        elif sort and legacy:  #基本都是走这条通道，其他的不走，因为装的就是旧版samtools，没有其他的版本，但是目前还算是够用吧
+            # 通过管道连接排序，避免临时文件,直接输出排序后的bam文件，更直接，然后生成索引
+            print("Using legacy samtools pipe for sorting (attempting direct output)...")
+            output_prefix = str(output_bam).replace('.bam', '')
+            # 旧版 samtools sort 的语法是 `sort <in.bam> <out.prefix>`
+            # 从 stdin 读取时，使用 `sort - <out.prefix>`
+            samtools_sort_legacy = [samtools_path, 'sort', '-', output_prefix]
+            
+            p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p3 = subprocess.Popen(samtools_sort_legacy, stdin=p2.stdout, stderr=subprocess.PIPE)
+            p1.stdout.close()
+            p2.stdout.close()
+            
+            # 捕获并打印错误，以便更好地诊断
+            stdout_p3, stderr_p3 = p3.communicate()
+            if stdout_p3:
+                print(f"Samtools sort (legacy) stdout: {stdout_p3.decode()}")
+            if stderr_p3:
+                print(f"Samtools sort (legacy) stderr: {stderr_p3.decode()}")
+
+            if p3.returncode != 0:
+                raise RuntimeError('samtools sort (legacy) failed')
+      
         else:
             # 不排序：直接写入输出BAM
             samtools_view_nosort = [samtools_path, 'view', '-bS', '-', '-o', str(output_bam)]
@@ -174,6 +182,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
             rc = p2.wait()
             if rc != 0:
                 raise RuntimeError('samtools view failed')
+
         if index:
             subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
         print(f"Successfully created BAM file: {output_bam}")
@@ -250,6 +259,7 @@ def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, ke
         try:
             return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index)
         except Exception:
+            #如果Windows版本失败，尝试使用传统方法
             return fanse2bam_win(fanse_file, fasta_path, output_bam, sort, index, keep_sam)
     else:  # Linux/Mac
         return fanse2bam_unix(fanse_file, fasta_path, output_bam, sort, index)

@@ -34,6 +34,8 @@ def detect_file_type(filename):
         return 'gtf'
     elif filename_lower.endswith(('.gff3', '.gff')):
         return 'gff3'
+    elif filename_lower.endswith('.refflat'): # Add this line
+        return 'refflat'
     
     # Check content
     try:
@@ -202,6 +204,49 @@ def convert_to_rna_coordinates(genomic_df):
     rna_df['chrom'] = rna_df['txname']  # Transcript name 当作染色体号，
     
     return rna_df
+
+def load_refflat_to_dataframe(input_file):
+    """
+    Load refFlat file and convert to DataFrame.
+    Assumes the refFlat file has a specific column order.
+    """
+    print(f"Processing REFFLAT file: {input_file}")
+
+    # Define the expected columns for the extended refflat format
+    # This list should match the output_columns in save_refflat_dataframe
+    refflat_columns = [
+        'geneName', 'txname', 'chrom', 'strand', 'txStart', 'txEnd',
+        'cdsStart', 'cdsEnd', 'exonCount', 'exonStarts', 'exonEnds',
+        'genename', 'g_biotype', 't_biotype', 'protein_id',
+        'txLength', 'cdsLength', 'utr5Length', 'utr3Length',
+        'genelonesttxlength', 'genelongestcdslength', 'geneEffectiveLength',
+        'description'
+    ]
+
+    # Read the refflat file into a DataFrame
+    # Skip lines starting with '#' (comments/headers)
+    df = pd.read_csv(input_file, sep='\t', comment='#', header=None, names=refflat_columns)
+
+    # Convert relevant columns to appropriate types
+    df['txStart'] = df['txStart'].astype(int)
+    df['txEnd'] = df['txEnd'].astype(int)
+    df['cdsStart'] = df['cdsStart'].astype(int)
+    df['cdsEnd'] = df['cdsEnd'].astype(int)
+    df['exonCount'] = df['exonCount'].astype(int)
+    df['txLength'] = df['txLength'].astype(int)
+    df['cdsLength'] = df['cdsLength'].astype(int)
+    df['utr5Length'] = df['utr5Length'].astype(int)
+    df['utr3Length'] = df['utr3Length'].astype(int)
+    df['genelonesttxlength'] = df['genelonesttxlength'].astype(int)
+    df['genelongestcdslength'] = df['genelongestcdslength'].astype(int)
+    df['geneEffectiveLength'] = df['geneEffectiveLength'].astype(int)
+
+    # Reconstruct exonStarts_list and exonEnds_list from string columns
+    # These are needed for convert_to_rna_coordinates and track generation
+    df['exonStarts_list'] = df['exonStarts'].apply(lambda x: [int(i) for i in x.strip(',').split(',')] if x else [])
+    df['exonEnds_list'] = df['exonEnds'].apply(lambda x: [int(i) for i in x.strip(',').split(',')] if x else [])
+
+    return df
 
 def load_annotation_to_dataframe(input_file, file_type='auto'):
     """
@@ -478,8 +523,23 @@ def convert_gxf_to_refflat(input_file, output_prefix, file_type='auto', add_head
     Returns:
         Tuple of (genomic_df, rna_df) DataFrames
     """
-    # Load genomic coordinates
-    genomic_df = load_annotation_to_dataframe(input_file, file_type)
+    if file_type == 'auto':
+        detected_file_type = detect_file_type(input_file)
+    else:
+        detected_file_type = file_type
+
+    genomic_df = pd.DataFrame() # Initialize an empty DataFrame
+
+    if detected_file_type == 'refflat':
+        # If input is already refflat, load it directly
+        genomic_df = load_refflat_to_dataframe(input_file)
+        print(f"Input file is already in refflat format. Skipping GXF parsing.")
+    elif detected_file_type in ['gtf', 'gff3']:
+        # Load genomic coordinates from GXF
+        genomic_df = load_annotation_to_dataframe(input_file, detected_file_type)
+    else:
+        print(f"Error: Unsupported file type '{detected_file_type}' for input file '{input_file}'")
+        return None, None
     
     if genomic_df.empty:
         print("Error: No data to process")
