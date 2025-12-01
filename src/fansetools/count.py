@@ -14,24 +14,25 @@ fansetools count 组件 - 用于处理fanse3文件的read计数
 """
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import glob
 import multiprocessing as mp
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.columns import Columns
+from rich.live import Live
 import os
+import math
 from pathlib import Path
 import sys
 import time
+import warnings
 
 import pandas as pd
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
-import warnings
-try:
-    from cryptography.utils import CryptographyDeprecationWarning
-    warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
-except Exception:
-    pass
 
 from fansetools.gxf2refflat_plus import (
     convert_gxf_to_refflat,
@@ -39,9 +40,13 @@ from fansetools.gxf2refflat_plus import (
 )
 from fansetools.parser import FANSeRecord, fanse_parser, fanse_parser_high_performance
 from fansetools.utils.path_utils import PathProcessor
+try:
+    from cryptography.utils import CryptographyDeprecationWarning
+    warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+except Exception:
+    pass
 
 # %% ParallelFanseCounter
-
 
 class ParallelFanseCounter:
     """并行处理多个fanse3文件的计数器"""
@@ -52,15 +57,13 @@ class ParallelFanseCounter:
         if self.verbose:
             print(f"初始化并行处理器: {self.max_workers} 个进程")
 
-    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, verbose=False):
-        """并行处理多个文件 - 修复版本"""
+    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode=None, verbose=False):
+        """并行处理多个文件（仅显示正在运行的任务）"""
         if verbose:
             print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
 
-        # 准备任务参数
         tasks = []
         for input_file in file_list:
-            # 为每个文件创建独立的输出目录
             file_stem = input_file.stem
             output_dir = Path(output_base_dir) / file_stem
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,36 +74,71 @@ class ParallelFanseCounter:
                 'gxf_file': gxf_file,
                 'level': level,
                 'paired_end': paired_end,
+                'length_mode': length_mode,
                 'file_stem': file_stem,
                 'verbose': verbose
             }
             tasks.append(task)
 
-        # 使用进程池并行处理
+        pending = deque(tasks)
         results = []
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交所有任务
-            future_to_task = {}
-            for task in tasks:
-                future = executor.submit(
-                    self._process_single_file, task, annotation_df)
-                future_to_task[future] = task
+        slots = min(self.max_workers, len(tasks))
 
-            # 使用tqdm显示总体进度
-            with tqdm(total=len(tasks), desc="总体进度", position=0, disable=not verbose) as pbar:
-                for future in as_completed(future_to_task):
-                    task = future_to_task[future]
-                    try:
-                        result = future.result()
-                        results.append((task['input_file'], True, result))
-                        if verbose:
-                            pbar.set_description(f" 完成: {task['file_stem']}")
-                    except Exception as e:
-                        results.append((task['input_file'], False, str(e)))
-                        if verbose:
-                            pbar.set_description(f" 失败: {task['file_stem']}")
-                    finally:
-                        pbar.update(1)
+        bars_per_row = 5
+        overall = Progress(TextColumn("[bold]总体进度"), BarColumn(), TimeElapsedColumn())
+        overall_task = overall.add_task("总体进度", total=len(tasks))
+
+        prog_list = []
+        task_id_list = []
+        for s in range(slots):
+            p = Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TimeElapsedColumn())
+            tid = p.add_task("等待", total=None)
+            prog_list.append(p)
+            task_id_list.append(tid)
+
+        rows = []
+        num_rows = max(1, math.ceil(slots / bars_per_row))
+        for r in range(num_rows):
+            start = r * bars_per_row
+            end = min(start + bars_per_row, slots)
+            if start < end:
+                rows.append(Columns(prog_list[start:end], equal=True))
+
+        render_group = Group(overall, *rows)
+
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_slot = {}
+            current_task_by_slot = {}
+
+            def submit_next(slot_idx):
+                if pending:
+                    t = pending.popleft()
+                    current_task_by_slot[slot_idx] = t
+                    f = executor.submit(self._process_single_file, t, annotation_df)
+                    future_to_slot[f] = slot_idx
+                    prog_list[slot_idx].update(task_id_list[slot_idx], description=f"[cyan]{t['file_stem']}", total=None, completed=0)
+                    return True
+                return False
+
+            with Live(render_group, refresh_per_second=10):
+                for s in range(slots):
+                    submit_next(s)
+
+                while future_to_slot:
+                    for future in as_completed(list(future_to_slot.keys())):
+                        slot_idx = future_to_slot.pop(future)
+                        t = current_task_by_slot.get(slot_idx)
+                        try:
+                            result = future.result()
+                            results.append((t['input_file'], True, result))
+                            prog_list[slot_idx].update(task_id_list[slot_idx], total=1, completed=1, description=f"[green]完成: {t['file_stem']}")
+                        except Exception as e:
+                            results.append((t['input_file'], False, str(e)))
+                            prog_list[slot_idx].update(task_id_list[slot_idx], total=1, completed=1, description=f"[red]失败: {t['file_stem']}")
+                        finally:
+                            overall.update(overall_task, advance=1)
+
+                        submit_next(slot_idx)
 
         return results
 
@@ -119,7 +157,10 @@ class ParallelFanseCounter:
                 level=task['level'],
                 paired_end=task['paired_end'],
                 annotation_df=annotation_df,
-                verbose=task.get('verbose', False)
+                verbose=task.get('verbose', False),
+                export_format=task.get('format', 'rsem'),
+                export_count_type=task.get('count_type','Final_EM'),
+                length_mode=task.get('length_mode', 'geneEffectiveLength')
             )
 
             # 运行计数处理
@@ -139,7 +180,7 @@ def count_main_parallel(args):
     try:
         # 1. 解析输入文件
         input_files = processor.parse_input_paths(
-            args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz'])
+            args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz', '.fanse3.zip'])
         if not input_files:
             print("错误: 未找到有效的输入文件")
             return
@@ -179,14 +220,17 @@ def count_main_parallel(args):
             output_files_to_check = []
             if args.level in ['isoform', 'both']:
                 output_files_to_check.append(
-                    individual_output_dir / f"{file_stem}.counts_isoform_level_unique.csv")
+                    individual_output_dir / f"{file_stem}.isoform_level_unique.csv")
+                output_files_to_check.append(
+                    individual_output_dir / f"{file_stem}.isoform_level_multi.csv")
+
             if args.level in ['gene', 'both'] and args.gxf:
                 output_files_to_check.append(
-                    individual_output_dir / f"{file_stem}.counts_gene_level_unique.csv")
+                    individual_output_dir / f"{file_stem}.gene_level_unique.csv")
                 output_files_to_check.append(
-                    individual_output_dir / f"{file_stem}.counts_gene_level_multi.csv")
+                    individual_output_dir / f"{file_stem}.gene_level_multi.csv")
 
-            # 检查文件是否存在
+            # 检查文件是否存在，都存在才算运行完。有一个不再都算没运行完，然后重新跑一次
             all_files_exist = all(f.exists() for f in output_files_to_check)
 
             if args.resume and all_files_exist:
@@ -216,9 +260,9 @@ def count_main_parallel(args):
 
         parallel_counter = ParallelFanseCounter(max_workers=max_workers, verbose=getattr(args, 'verbose', False))
 
-        if getattr(args, 'verbose', False):
-            print("开始并行处理...")
-            print("=" * 60)
+        # if getattr(args, 'verbose', False):
+        print("启动多任务并行处理 ==>> 共 {} 个文件".format(len(files_to_process)))
+        print("=" * 60)
 
         start_time = time.time()
         results = parallel_counter.process_files_parallel(
@@ -228,6 +272,7 @@ def count_main_parallel(args):
             level=args.level,
             paired_end=args.paired_end,
             annotation_df=annotation_df,
+            length_mode=getattr(args, 'len', 'geneEffectiveLength'),
             verbose=getattr(args, 'verbose', False)
         )
 
@@ -262,7 +307,7 @@ def count_main_parallel(args):
         traceback.print_exc()
 
 
-def count_main_serial(args):
+def count_main_serial(args, progress=None, task_id=None):
     """串行处理版本（原有的count_main函数）"""
     if getattr(args, 'verbose', False):
         print("使用单任务处理模式...")
@@ -271,7 +316,7 @@ def count_main_serial(args):
     try:
         # 原有的串行处理逻辑...
         input_files = processor.parse_input_paths(
-            args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz'])
+            args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz', '.fanse3.zip'])
         if not input_files:
             print("错误: 未找到有效的输入文件")
             return
@@ -344,15 +389,22 @@ def count_main_serial(args):
                     output_filename=output_file.name,
                     gxf_file=args.gxf,
                     level=args.level if annotation_df is not None else 'isoform',
-                    paired_end=args.paired_end,
+                    # paired_end=args.paired_end,
                     annotation_df=annotation_df,
                     verbose=getattr(args, 'verbose', False),
+                    export_format=getattr(args, 'format', 'rsem'),
+                    export_count_type=getattr(args, 'count_type', 'Final_EM'),
+                    progress=progress,  # Pass progress object
+                    task_id=task_id,     # Pass task_id
+                    length_mode=getattr(args, 'len', 'geneEffectiveLength')
                 )
                 count_files = counter.run()
                 if getattr(args, 'verbose', False):
                     print(" 完成")
             except Exception as e:
                 print(f" 处理失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
 
         if getattr(args, 'verbose', False):
             print(f"\n处理完成: 总共 {len(input_files)} 个文件")
@@ -361,12 +413,16 @@ def count_main_serial(args):
         print(f"错误: {str(e)}")
 
 
-def count_main(args):
+def count_main(args, progress=None, task_id=None):
     """主入口函数，根据参数选择并行或串行"""
+    if not getattr(args, 'input', None) and getattr(args, 'read1', None):
+        args.input = args.read1
+    if getattr(args, 'read2', None) and not getattr(args, 'paired_end', None):
+        args.paired_end = args.read2
     if hasattr(args, 'processes') and args.processes != 1:
         return count_main_parallel(args)
     else:
-        return count_main_serial(args)
+        return count_main_serial(args, progress, task_id)
 
 
 class FanseCounter:
@@ -379,7 +435,12 @@ class FanseCounter:
                  paired_end=None,
                  output_filename=None,
                  annotation_df=None,
-                 verbose=False):
+                 verbose=False,
+                 export_format='rsem',
+                 export_count_type='Final_EM',
+                 progress=None,  # New: rich progress object
+                 task_id=None,   # New: rich task ID
+                 length_mode='geneEffectiveLength'):  # 新增：长度指标选择
 
         # 添加计数类型前缀
         self.isoform_prefix = 'isoform_'
@@ -396,6 +457,11 @@ class FanseCounter:
         self.output_filename = output_filename  # 新增：支持自定义输出文件名
         self.annotation_df = annotation_df  # 新增：注释数据框
         self.verbose = verbose
+        self.export_format = export_format
+        self.export_count_type = export_count_type
+        self.progress = progress  # Store progress object
+        self.task_id = task_id    # Store task ID
+        self.length_mode = length_mode  # 选择用于TPM/EM分配的长度指标
 
         # # 存储计数结果
         # self.counts_data = {}
@@ -405,28 +471,41 @@ class FanseCounter:
         self.counts_data = {
             # isoform水平计数
             f'{self.isoform_prefix}raw': Counter(),
-            f'{self.isoform_prefix}unique': Counter(),
-            f'{self.isoform_prefix}multi': Counter(),
+            f'{self.isoform_prefix}unique_to_isoform': Counter(),
+            # f'{self.isoform_prefix}unique': Counter(),
+            f'{self.isoform_prefix}multi_to_isoform': Counter(),
             f'{self.isoform_prefix}firstID': Counter(),
+
             f'{self.isoform_prefix}multi2all': Counter(),
             f'{self.isoform_prefix}multi_equal': Counter(),
             f'{self.isoform_prefix}multi_EM': Counter(),
+
             f'{self.isoform_prefix}Final_EM': Counter(),
             f'{self.isoform_prefix}Final_EQ': Counter(),
+            f'{self.isoform_prefix}Final_MA': Counter(),
             f'{self.isoform_prefix}multi_EQ_ratio': Counter(),
             f'{self.isoform_prefix}multi_EM_ratio': Counter(),
+
             # gene水平计数
             f'{self.gene_prefix}raw': Counter(),
-            f'{self.gene_prefix}unique': Counter(),
+            f'{self.gene_prefix}multi_to_isoform': Counter(),
+            # f'{self.gene_prefix}multi': Counter(),
+            f'{self.gene_prefix}unique_to_isoform': Counter(),
+            f'{self.gene_prefix}unique_to_gene': Counter(),
             f'{self.gene_prefix}firstID': Counter(),
+
             f'{self.gene_prefix}multi2all': Counter(),
             f'{self.gene_prefix}multi_equal': Counter(),
             f'{self.gene_prefix}multi_EM': Counter(),
+
             f'{self.gene_prefix}Final_EM': Counter(),
             f'{self.gene_prefix}Final_EQ': Counter(),
+            f'{self.gene_prefix}Final_MA': Counter(),
             f'{self.gene_prefix}multi_EQ_ratio': Counter(),
             f'{self.gene_prefix}multi_EM_ratio': Counter(),
         }
+        # 兼容旧键名：确保 isoform_multi 指向 isoform_multi_to_isoform
+        # self.counts_data[f'{self.isoform_prefix}multi'] = self.counts_data[f'{self.isoform_prefix}multi_to_isoform']
         self.summary_stats = {}
         self.multi_mapping_info = defaultdict(list)
 
@@ -455,12 +534,13 @@ class FanseCounter:
             print(f'Parsing {self.input_file.name}')
         start_time = time.time()
 
-        # 预初始化数据结构
+        # 预初始化数据结构，针对isoform。默认所有reads都比对到isoform,后续再根据这个，multi_to_isoform判断是否属于gene
         counts_data = {
             f'{self.isoform_prefix}raw': Counter(),
-            f'{self.isoform_prefix}multi': Counter(),
-            f'{self.isoform_prefix}unique': Counter(),
+            f'{self.isoform_prefix}unique_to_isoform': Counter(),
+            f'{self.isoform_prefix}multi_to_isoform': Counter(),
             f'{self.isoform_prefix}firstID': Counter(),
+
             f'{self.isoform_prefix}multi2all': Counter(),
             f'{self.isoform_prefix}multi_equal': Counter(),
             f'{self.isoform_prefix}multi_EM': Counter(),
@@ -469,20 +549,47 @@ class FanseCounter:
             f'{self.isoform_prefix}Final_EQ': Counter(),
         }
 
+        # 兼容旧键名，确保 isoform_multi 可用
+        # counts_data[f'{self.isoform_prefix}multi'] = counts_data[f'{self.isoform_prefix}multi_to_isoform']
+
         total_count = 0
-        batch_size = 600000
+        batch_size = 800000
         # update_interval = 10000
 
-        # 使用局部变量加速
-        raw, multi, unique, firstID, multi2all = (
-            counts_data[f'{self.isoform_prefix}raw'],
-            counts_data[f'{self.isoform_prefix}multi'],
-            counts_data[f'{self.isoform_prefix}unique'],
-            counts_data[f'{self.isoform_prefix}firstID'],
-            counts_data[f'{self.isoform_prefix}multi2all']
-        )
+        # 3. 本地变量缓存，消除属性查找
+        raw      = counts_data[f'{self.isoform_prefix}raw']
+        multi    = counts_data[f'{self.isoform_prefix}multi_to_isoform']
+        unique   = counts_data[f'{self.isoform_prefix}unique_to_isoform']
+        firstID  = counts_data[f'{self.isoform_prefix}firstID']
+        multi2all= counts_data[f'{self.isoform_prefix}multi2all']
 
-        for position, fanse_file in enumerate([self.input_file] + ([Path(self.paired_end)] if self.paired_end else [])):
+        FANSE_EXTS = {'.fanse3','.fanse','.fanse3.zip', '.fanse3.gz'}
+        candidate_files = [self.input_file]
+        
+        #判断是否是双端fanse文件，如果是，判断是否有对应的双端文件，如果有，加入到candidate_files中
+        if self.paired_end:
+            pe_path = Path(self.paired_end)
+            if pe_path.suffix in FANSE_EXTS:
+                candidate_files.append(pe_path)
+        # 遍历所有候选文件
+        for position, fanse_file in enumerate(candidate_files):
+            if self.progress and self.task_id:
+                self.progress.update(self.task_id, description=f"[cyan]Parsing {fanse_file.name}...")
+            
+            # 获取文件大小用于统计进度条总数
+            file_size = fanse_file.stat().st_size
+            processed_bytes = 0
+            
+            # 如果是第一个文件，或者不是断点续传，则重置进度条
+            if self.progress and self.task_id:
+                self.progress.update(self.task_id, total=file_size)
+                self.progress.update(self.task_id, completed=0)
+
+            if self.progress and self.task_id:
+                self.progress.update(self.task_id, description=f"Parsing {fanse_file.name}")
+            # 如果有进度条，则更新任务描述
+            if self.progress and self.task_id is not None:
+                self.progress.update(self.task_id, description=f"[cyan]Processing {fanse_file.name}[/cyan]")
             if not fanse_file.exists():
                 continue
 
@@ -493,46 +600,50 @@ class FanseCounter:
                 # file_size = fanse_file.stat().st_size
                 # estimated_records = max(1, file_size // 527)
                 # 智能估算记录数
-                sample_size = 100000  # 采样数目，用来估算总reads数
+                sample_size = 100000  # 从fanse文件开头提取的fanse记录数目，用来估算总reads数
                 estimated_records = self.calculate_file_record_estimate(
                     fanse_file, sample_size)
+                if self.progress and self.task_id:
+                    self.progress.update(self.task_id, total=estimated_records, completed=0)
 
-                with tqdm(total=estimated_records, unit='reads', mininterval=5, unit_scale=True, position=position, leave=False) as pbar:
-                    # 进度条更新频率控制
-                    update_interval = 1000
-                    update_counter = 0
+                use_tqdm = not (self.progress and self.task_id)
+                pbar = None
+                if use_tqdm:
+                    pbar = tqdm(total=estimated_records, unit='reads', mininterval=5, unit_scale=True, position=position, leave=False)
 
-                    for i, record in enumerate(fanse_parser_selected(str(fanse_file))):
-                        if record.ref_names:
-                            total_count += 1
+                update_interval = 10000
+                update_counter = 0
 
-                            # 批量处理
-                            batch.append(record)
-                            if len(batch) >= batch_size:
-                                self._fast_batch_process(
-                                    batch, raw, multi, unique, firstID, multi2all)
-                                batch = []
+                for i, record in enumerate(fanse_parser_selected(str(fanse_file))):
+                    if record.ref_names:
+                        total_count += 1
 
-                            # 智能更新
-                            update_counter += 1
-                            if update_counter >= update_interval:
+                        batch.append(record)
+                        if len(batch) >= batch_size:
+                            self._fast_batch_process(batch, raw, multi, unique, firstID, multi2all)
+                            batch = []
+
+                        update_counter += 1
+                        if update_counter >= update_interval:
+                            if pbar:
                                 pbar.update(update_counter)
-                                update_counter = 0
-                            # 减少进度更新频率
-                            # if i - last_update >= update_interval:
-                            #     print(f"Processed {i} records...", end='\r')
-                            #     last_update = i
-                        else:
-                            update_counter += 1
+                            if self.progress and self.task_id:
+                                self.progress.update(self.task_id, advance=update_counter)
+                            update_counter = 0
+                    else:
+                        update_counter += 1
 
-                    # 更新剩余的进度
-                    if update_counter > 0:
+                if update_counter > 0:
+                    if pbar:
                         pbar.update(update_counter)
-                        # pbar.update(1)
-                    # 处理剩余批次
-                    if batch:
-                        self._fast_batch_process(
-                            batch, raw, multi, unique, firstID, multi2all)
+                    if self.progress and self.task_id:
+                        self.progress.update(self.task_id, advance=update_counter)
+
+                if pbar:
+                    pbar.close()
+
+                if batch:
+                    self._fast_batch_process(batch, raw, multi, unique, firstID, multi2all)
 
             except Exception as e:
                 print(f"Error: {e}")
@@ -542,29 +653,46 @@ class FanseCounter:
         if self.verbose:
             print(
                 f" Completed: {total_count} records in {duration:.2f}s ({total_count/duration:.0f} rec/sec)")
-        
+
         return counts_data, total_count
 
     def _fast_batch_process(self, batch, raw, multi, unique, firstID, multi2all):
-        """快速批量处理"""
+        """
+        批量处理FANSe记录，按比对状态更新各类计数器。
+        
+        参数
+        ----
+        batch : list[FANSeRecord]
+            待处理的一批记录。
+        raw : collections.Counter
+            原始计数器：记录所有reads（无论唯一/多重比对）的首次比对ID或拼接ID。
+        multi : collections.Counter
+            多重比对计数器：仅记录多重比对reads的拼接ID。
+        unique : collections.Counter
+            唯一比对计数器：仅记录唯一比对reads的ID。
+        firstID : collections.Counter
+            首ID计数器：记录所有reads（无论唯一/多重）的首个比对ID。
+        multi2all : collections.Counter
+            多重比对展开计数器：将多重比对reads的拼接ID拆开后，分别累加到每个转录本。
+        """
         for record in batch:
-            ids = record.ref_names
-            is_multi = record.is_multi
-
-            # 最小化字符串操作
-            first_id = ids[0]
-            raw_id = first_id if len(ids) == 1 else ','.join(ids)
-
-            raw[raw_id] += 1
-            firstID[first_id] += 1
-
-            if is_multi:
-                multi[raw_id] += 1
-                # 使用集合操作优化多ID处理
-                for tid in ids:
-                    multi2all[tid] += 1
-            else:
-                unique[raw_id] += 1
+            ids = record.ref_names          # 当前read比对到的所有转录本ID列表
+            is_multi = record.is_multi      # 是否为多重比对（True=多重，False=唯一）
+            first_id = ids[0]               # 取首个比对ID作为代表
+            
+            if not is_multi:
+                # 唯一比对分支
+                raw_id = first_id
+                raw.update([raw_id])        # 原始计数累加
+                firstID.update([first_id])  # 首ID计数累加
+                unique.update([raw_id])     # 唯一比对计数累加
+            elif is_multi:
+                # 多重比对分支
+                joined_ids = ','.join(ids)  # 将多个ID拼接成字符串作为联合键
+                raw.update([joined_ids])    # 原始计数累加联合键
+                firstID.update([first_id])  # 首ID计数累加
+                multi.update([joined_ids])  # 多重比对计数累加联合键
+                multi2all.update(ids)       # 将联合键拆开后，分别累加到每个转录本
 
     def calculate_average_record_size(self, file_path, sample_size=100000):
         """
@@ -572,7 +700,7 @@ class FanseCounter:
 
         参数:
             file_path: 文件路径
-            sample_size: 采样记录数（默认10000条）
+            sample_size: 采样记录数（默认100,000条）
 
         返回:
             平均每条记录的字节数
@@ -602,12 +730,12 @@ class FanseCounter:
             else:
                 if self.verbose:
                     print("警告: 无法采样记录，使用默认值527")
-                return 527
+                return 500
 
         except Exception as e:
             if self.verbose:
                 print(f"采样失败: {e}，使用默认值527")
-            return 527
+            return 500
 
     def calculate_file_record_estimate(self, file_path, sample_size=100000):
         """
@@ -638,16 +766,16 @@ class FanseCounter:
                 return record_count
             except:
                 pass
-
-        # 对于大文件，使用采样估算
-        avg_size = self.calculate_average_record_size(
-            file_path, sample_size)*0.85  # 经验乘以0.85，人为增大一点估算的reads总数，反而比较符合实际，也是估算
-        estimated_records = max(1, int(file_size / avg_size))
+        else:
+            # 对于大文件，使用采样估算
+            avg_size = self.calculate_average_record_size(
+                file_path, sample_size)*0.8  # 经验乘以0.8，人为增大一点估算的reads总数，反而比较符合实际，也是估算
+            estimated_records = max(1, int(file_size / avg_size))
 
         if self.verbose:
-            print(f"文件大小: {file_size} 字节")
-            print(f"平均记录大小: {avg_size:.1f} 字节")
-            print(f"估计Fanse记录数: {estimated_records/1000000} M 条")
+            print(f"文件大小: {file_size/1_000_000_000:.2f} GB ")
+            print(f"平均记录大小: {avg_size:.0f} 字节")
+            print(f"估计Fanse记录数: {estimated_records/1_000_000:.2f} M")
 
         return estimated_records
 
@@ -668,55 +796,40 @@ class FanseCounter:
         """
         if prefix is None:
             prefix = self.isoform_prefix  # 默认使用isoform前缀
-
-        print(f"开始高级多映射分析 (前缀: {prefix})...")
+        if self.verbose:
+            print(f"开始高级多映射分析 (前缀: {prefix})...")
 
         # 检查是否有multi数据
-        multi_key = f'{prefix}multi'
+        multi_key = f'{prefix}multi_to_isoform'
         if multi_key not in counts_data or not counts_data[multi_key]:
-            print(f"没有{prefix}多映射数据，跳过高级分析")
+            if self.verbose:
+                print(f"没有{prefix}多映射数据，跳过高级分析")
             return
 
-        # 获取长度信息
+        # 获取长度信息（统一入口）
         if length_dict is None:
-            length_dict = {}
-            current_annotation_df = annotation_df if annotation_df is not None else self.annotation_df
+            length_dict = self._build_length_dict(prefix, annotation_df)
+            if self.verbose:
+                print(f"加载了 {len(length_dict)} 个{prefix}ID的长度信息（模式: {self.length_mode}）")
 
-            if current_annotation_df is not None:
-                # 根据前缀选择不同的列名映射
-                if prefix == self.isoform_prefix:
-                    # isoform水平：使用转录本长度
-                    id_col = 'txname' if 'txname' in current_annotation_df.columns else 'transcript_id'
-                    length_col = 'txLength' if 'txLength' in current_annotation_df.columns else 'length'
-                else:
-                    # gene水平：使用基因长度
-                    id_col = 'geneName' if 'geneName' in current_annotation_df.columns else 'gene_id'
-                    # 对于基因水平，使用最长转录本长度
-                    length_col = 'genelongesttxLength' if 'genelongesttxLength' in current_annotation_df.columns else 'txLength'
+        # 通过unique部分计算TPM：
+        # 为gene水平添加特殊处理,用unique_to_gene的reads，而不用unique_to_isoform.重要。因为很多reads映射到多个isoform
+        #一些来自同一个基因的reads，会被分配到多个isoform而导致每个isoform没有unique reads，而unique_to_gene可以让gene具有unique reads，而被挽救
+        #这种数目有多少，可以尝试统计一下，显示到摘要里面。
+        if prefix == self.gene_prefix :  #and hasattr(self, 'gene_level_counts_unique_genes')
+            unique_key = f'{prefix}unique_to_gene'
+            # 如果找不到对应的计数器，否则就新建一个空的 Counter，避免后续代码因 KeyError 崩溃。实际是可以直接找到的，因此不必担心是空的
+            unique_source = counts_data.get(unique_key, Counter())
+            tpm_values = self._calculate_tpm(unique_source, length_dict)
+       
+        # isoform水平，直接用unique_to_isoform即可，无需考虑
+        elif prefix == self.isoform_prefix: 
+            unique_key = f'{prefix}unique_to_isoform'
+            unique_source = counts_data.get(unique_key, Counter())
+            tpm_values = self._calculate_tpm(unique_source, length_dict)
 
-                if id_col in current_annotation_df.columns and length_col in current_annotation_df.columns:
-                    if prefix == self.gene_prefix:
-                        # 对于基因水平，需要计算每个基因的最长转录本长度
-                        gene_lengths = current_annotation_df.groupby(id_col)[
-                            length_col].max()
-                        length_dict = gene_lengths.to_dict()
-                    else:
-                        # isoform水平直接映射
-                        length_dict = dict(
-                            zip(current_annotation_df[id_col], current_annotation_df[length_col]))
-
-                    print(f"加载了 {len(length_dict)} 个{prefix}ID的长度信息")
-
-        # 通过unique部分计算TPM
-        unique_key = f'{prefix}unique'
-        # 优先使用传入的 counts_data 中的 unique 计数；
-        # 在 gene 水平下，若当前 counts_data 未包含 unique 计数，则回退到 self.gene_level_counts_unique_genes
-        unique_source = counts_data.get(unique_key, Counter())
-        if (not unique_source) and prefix == self.gene_prefix and hasattr(self, 'gene_level_counts_unique_genes'):
-            unique_source = self.gene_level_counts_unique_genes.get(unique_key, Counter())
-
-        tpm_values = self._calculate_tpm(unique_source, length_dict)
-        print(f"计算了 {len(tpm_values)} 个具有unique reads {prefix}ID的TPM值")
+        if self.verbose:
+            print(f"计算了 {len(tpm_values)} 个具有unique reads {prefix}ID的TPM值")
 
         # 初始化计数器
         multi_equal_counter = Counter()
@@ -726,47 +839,48 @@ class FanseCounter:
         processed_events = 0
         total_events = len(counts_data[multi_key])
 
-        print(f"开始处理 {total_events} 个{prefix}多映射事件...")
+        if self.verbose:
+            print(f"开始处理 {total_events} 个{prefix}多映射事件...")
 
-        for ids_str, event_count in counts_data[multi_key].items():
+        for ids_key, event_count in counts_data[multi_key].items():
             try:
-                # 分割ID（可能是转录本ID或基因ID）
-                ids = ids_str.split(',')
+                ids = ids_key.split(',') if isinstance(ids_key, str) else list(ids_key)
 
                 # multi_equal: 平均分配
-                equal_share_per_read = 1.0 / len(ids)
-                for id_val in ids:
-                    multi_equal_counter[id_val] += event_count * \
-                        equal_share_per_read
+                equal_alloc = self._distribute_equal(ids, event_count)
+                for id_val, cnt in equal_alloc.items():
+                    multi_equal_counter[id_val] += cnt
 
-                # multi_EM: 按TPM比例分配
+                # multi_EM: 按具有unique reads 的  isoform  或者 gene  的 TPM比例分配 multi-reads
                 allocation = self._allocate_multi_reads_by_tpm_rescued(
                     ids, tpm_values)
+                
                 if allocation:
+                    # 如果可以分配TPM，按比例分配
                     for id_val, share_ratio in allocation.items():
                         multi_em_counter[id_val] += event_count * share_ratio
                 else:
-                    # 无法分配的情况
-                    multi_em_cannot_allocate_tpm_counter[ids_str] += event_count
-
-                processed_events += 1
-                if processed_events % 10000 == 0:
-                    print(
-                        f"已处理 {processed_events}/{total_events} 个{prefix}多映射事件")
+                    # 无法分配的情况，我们不采取按照相等比例分配的办法，而是采取不分配的方案。确保没有UNIQUE 的reads 不参与继续分配，以保持严谨性
+                    # 这些reads会被分配到multi_EM_cannot_allocate_tpm_counter中
+                    multi_em_cannot_allocate_tpm_counter.update({ids_key: event_count})
+                if self.verbose:
+                    processed_events += 1
+                    if processed_events % 10000 == 0:
+                        print(f"已处理 {processed_events}/{total_events} 个{prefix}多映射事件")
 
             except Exception as e:
-                print(f"处理{prefix}多映射事件 {ids_str} 时出错: {str(e)}")
+                print(f"处理{prefix}多映射事件 {ids_key} 时出错: {str(e)}")
                 continue
 
         # 更新计数器
         counts_data[f'{prefix}multi_equal'] = multi_equal_counter
         counts_data[f'{prefix}multi_EM'] = multi_em_counter
         counts_data[f'{prefix}multi_EM_cannot_allocate_tpm'] = multi_em_cannot_allocate_tpm_counter
-
-        print(f"{prefix}高级多映射分析完成：")
-        print(f"  - {prefix}multi_equal: {len(multi_equal_counter)} 个ID")
-        print(f"  - {prefix}multi_EM: {len(multi_em_counter)} 个ID")
-        print(f"  - 无法分配TPM的事件: {len(multi_em_cannot_allocate_tpm_counter)} 个")
+        if self.verbose:
+            print(f"{prefix}高级多映射分析完成：")
+            print(f"  - {prefix}multi_equal: {len(multi_equal_counter)} 个ID")
+            print(f"  - {prefix}multi_EM: {len(multi_em_counter)} 个ID")
+            print(f"  - 无法分配TPM的事件: {len(multi_em_cannot_allocate_tpm_counter)} 个")
 
         # return None
 
@@ -778,7 +892,7 @@ class FanseCounter:
         """gene水平的多映射处理"""
         return self._rescue_multi_mappings_by_tpm(counts_data, prefix=self.gene_prefix)
 
-    def _calculate_tpm(self, unique_counts, transcript_lengths):
+    def _calculate_tpm(self, unique_counts, lengths):
         '''
         """计算每个基因的TPM值"""
         TPM是一种常用的基因表达标准化方法，能够消除基因长度和测序深度的影响。
@@ -786,7 +900,7 @@ class FanseCounter:
         - 第一步是RPK标准化，用基因的原始reads数除以基因长度(以千碱基为单位)；
         - 第二步是总和标准化，将所有基因的RPK值相加，然后用每个基因的RPK值除以这个总和再乘以一百万。
         '''
-        if not unique_counts or not transcript_lengths:
+        if not unique_counts or not lengths:
             return {}
 
         # 计算RPK (Reads Per Kilobase)
@@ -794,8 +908,8 @@ class FanseCounter:
         total_rpk = 0
 
         for transcript, count in unique_counts.items():
-            if transcript in transcript_lengths and transcript_lengths[transcript] > 0:
-                length_kb = transcript_lengths[transcript] / 1000
+            if transcript in lengths and lengths[transcript] > 0:
+                length_kb = lengths[transcript] / 1000
                 rpk = count / length_kb
                 rpk_values[transcript] = rpk
                 total_rpk += rpk  # 计算总rpk
@@ -812,13 +926,16 @@ class FanseCounter:
     def _allocate_multi_reads_by_tpm_rescued(self, transcript_ids, tpm_values):
         """根据unique 计算的  TPM值分配多映射reads"""
         allocation = {}
+         #这个分配情况是否合适，有待后续再检查一下。还没想明白的感觉。为什么直接分配1
+        if len(transcript_ids) == 1:
+            tid = transcript_ids[0]
+            return {tid: 1.0}
 
         # 过滤掉没有TPM值的转录本
-        valid_transcripts = [
-            tid for tid in transcript_ids if tid in tpm_values and tpm_values[tid] > 0]
+        valid_transcripts = [tid for tid in transcript_ids if tid in tpm_values and tpm_values[tid] > 0]
 
         if not valid_transcripts:
-            # 回退到平均分配，，，这个有点不太合适，可以放在另一个表格multi_EM_cannot_allocate_tpm里，暂时不参与分配  20251111
+            # 回退到平均分配，，，这个有点不太合适，放在另一个列表multi_EM_cannot_allocate_tpm里，不参与分配  20251111
             return None
             # share = 1.0 / len(transcript_ids)
             # return  {tid: share for tid in transcript_ids}
@@ -842,6 +959,68 @@ class FanseCounter:
 
         return allocation
 
+    def _distribute_equal(self, ids, event_count):
+        """平均分配多映射reads到各ID，返回{id: count}映射"""
+        if not ids:
+            return {}
+        share = event_count / float(len(ids))
+        return {id_val: share for id_val in ids}
+
+    def _build_length_dict(self, prefix, annotation_df=None):
+        """构建用于TPM/EM分配的长度字典
+        - prefix 为 'isoform_' 或 'gene_'
+        - 根据 self.length_mode 选择具体长度列
+        - 兼容缺失列，自动回退到合适的列
+        """
+        df = annotation_df if annotation_df is not None else self.annotation_df
+        if df is None or df.empty:
+            return {}
+
+        mode = (self.length_mode or 'geneEffectiveLength')
+
+        if prefix == self.isoform_prefix:
+            id_col = 'txname' if 'txname' in df.columns else None
+            length_col = 'txLength'
+            if id_col and length_col in df.columns:
+                return dict(zip(df[id_col], df[length_col]))
+            return {}
+
+        # gene level
+        id_col = 'geneName' if 'geneName' in df.columns else None
+        if not id_col:
+            return {}
+
+        # 可选列集合
+        candidates = [
+            mode,
+            'geneEffectiveLength',
+            'geneNonOverlapLength',
+            'geneReadCoveredLength',
+            'genelongesttxLength',
+        ]
+        # 选择第一个存在的列
+        selected = None
+        for col in candidates:
+            if col in df.columns:
+                selected = col
+                break
+        if selected is None:
+            # 回退：使用每个基因最长转录本长度（从 txLength 聚合）
+            if 'txLength' in df.columns:
+                if self.verbose:
+                    print(f"[len] 未找到列 {mode} ，回退为按 txLength 聚合的基因最长转录本长度")
+                return df.groupby(id_col)['txLength'].max().to_dict()
+            return {}
+
+        # gene 层面长度字典：若 selected 是转录本列需聚合
+        if selected == 'txLength':
+            if self.verbose:
+                print(f"[len] 选择 txLength，按基因聚合为最长转录本长度用于归一化")
+            return df.groupby(id_col)['txLength'].max().to_dict()
+        if self.verbose:
+            print(f"[len] 使用列 {selected} 作为 {prefix} 层面的长度指标")
+        return df.groupby(id_col)[selected].max().to_dict()
+
     def generate_isoform_level_counts(self, counts_data, total_count):
         """
         根据解析的计数数据生成isoform水平的各种计数
@@ -852,7 +1031,7 @@ class FanseCounter:
         # 第一阶段：已经在parse_fanse_file_optimized_final中计算了raw_counts, firstID_counts, \
         #                                   unique_counts, multi2all_counts, multi_equal_counts, multi_EM_counts.
         # 第二阶段： **重要** 针对多映射计数进行重新分配rescue multi mapped reads
-        if counts_data[f'{self.isoform_prefix}multi']:
+        if counts_data[f'{self.isoform_prefix}multi_to_isoform']:
             if self.verbose:
                 print("Starting advanced multi-mapping analysis...")
             # self._rescue_multi_mappings_by_tpm(counts_data)
@@ -868,34 +1047,30 @@ class FanseCounter:
         # 初始化合并计数器
         counts_data[f'{self.isoform_prefix}Final_EM'] = Counter()
         counts_data[f'{self.isoform_prefix}Final_EQ'] = Counter()
+        counts_data[f'{self.isoform_prefix}Final_MA'] = Counter()
 
         # 1. 合并 unique 和 multi_EM 计数 (Final_EM)
-        for transcript, count in counts_data[f'{self.isoform_prefix}unique'].items():
-            counts_data[f'{self.isoform_prefix}Final_EM'][transcript] += count
-
-        for transcript, count in counts_data[f'{self.isoform_prefix}multi_EM'].items():
-            counts_data[f'{self.isoform_prefix}Final_EM'][transcript] += count
+        counts_data[f'{self.isoform_prefix}Final_EM'].update(counts_data[f'{self.isoform_prefix}unique_to_isoform'])
+        counts_data[f'{self.isoform_prefix}Final_EM'].update(counts_data[f'{self.isoform_prefix}multi_EM'])
 
         # 2. 合并 unique 和 multi_equal 计数 (Final_EQ)
-        for transcript, count in counts_data[f'{self.isoform_prefix}unique'].items():
-            counts_data[f'{self.isoform_prefix}Final_EQ'][transcript] += count
+        counts_data[f'{self.isoform_prefix}Final_EQ'].update(counts_data[f'{self.isoform_prefix}unique_to_isoform'])
+        counts_data[f'{self.isoform_prefix}Final_EQ'].update(counts_data[f'{self.isoform_prefix}multi_equal'])
 
-        for transcript, count in counts_data[f'{self.isoform_prefix}multi_equal'].items():
-            counts_data[f'{self.isoform_prefix}Final_EQ'][transcript] += count
+        # 3. 合并 unique 和 multi2all 计数 (Final_MA)
+        counts_data[f'{self.isoform_prefix}Final_MA'].update(counts_data[f'{self.isoform_prefix}unique_to_isoform'])
+        counts_data[f'{self.isoform_prefix}Final_MA'].update(counts_data[f'{self.isoform_prefix}multi2all'])
 
         # 验证合并结果
         total_em = sum(counts_data[f'{self.isoform_prefix}Final_EM'].values())
         total_eq = sum(counts_data[f'{self.isoform_prefix}Final_EQ'].values())
-        total_unique = sum(
-            counts_data[f'{self.isoform_prefix}unique'].values())
-        total_multi_em = sum(
-            counts_data[f'{self.isoform_prefix}multi_EM'].values())
-        total_multi_eq = sum(
-            counts_data[f'{self.isoform_prefix}multi_equal'].values())
+        total_unique_to_isoform = sum( counts_data[f'{self.isoform_prefix}unique_to_isoform'].values())
+        total_multi_em = sum(counts_data[f'{self.isoform_prefix}multi_EM'].values())
+        total_multi_eq = sum(counts_data[f'{self.isoform_prefix}multi_equal'].values())
 
         if self.verbose:
             print("合并验证:")
-            print(f"  - unique计数总计: {total_unique}")
+            print(f"  - unique_to_isoform计数总计: {total_unique_to_isoform}")
             print(f"  - multi_EM计数总计: {round(total_multi_em)}")
             print(f"  - multi_equal计数总计: {round(total_multi_eq)}")
             print(f"  - Final_em总计: {round(total_em)} ")
@@ -905,12 +1080,12 @@ class FanseCounter:
         self.counts_data = counts_data
         self.summary_stats = {
             'total_reads': total_count,
-            'unique_mapped': sum(counts_data[f'{self.isoform_prefix}unique'].values()),
-            'multi_mapped': sum(counts_data[f'{self.isoform_prefix}multi'].values()),
+            'unique_mapped': total_unique_to_isoform,
+            'multi_mapped': sum(counts_data[f'{self.isoform_prefix}multi_to_isoform'].values()),
             'raw': sum(counts_data[f'{self.isoform_prefix}raw'].values()),
             'firstID': sum(counts_data[f'{self.isoform_prefix}firstID'].values()),
-            'multi_equal': sum(counts_data[f'{self.isoform_prefix}multi_equal'].values()),
-            'multi_EM': sum(counts_data[f'{self.isoform_prefix}multi_EM'].values()),
+            'multi_equal': total_multi_eq,
+            'multi_EM': total_multi_em,
             'multi_EM_cannot_allocate_tpm': sum(counts_data[f'{self.isoform_prefix}multi_EM_cannot_allocate_tpm'].values()),
             'Final_em': total_em,
             'Final_eq': total_eq,
@@ -926,13 +1101,14 @@ class FanseCounter:
             print(
                 f"  - Final_EQ: {len(counts_data[f'{self.isoform_prefix}Final_EQ'])} 个转录本, {round(total_eq)} 条reads")
 
+
     def aggregate_gene_level_counts(self):
         """
         基因水平计数聚合
         """
         if self.annotation_df is None:
             if self.verbose:
-                print("Warning: Cannot aggregate gene level counts without annotation data")
+                print("Warning: Can not aggregate gene level counts without annotation data")
             return {}, {}
 
         if self.verbose:
@@ -944,81 +1120,128 @@ class FanseCounter:
             zip(self.annotation_df['txname'], self.annotation_df['geneName']))
 
         # 初始化基因水平计数器
+        # gene_level_counts_unique_genes：存放“唯一比对到某个基因”的各类计数结果
+        # gene_level_counts_multi_genes：存放“同时比对到多个基因”的各类计数结果
         gene_level_counts_unique_genes = {}
         gene_level_counts_multi_genes = {}
+
 
         # 初始化所有基因计数类型
         for count_type in self.counts_data.keys():
             if count_type.startswith(self.isoform_prefix):
-                # 将isoform替换为gene的计数类型
+                # 将isoform替换为gene的计数类型，unique和multi两类都重新定义好
                 base_type = count_type.replace(self.isoform_prefix, '')
                 gene_level_counts_unique_genes[f'{self.gene_prefix}{base_type}'] = Counter()
-                gene_level_counts_multi_genes[f'{self.gene_prefix}{base_type}'] = Counter()
+                gene_level_counts_multi_genes[f'{self.gene_prefix}{base_type}']  = Counter()
+        gene_level_counts_multi_genes[f'{self.gene_prefix}multi_to_gene']    = Counter()
 
-        # 聚合 isoform_multi_occurrence_count 到基因级别
-        for transcript_id, count in self.counts_data[f'{self.isoform_prefix}multi2all'].items():
-            gene_id = transcript_to_gene.get(transcript_id)
-            if gene_id:
-                gene_level_counts_unique_genes[f'{self.gene_prefix}multi2all'][gene_id] += count
+        # 明确定义两类基因唯一计数,前面有定义过，这里重新定义为了解读方便省心
+        gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_isoform'] = Counter()
+        gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene_but_not_isoform'] = Counter()
+        gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene']   = Counter()
+        gene_level_counts_unique_genes[f'{self.gene_prefix}multi_to_isoform'] = Counter()
+        gene_level_counts_unique_genes[f'{self.gene_prefix}multi_to_gene']    = Counter()
+        # 重新计算基因水平的 multi2all：仅当某条 read 的多重比对组合全部落在不同基因时才累加到每个gene id
+        # iso_multi2all = self.counts_data.get(f'{self.isoform_prefix}multi_to_isoform', Counter())
+        # for combo_key, read_count in iso_multi2all.items():
+        #     # combo_key 形如 "txA,txB,txC"
+        #     tx_ids = combo_key.split(',') if isinstance(combo_key, str) else list(combo_key)
+        #     gene_set = {transcript_to_gene.get(tx) for tx in tx_ids if transcript_to_gene.get(tx)}
+        #     # 必须所有转录本都能映射到同一基因
+        #     if len(gene_set) == 1:
+        #         gene_id = gene_set.pop()
+        #         gene_level_counts_unique_genes[f'{self.gene_prefix}multi2all'][gene_id] += read_count
 
         # 第一步：计算基因水平的unique reads计数和multi计数
         # gene_unique_counts = Counter()
-        for count_type, counter in self.counts_data.items():
-            if count_type.startswith('isoform_allocation_ratios'):
-                continue
+        # 遍历 self.counts_data 中的每一种 isoform 级计数类型及其对应的 Counter
+        # 例如：'isoform_raw'、'isoform_unique_to_isoform'、'isoform_multi_to_isoform'...
+        # for count_type, counter in self.counts_data.items():
+        #     # 跳过需要后续重新计算的 'multi2all' 类型，避免重复累加
+        #     # （multi2all 会在后面单独按基因维度重新统计）
+        #     if 'multi2all' in count_type:
+        #         continue
 
-            base_type = count_type.replace(self.isoform_prefix, '')
+        count_type = f'{self.isoform_prefix}raw'
+        counter = self.counts_data[count_type]  #提取isoform_raw的counter计数器，采用这个计数器来计数就够了，避免AI幻觉
+        # 去掉 isoform 前缀，得到基础计数类型名
+        # 如 'isoform_unique_to_isoform' -> 'unique_to_isoform'
+        # base_type = count_type.replace(self.isoform_prefix, '')
 
-            gene_counter_unique = gene_level_counts_unique_genes.get(
-                f'{self.gene_prefix}{base_type}', Counter()
-            )
-            gene_counter_multi = gene_level_counts_multi_genes.get(
-                f'{self.gene_prefix}{base_type}', Counter()
-            )
+        # # 在基因水平字典里分别拿到对应的唯一映射与多重映射计数器
+        # # 若尚未创建，则返回空 Counter，保证后续可安全 update
+        # gene_counter_unique = gene_level_counts_unique_genes.get(
+        #     f'{self.gene_prefix}{base_type}', Counter()
+        # )
+        # gene_counter_multi = gene_level_counts_multi_genes.get(
+        #     f'{self.gene_prefix}{base_type}', Counter()
+        # )
 
-            for transcript_ids_str, event_count in counter.items():
-                if ',' not in transcript_ids_str:
-                    gene = transcript_to_gene.get(transcript_ids_str)
-                    if gene:
-                        gene_counter_unique[gene] += event_count
-                        if count_type == f'{self.isoform_prefix}unique':
-                            gene_level_counts_unique_genes[f'{self.gene_prefix}unique'][gene] += event_count
-                else:
-                    transcript_ids = transcript_ids_str.split(',')
-                    genes = set()
-                    for tid in transcript_ids:
-                        g = transcript_to_gene.get(tid)
-                        if g:
-                            genes.add(g)
+        # 遍历当前计数器中的每一条记录：键为转录本ID（或组合），值为对应reads数
+        for transcript_ids_key, event_count in counter.items():
 
-                    if len(genes) == 1:
-                        gene = next(iter(genes))
-                        gene_counter_unique[gene] += event_count
-                        if count_type == f'{self.isoform_prefix}multi':
-                            gene_level_counts_unique_genes[f'{self.gene_prefix}unique'][gene] += event_count
-                    elif len(genes) > 1:
-                        gene_key = ','.join(sorted(genes))
-                        gene_counter_multi[gene_key] += event_count
+            # 判断该键是否为“多转录本组合”——既可能是tuple，也可能是逗号分隔的字符串
+            if isinstance(transcript_ids_key, tuple) or (isinstance(transcript_ids_key, str) and ',' in transcript_ids_key):
+                # 统一转成列表：tuple直接转；字符串按逗号拆分
+                transcript_ids = list(transcript_ids_key) if isinstance(transcript_ids_key, tuple) else transcript_ids_key.split(',')
+                # 用set收集这些转录本对应的所有基因名（自动去重）
+                genes = set()
+                for tid in transcript_ids:
+                    g = transcript_to_gene.get(tid)   # 通过预建的映射拿到基因名
+                    if g:                             # 仅当映射成功才加入
+                        genes.add(g)
+
+                #如果first transcript 是unique to isoform, 则把reads累加到“唯一到转录本”计数器????
+                if transcript_ids[0] in gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_isoform']:
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}raw'].update({transcript_ids[0]: event_count}) 
+                # 如果multi reads的所有转录本都落在同一个基因上（set长度为1），说明isoform不唯一但是gene唯一
+                if len(genes) == 1:
+                    gene = next(iter(genes))          # 取出唯一基因名
+                    # 把reads累加到“基因-唯一”计数器
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}raw'].update({gene: event_count}) 
+                    # 记录“多转录本→单基因”的reads，视为对该基因的唯一贡献
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene'].update({gene: event_count})
+                    # 同时记录它来源于isoform水平的多映射事件
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene_and_no_unique_isoform'].update({gene: event_count})
+                    # 当且仅当正在处理isoform的多映射计数时，额外更新专用计数器
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene_and_unique_isoform'] .update({gene: event_count})  # 把reads累加到“唯一到基因但不唯一到转录本”计数器
+
+                # 如果转录本跨多个基因（set长度>1）
+                elif len(genes) > 1:
+                    gene_key = ','.join(sorted(genes))  # 用排序后的基因名拼接作为跨基因组合键
+                    gene_level_counts_multi_genes[f'{self.gene_prefix}raw'].update({gene_key: event_count})   # 累加到“基因-多重”计数器
+                    # 同时记录它来不光源于isoform水平的多映射事件，而且多gene
+                    gene_level_counts_multi_genes[f'{self.gene_prefix}multi_to_isoform'].update({gene_key: event_count})
+                    gene_level_counts_multi_genes[f'{self.gene_prefix}multi_to_gene'].update({gene_key: event_count})
+
+            # 否则：read的键是单个转录本ID（字符串）
+            else:
+                gene = transcript_to_gene.get(transcript_ids_key)  # 直接映射到基因
+                if gene:                                           # 映射成功才处理
+                    # gene_counter_unique[gene] += event_count       # 累加到“基因-唯一”计数器
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}raw'].update({gene: event_count}) 
+                    # 当且仅当正在处理isoform的唯一计数时，额外更新两个专用计数器
+                    # if count_type == f'{self.isoform_prefix}unique':
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene'].update({gene: event_count})
+                    gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_isoform'].update({gene: event_count})
 
         if self.verbose:
-            print(f"基因水平unique reads计数完成: {len(gene_counter_unique)} 个基因")
+            print(f"基因水平unique reads计数完成: {len(gene_level_counts_unique_genes[f'{self.gene_prefix}raw'])} 个基因")
 
         # 第二步：使用基因水平的unique reads计算TPM,暂时用最长转录本长度
-        # 1. 检查unique和gene水平的东西都存在哎
-        if hasattr(self, 'gene_level_counts_unique_genes') and self.gene_level_counts_unique_genes:
-            # 检查是否有gene水平的multi数据
-            gene_multi_key = f'{self.gene_prefix}multi'
-            if gene_multi_key in self.gene_level_counts_multi_genes and self.gene_level_counts_multi_genes[gene_multi_key]:
+
+        # 用有unique reads的genes为gene水平的基因们构建长度字典（这里目前采用基因最长转录本长度，还可以采用其他种类长度替代）
+        
+        # 1. 统一构建所有基因的长度字典（依据 --len 选择）
+        gene_lengths = self._build_length_dict(self.gene_prefix, self.annotation_df)
+        
+        # 21. 检查unique和gene水平的东西都存在哎
+        if gene_level_counts_multi_genes:
+            # 检查是否有gene水平的multi数据，可以参与分配EM reads
+            gene_multi_key = f'{self.gene_prefix}multi_to_gene'
+            if gene_level_counts_multi_genes.get(gene_multi_key):
                 if self.verbose:
                     print("Starting advanced multi-mapping analysis for gene level...")
-
-                # 用有unique reads的genes为gene水平的基因们构建长度字典（这里目前采用基因最长转录本长度，还可以采用其他种类长度替代）
-                gene_lengths = {}
-                for gene_name in set(self.gene_level_counts_unique_genes[f'{self.gene_prefix}unique'].keys()):
-                    gene_transcripts = self.annotation_df[self.annotation_df['geneName'] == gene_name]
-                    if not gene_transcripts.empty:
-                        max_length = gene_transcripts['txLength'].max()
-                        gene_lengths[gene_name] = max_length
 
                 # 使用通用方法处理self.gene_level_counts_multi_genes列表里面水平的gene水平的多映射并分配
                 self._rescue_multi_mappings_by_tpm(
@@ -1032,36 +1255,45 @@ class FanseCounter:
 
 
         # 第四步：合并计数
-        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EM'] = Counter(
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EM'] = Counter()
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'] = Counter()
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_MA'] = Counter()
+
+        # 1. 合并 unique_to_gene 和 multi_EM 计数 (最终的Final_EM)
+        # Final_EM = unique_to_gene + multi_EM
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EM'].update(
+            gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene']
         )
-        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'] = Counter(
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EM'].update(
+            gene_level_counts_unique_genes[f'{self.gene_prefix}multi_EM']
         )
 
-        # 1. 合并 unique 和 multi_EM 计数 (最终的Final_EM)
-        #Final_EM = gene_unique + gene_EM
-        for gene, count in gene_level_counts_unique_genes[f'{self.gene_prefix}unique'].items():
-            gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EM'][gene] += count
-        # for gene, count in gene_level_counts_unique_genes[f'{self.gene_prefix}multi'].items():
-        #     gene_level_counts_unique_genes[f'{self.gene_prefix}Final_em'][gene] += count
-        for gene, count in gene_level_counts_unique_genes[f'{self.gene_prefix}multi_EM'].items():
-            gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EM'][gene] += count
+        # 2. 合并 unique_to_gene 和 multi_equal 计数 (Final_EQ)
+        # Final_EQ = unique_to_gene + multi_equal
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'].update(
+            gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene']
+        )
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'].update(
+            gene_level_counts_unique_genes[f'{self.gene_prefix}multi_equal']
+        )
 
-        # 2. 合并 unique 和 multi_equal 计数 (Final_EQ)
-        #Final_EQ = gene_unique+gene_multi_equal
-        for gene, count in gene_level_counts_unique_genes[f'{self.gene_prefix}unique'].items():
-            gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'][gene] += count
-        for gene, count in gene_level_counts_unique_genes[f'{self.gene_prefix}multi_equal'].items():
-            gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'][gene] += count
+        # 3. 合并 unique_to_gene 和 multi2all 计数 (Final_MA)
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_MA'].update(
+            gene_level_counts_unique_genes[f'{self.gene_prefix}unique_to_gene']
+        )
+        gene_level_counts_unique_genes[f'{self.gene_prefix}Final_MA'].update(
+            gene_level_counts_unique_genes[f'{self.gene_prefix}multi2all']
+        )
 
         # 计算基因水平的multi_equal_ratio和multi_EM_ratio
         if self.verbose:
             print("Calculating gene level multi-mapping ratios...")
-        if f'{self.gene_prefix}multi_equal_ratio' not in gene_level_counts_unique_genes:
-            gene_level_counts_unique_genes[f'{self.gene_prefix}multi_equal_ratio'] = Counter()
-        if f'{self.gene_prefix}multi_EM_ratio' not in gene_level_counts_unique_genes:
-            gene_level_counts_unique_genes[f'{self.gene_prefix}multi_EM_ratio'] = Counter()
+        # if f'{self.gene_prefix}multi_equal_ratio' not in gene_level_counts_unique_genes:
+        gene_level_counts_unique_genes[f'{self.gene_prefix}multi_equal_ratio'] = Counter()
+        # if f'{self.gene_prefix}multi_EM_ratio' not in gene_level_counts_unique_genes:
+        gene_level_counts_unique_genes[f'{self.gene_prefix}multi_EM_ratio'] = Counter()
 
-        for gene_id in gene_level_counts_unique_genes[f'{self.gene_prefix}unique'].keys():
+        for gene_id in gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'].keys():
             # multi_equal_ratio
             total_gene_reads_equal  = gene_level_counts_unique_genes[f'{self.gene_prefix}Final_EQ'].get(gene_id, 0) 
             if total_gene_reads_equal > 0:
@@ -1102,15 +1334,18 @@ class FanseCounter:
                     print("没有转录本水平计数数据")
                 return {}
 
-            # 使用firstID作为基础数据框
+            # 使用firstID作为基础数据框,因为这个包含所有的reads
             firstID_type = f'{self.isoform_prefix}firstID'
-            if firstID_type not in self.counts_data or not self.counts_data[firstID_type]:
-                if self.verbose:
-                    print("没有firstID计数数据，无法生成转录本水平文件")
-                return {}
+            # if firstID_type not in self.counts_data or not self.counts_data[firstID_type]:
+            #     if self.verbose:
+            #         print("没有firstID计数数据，无法生成转录本水平文件")
+            #     return {}
 
-            combined_df = pd.DataFrame(self.counts_data[firstID_type].items(),
-                                       columns=['Transcript', 'firstID_count'])
+            base_items = [
+                (k if isinstance(k, str) else ','.join(k), v)
+                for k, v in self.counts_data[firstID_type].items()
+            ]
+            combined_df = pd.DataFrame(base_items, columns=['Transcript', 'firstID_count'])
 
             # 合并所有计数类型
             for count_type in isoform_count_types:
@@ -1119,10 +1354,21 @@ class FanseCounter:
 
                 full_type = f'{self.isoform_prefix}{count_type}'
                 if full_type in self.counts_data and self.counts_data[full_type]:
-                    temp_df = pd.DataFrame(self.counts_data[full_type].items(),
-                                           columns=['Transcript', f'{count_type}_count'])
+                    items = [
+                        (k if isinstance(k, str) else ','.join(k), v)
+                        for k, v in self.counts_data[full_type].items()
+                    ]
+                    # 重命名unique_count为unique_to_isoform_count，保留multi_to_isoform_count
+                    col_name = f'{count_type}_count'
+                    if count_type == 'unique':
+                        col_name = 'unique_to_isoform_count'
+                    temp_df = pd.DataFrame(items, columns=['Transcript', col_name])
                     combined_df = combined_df.merge(
                         temp_df, on='Transcript', how='outer')
+
+            # if 'multi_count' in combined_df.columns:
+            #     combined_df['multi_to_isoform_count'] = combined_df['multi_count']
+            #     combined_df = combined_df.drop(columns=['multi_count'])
 
             # 添加注释信息（如果有）
             if self.annotation_df is not None:
@@ -1149,6 +1395,11 @@ class FanseCounter:
                 if 'txname' in combined_df.columns and 'Transcript' in combined_df.columns:
                     combined_df = combined_df.drop('txname', axis=1)
 
+            # 别名与列规范：区分isoform/gene层的TPM不可分配事件
+            if 'multi_EM_cannot_allocate_tpm_count' in combined_df.columns:
+                combined_df['multi_EM_cannot_allocate_tpm_isoform_count'] = combined_df['multi_EM_cannot_allocate_tpm_count']
+                combined_df = combined_df.drop(columns=['multi_EM_cannot_allocate_tpm_count'])
+
             # 填充NaN值为0
             count_columns = [
                 col for col in combined_df.columns if col.endswith('_count')]
@@ -1157,11 +1408,15 @@ class FanseCounter:
             # 保存文件
             combined_filename = self.output_dir / \
                 f'{base_name}.counts_isoform_level_unique.csv'
-            combined_df.to_csv(combined_filename,
-                               index=False, float_format='%.2f')
+            try:
+                combined_df.to_csv(combined_filename,
+                                   index=False, float_format='%.2f')
+            except Exception:
+                combined_df.to_csv(combined_filename,
+                                   index=False)
             isoform_files['isoform'] = combined_filename
 
-            multi_key = f'{self.isoform_prefix}multi'
+            multi_key = f'{self.isoform_prefix}multi_to_isoform'
             if multi_key in self.counts_data and self.counts_data[multi_key]:
                 length_map = {}
                 if self.annotation_df is not None and 'txname' in self.annotation_df.columns and 'txLength' in self.annotation_df.columns:
@@ -1175,8 +1430,8 @@ class FanseCounter:
                         return str(int(r))
                     return f'{v:.1f}'
                 rows = []
-                for ids_str, event_count in self.counts_data[multi_key].items():
-                    ids = ids_str.split(',')
+                for ids_key, event_count in self.counts_data[multi_key].items():
+                    ids = ids_key.split(',') if isinstance(ids_key, str) else list(ids_key)
                     
                     raw_vals = [_fmt_val(float(self.counts_data.get(f'{self.isoform_prefix}raw', Counter()).get(t, 0))) for t in ids]
                     firstID_vals = [_fmt_val(float(self.counts_data.get(f'{self.isoform_prefix}firstID', Counter()).get(t, 0))) for t in ids]
@@ -1210,7 +1465,7 @@ class FanseCounter:
                     ]
 
                     rows.append({
-                        'Transcripts': ids_str,
+                        'Transcripts': ids_key if isinstance(ids_key, str) else ','.join(ids),
                         f'{self.isoform_prefix}raw_counts': ';'.join(raw_vals),
                         f'{self.isoform_prefix}firstID_counts': ';'.join(firstID_vals),
                         f'{self.isoform_prefix}unique_counts': ';'.join(uniq_vals),
@@ -1225,7 +1480,7 @@ class FanseCounter:
                 iso_multi_df = pd.DataFrame(rows)
                 iso_multi_filename = self.output_dir / f'{base_name}.counts_isoform_level_multi.csv'
                 iso_multi_df.to_csv(iso_multi_filename, index=False)
-                isoform_files['isoform_multi'] = iso_multi_filename
+                isoform_files['isoform_multi_to_isoform'] = iso_multi_filename
 
             if self.verbose:
                 print(f"转录本水平计数文件生成完成: {len(combined_df)} 个转录本")
@@ -1369,11 +1624,51 @@ class FanseCounter:
                             single_gene_df = single_gene_df.drop(
                                 'geneName', axis=1)
 
-                    # 保存文件
+                    existing_cols = list(single_gene_df.columns)
+                    preferred_order = [
+                        'Gene',
+                        'raw_count',
+                        'multi_to_isoform_count',
+                        'unique_to_isoform_count',
+                        'unique_to_gene_count',
+                        'firstID_count',
+                        'multi2all_count',
+                        'multi_equal_count',
+                        'multi_EM_count',
+                        'Final_EM_count',
+                        'Final_EQ_count',
+                        'multi_equal_ratio',
+                        'multi_EM_ratio'
+                    ]
+                    drop_cols = [
+                        'unique_count',
+                        'multi_EM_cannot_allocate_tpm_count'
+                    ]
+                    for dc in drop_cols:
+                        if dc in single_gene_df.columns:
+                            single_gene_df = single_gene_df.drop(columns=[dc])
+                    # if 'unique_count' in existing_cols:
+                    #     single_gene_df = single_gene_df.drop(columns=['unique_count'])
+                    ordered_cols = [c for c in preferred_order if c in single_gene_df.columns] + [
+                        c for c in single_gene_df.columns if c not in preferred_order
+                    ]
+                    single_gene_df = single_gene_df[ordered_cols]
+
                     gene_filename = self.output_dir / \
                         f'{base_name}.counts_gene_level_unique.csv'
-                    single_gene_df.to_csv(
-                        gene_filename, index=False, float_format='%.2f')
+                    def _fmt_int_or_float(col):
+                        if pd.api.types.is_integer_dtype(single_gene_df[col]):
+                            return None
+                        return '%.2f'
+                    float_fmt = None
+                    # 保持整数列无小数，其他列两位小数
+                    try:
+                        float_fmt = '%.2f'
+                        single_gene_df.to_csv(
+                            gene_filename, index=False, float_format=float_fmt)
+                    except Exception:
+                        single_gene_df.to_csv(
+                            gene_filename, index=False)
                     gene_files['gene'] = gene_filename
                     if self.verbose:
                         print(f"单个基因计数文件生成完成: {len(single_gene_df)} 个基因")
@@ -1386,6 +1681,28 @@ class FanseCounter:
                 if self.verbose:
                     print("开始生成多基因组合计数文件...")
                 multi_genes_data = []
+
+                # 预先缓存长度与TPM视图，减少循环中的字典/数据框访问
+                gene_unique_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}unique_to_gene', Counter())
+                # 构建 gene -> 有效长度 映射
+                length_map_col = None
+                if 'geneEffectiveLength' in self.annotation_df.columns:
+                    length_map_col = 'geneEffectiveLength'
+                elif 'genelongesttxLength' in self.annotation_df.columns:
+                    length_map_col = 'genelongesttxLength'
+                elif 'txLength' in self.annotation_df.columns:
+                    length_map_col = 'txLength'
+                gene_lengths_map = {}
+                if length_map_col and 'geneName' in self.annotation_df.columns:
+                    gene_lengths_map = dict(self.annotation_df.groupby('geneName')[length_map_col].max())
+                # 预先计算 TPMS（基于unique）
+                gene_tpm_map = self._calculate_tpm(gene_unique_counter, gene_lengths_map)
+                # 本地引用计数器，减少属性查找与哈希查找次数
+                gene_multi_counter = self.gene_level_counts_multi_genes.get(f'{self.gene_prefix}multi_to_gene', Counter())
+                gene_m2a_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}multi2all', Counter())
+                gene_uniq_counter = gene_unique_counter
+                gene_final_em_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}Final_EM', Counter())
+                gene_final_eq_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}Final_EQ', Counter())
 
                 # 收集所有多基因组合
                 all_multi_combinations = set()
@@ -1418,26 +1735,20 @@ class FanseCounter:
                         if abs(v - r) < 1e-6:
                             return str(int(r))
                         return f'{v:.1f}'
-                    event_count = self.gene_level_counts_multi_genes.get(f'{self.gene_prefix}multi', Counter()).get(gene_combo, 0)
+                    event_count = gene_multi_counter.get(gene_combo, 0)
                     eq_vals = [_fmt_val(event_count / len(genes)) for _ in genes]
-                    gene_lengths = {}
-                    if self.annotation_df is not None:
-                        for gene_name in genes:
-                            txs = self.annotation_df[self.annotation_df['geneName'] == gene_name]
-                            if not txs.empty:
-                                gene_lengths[gene_name] = txs['txLength'].max()
-                    gene_tpm = self._calculate_tpm(self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}unique', Counter()), gene_lengths)
-                    em_alloc = self._allocate_multi_reads_by_tpm_rescued(genes, gene_tpm)
+                    # 使用预计算的TPM视图进行分配
+                    em_alloc = self._allocate_multi_reads_by_tpm_rescued(genes, gene_tpm_map)
                     if em_alloc:
                         em_vals = [_fmt_val(event_count * em_alloc.get(g, 0.0)) for g in genes]
-                        combo_row['multi_EM_cannot_allocate_tpm_count'] = 0
+                        combo_row['multi_EM_cannot_allocate_tpm_gene_count'] = 0
                     else:
                         em_vals = ['*' for _ in genes]
-                        combo_row['multi_EM_cannot_allocate_tpm_count'] = event_count
-                    m2a_vals = [_fmt_val(float(self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}multi2all', Counter()).get(g, 0))) for g in genes]
-                    uniq_vals = [_fmt_val(float(self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}unique', Counter()).get(g, 0))) for g in genes]
-                    final_em_vals = [_fmt_val(float(self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}Final_EM', Counter()).get(g, 0))) for g in genes]
-                    final_eq_vals = [_fmt_val(float(self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}Final_EQ', Counter()).get(g, 0))) for g in genes]
+                        combo_row['multi_EM_cannot_allocate_tpm_gene_count'] = event_count
+                    m2a_vals = [_fmt_val(float(gene_m2a_counter.get(g, 0))) for g in genes]
+                    uniq_vals = [_fmt_val(float(gene_uniq_counter.get(g, 0))) for g in genes]
+                    final_em_vals = [_fmt_val(float(gene_final_em_counter.get(g, 0))) for g in genes]
+                    final_eq_vals = [_fmt_val(float(gene_final_eq_counter.get(g, 0))) for g in genes]
                     combo_row['EM_counts'] = ';'.join(em_vals)
                     combo_row['equal_counts'] = ';'.join(eq_vals)
                     combo_row['multi2all_counts'] = ';'.join(m2a_vals)
@@ -1453,15 +1764,25 @@ class FanseCounter:
                     multi_genes_filename = self.output_dir / \
                         f'{base_name}.counts_gene_level_multi.csv'
                     
-                    multi_genes_df.to_csv(
-                        multi_genes_filename, index=False, float_format='%.2f')
-                   
-                    gene_files['multi_genes'] = multi_genes_filename
+                    try:
+                        multi_genes_df.to_csv(multi_genes_filename, index=False, float_format='%.2f')
+                        gene_files['multi_genes'] = multi_genes_filename
+                    except PermissionError:
+                        fallback_dir = self.output_dir / 'tmp_multi'
+                        fallback_dir.mkdir(parents=True, exist_ok=True)
+                        fallback_path = fallback_dir / f'{base_name}.counts_gene_level_multi.csv'
+                        multi_genes_df.to_csv(fallback_path, index=False, float_format='%.2f')
+                        gene_files['multi_genes'] = fallback_path
                     if self.verbose:
                         print(f"多基因组合计数文件生成完成: {len(multi_genes_df)} 个组合")
                 else:
                     if self.verbose:
                         print("没有多基因组合数据可生成文件")
+
+                if self.export_format in ['rsem', 'all']:
+                    rsem_file = self._write_rsem_gene_results(base_name)
+                    if rsem_file:
+                        gene_files['rsem_genes'] = rsem_file
 
         except Exception as e:
             if self.verbose:
@@ -1470,6 +1791,264 @@ class FanseCounter:
             traceback.print_exc()
 
         return gene_files
+
+    def _write_rsem_gene_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.gene_level_counts_unique_genes.get(f"{self.gene_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        length_col = None
+        if 'genelongesttxLength' in df_anno.columns:
+            length_col = 'genelongesttxLength'
+        elif 'txLength' in df_anno.columns:
+            length_col = 'txLength'
+        eff_len_col = 'geneEffectiveLength' if 'geneEffectiveLength' in df_anno.columns else length_col
+        gene_len_map = {}
+        gene_eff_map = {}
+        if 'geneName' in df_anno.columns and length_col:
+            gene_len_map = dict(df_anno.groupby('geneName')[length_col].max())
+        if 'geneName' in df_anno.columns and eff_len_col:
+            gene_eff_map = dict(df_anno.groupby('geneName')[eff_len_col].max())
+        rows = []
+        for gene, count in counter.items():
+            length = gene_len_map.get(gene, 0)
+            eff_len = gene_eff_map.get(gene, length)
+            rows.append((gene, length, eff_len, round(float(count), 1)))
+        out_df = pd.DataFrame(rows, columns=['gene_id', 'length', 'effective_length', 'expected_count'])
+        rsem_path = self.output_dir / (f'{base_name}.rsem.genes.{ctype}.results' if count_type is not None else f'{base_name}.rsem.genes.results')
+        out_df.to_csv(rsem_path, sep='\t', index=False)
+        return rsem_path
+
+    def _write_rsem_isoform_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.counts_data.get(f"{self.isoform_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        name_col = 'txname' if 'txname' in df_anno.columns else 'transcript_id'
+        len_col = 'txLength' if 'txLength' in df_anno.columns else 'length'
+        eff_len_col = 'txEffectiveLength' if 'txEffectiveLength' in df_anno.columns else len_col
+        length_map = {}
+        eff_length_map = {}
+        if name_col in df_anno.columns and len_col in df_anno.columns:
+            length_map = dict(zip(df_anno[name_col], df_anno[len_col]))
+        if name_col in df_anno.columns and eff_len_col in df_anno.columns:
+            eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
+        rows = []
+        for tid, count in counter.items():
+            length = length_map.get(tid, 0)
+            eff_len = eff_length_map.get(tid, length)
+            rows.append((tid, length, eff_len, round(float(count), 1)))
+        out_df = pd.DataFrame(rows, columns=['transcript_id', 'length', 'effective_length', 'expected_count'])
+        rsem_path = self.output_dir / (f'{base_name}.rsem.isoforms.{ctype}.results' if count_type is not None else f'{base_name}.rsem.isoforms.results')
+        out_df.to_csv(rsem_path, sep='\t', index=False)
+        return rsem_path
+
+    def _write_salmon_isoform_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.counts_data.get(f"{self.isoform_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        name_col = 'txname' if 'txname' in df_anno.columns else 'transcript_id'
+        len_col = 'txLength' if 'txLength' in df_anno.columns else 'length'
+        eff_len_col = 'txEffectiveLength' if 'txEffectiveLength' in df_anno.columns else len_col
+        length_map = {}
+        eff_length_map = {}
+        if name_col in df_anno.columns and len_col in df_anno.columns:
+            length_map = dict(zip(df_anno[name_col], df_anno[len_col]))
+        if name_col in df_anno.columns and eff_len_col in df_anno.columns:
+            eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
+        # 计算TPM基于Final_EM
+        tpm_map = self._calculate_tpm(counter, length_map)
+        rows = []
+        for tid, count in counter.items():
+            _len_val = length_map.get(tid, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = eff_length_map.get(tid, length)
+            # 数值处理：整数不带小数，浮点保留两位
+            cval = float(count)
+            if abs(cval - round(cval)) < 1e-6:
+                num_reads = int(round(cval))
+            else:
+                num_reads = round(cval, 2)
+            tpm = round(float(tpm_map.get(tid, 0.0)), 2)
+            rows.append((tid, length, eff_len, tpm, num_reads))
+        out_df = pd.DataFrame(rows, columns=['Name', 'Length', 'EffectiveLength', 'TPM', 'NumReads'])
+        out_path = self.output_dir / (f'{base_name}.salmon.{ctype}.quant.sf' if count_type is not None else f'{base_name}.salmon.quant.sf')
+        out_df.to_csv(out_path, index=False)
+        return out_path
+
+    def _write_salmon_gene_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.gene_level_counts_unique_genes.get(f"{self.gene_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        name_col = 'geneName'
+        len_col = 'genelongesttxLength' if 'genelongesttxLength' in df_anno.columns else ('txLength' if 'txLength' in df_anno.columns else None)
+        eff_len_col = 'geneEffectiveLength' if 'geneEffectiveLength' in df_anno.columns else len_col
+        gene_len_map = {}
+        gene_eff_map = {}
+        if len_col and 'geneName' in df_anno.columns:
+            gene_len_map = dict(df_anno.groupby('geneName')[len_col].max())
+        if eff_len_col and 'geneName' in df_anno.columns:
+            gene_eff_map = dict(df_anno.groupby('geneName')[eff_len_col].max())
+        tpm_map = self._calculate_tpm(counter, gene_len_map)
+        rows = []
+        for gid, count in counter.items():
+            _len_val = gene_len_map.get(gid, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = gene_eff_map.get(gid, length)
+            cval = float(count)
+            num_reads = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
+            tpm = round(float(tpm_map.get(gid, 0.0)), 2)
+            rows.append((gid, length, eff_len, tpm, num_reads))
+        out_df = pd.DataFrame(rows, columns=['Name', 'Length', 'EffectiveLength', 'TPM', 'NumReads'])
+        out_path = self.output_dir / (f'{base_name}.salmon.genes.{ctype}.sf' if count_type is not None else f'{base_name}.salmon.genes.sf')
+        out_df.to_csv(out_path, index=False)
+        return out_path
+
+    def _write_kallisto_isoform_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.counts_data.get(f"{self.isoform_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        name_col = 'txname' if 'txname' in df_anno.columns else 'transcript_id'
+        len_col = 'txLength' if 'txLength' in df_anno.columns else 'length'
+        eff_len_col = 'txEffectiveLength' if 'txEffectiveLength' in df_anno.columns else len_col
+        length_map = {}
+        eff_length_map = {}
+        if name_col in df_anno.columns and len_col in df_anno.columns:
+            length_map = dict(zip(df_anno[name_col], df_anno[len_col]))
+        if name_col in df_anno.columns and eff_len_col in df_anno.columns:
+            eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
+        tpm_map = self._calculate_tpm(counter, length_map)
+        rows = []
+        for tid, count in counter.items():
+            _len_val = length_map.get(tid, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = eff_length_map.get(tid, length)
+            cval = float(count)
+            if abs(cval - round(cval)) < 1e-6:
+                est_counts = int(round(cval))
+            else:
+                est_counts = round(cval, 2)
+            tpm = round(float(tpm_map.get(tid, 0.0)), 2)
+            rows.append((tid, length, eff_len, est_counts, tpm))
+        out_df = pd.DataFrame(rows, columns=['target_id', 'length', 'eff_length', 'est_counts', 'tpm'])
+        out_path = self.output_dir / (f'{base_name}.kallisto.isoforms.{ctype}.abundance.tsv' if count_type is not None else f'{base_name}.kallisto.isoforms.abundance.tsv')
+        out_df.to_csv(out_path, index=False)
+        return out_path
+
+    def _write_kallisto_gene_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.gene_level_counts_unique_genes.get(f"{self.gene_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        len_col = 'genelongesttxLength' if 'genelongesttxLength' in df_anno.columns else ('txLength' if 'txLength' in df_anno.columns else None)
+        eff_len_col = 'geneEffectiveLength' if 'geneEffectiveLength' in df_anno.columns else len_col
+        gene_len_map = {}
+        gene_eff_map = {}
+        if len_col and 'geneName' in df_anno.columns:
+            gene_len_map = dict(df_anno.groupby('geneName')[len_col].max())
+        if eff_len_col and 'geneName' in df_anno.columns:
+            gene_eff_map = dict(df_anno.groupby('geneName')[eff_len_col].max())
+        tpm_map = self._calculate_tpm(counter, gene_len_map)
+        rows = []
+        for gid, count in counter.items():
+            _len_val = gene_len_map.get(gid, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = gene_eff_map.get(gid, length)
+            cval = float(count)
+            est_counts = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
+            tpm = round(float(tpm_map.get(gid, 0.0)), 2)
+            rows.append((gid, length, eff_len, est_counts, tpm))
+        out_df = pd.DataFrame(rows, columns=['target_id', 'length', 'eff_length', 'est_counts', 'tpm'])
+        out_path = self.output_dir / (f'{base_name}.kallisto.genes.{ctype}.abundance.tsv' if count_type is not None else f'{base_name}.kallisto.genes.abundance.tsv')
+        out_df.to_csv(out_path, index=False)
+        return out_path
+
+    def _write_featurecounts_gene_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.gene_level_counts_unique_genes.get(f"{self.gene_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        len_col = None
+        if 'genelongesttxLength' in df_anno.columns:
+            len_col = 'genelongesttxLength'
+        elif 'txLength' in df_anno.columns:
+            len_col = 'txLength'
+        eff_len_col = 'geneEffectiveLength' if 'geneEffectiveLength' in df_anno.columns else len_col
+        gene_len_map = {}
+        gene_eff_map = {}
+        if 'geneName' in df_anno.columns and len_col:
+            gene_len_map = dict(df_anno.groupby('geneName')[len_col].max())
+        if 'geneName' in df_anno.columns and eff_len_col:
+            gene_eff_map = dict(df_anno.groupby('geneName')[eff_len_col].max())
+        rows = []
+        for gene, count in counter.items():
+            _len_val = gene_len_map.get(gene, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = gene_eff_map.get(gene, length)
+            cval = float(count)
+            if abs(cval - round(cval)) < 1e-6:
+                fc_count = int(round(cval))
+            else:
+                fc_count = round(cval, 2)
+            rows.append((gene, length, eff_len, fc_count))
+        out_df = pd.DataFrame(rows, columns=['Geneid', 'Length', 'EffectiveLength', 'Count'])
+        out_path = self.output_dir / (f'{base_name}.featureCounts.genes.{ctype}.tsv' if count_type is not None else f'{base_name}.featureCounts.genes.tsv')
+        out_df.to_csv(out_path, sep='\t', index=False)
+        return out_path
+
+    def _write_featurecounts_isoform_results(self, base_name, count_type=None):
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        counter = self.counts_data.get(f"{self.isoform_prefix}{ctype}", Counter())
+        if not counter:
+            return None
+        df_anno = self.annotation_df
+        name_col = 'txname' if 'txname' in df_anno.columns else 'transcript_id'
+        len_col = 'txLength' if 'txLength' in df_anno.columns else 'length'
+        eff_len_col = 'txEffectiveLength' if 'txEffectiveLength' in df_anno.columns else len_col
+        length_map = {}
+        eff_length_map = {}
+        if name_col in df_anno.columns and len_col in df_anno.columns:
+            length_map = dict(zip(df_anno[name_col], df_anno[len_col]))
+        if name_col in df_anno.columns and eff_len_col in df_anno.columns:
+            eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
+        rows = []
+        for tid, count in counter.items():
+            _len_val = length_map.get(tid, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = eff_length_map.get(tid, length)
+            cval = float(count)
+            fc_count = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
+            rows.append((tid, length, eff_len, fc_count))
+        out_df = pd.DataFrame(rows, columns=['Geneid', 'Length', 'EffectiveLength', 'Count'])
+        out_path = self.output_dir / (f'{base_name}.featureCounts.isoforms.{ctype}.tsv' if count_type is not None else f'{base_name}.featureCounts.isoforms.tsv')
+        out_df.to_csv(out_path, sep='\t', index=False)
+        return out_path
 
     def _get_gene_annotation_data(self):
         """获取基因注释数据"""
@@ -1499,8 +2078,7 @@ class FanseCounter:
             print(f"使用的基因注释列: {selected_cols}")
 
         # 获取去重的基因注释
-        gene_annotation = self.annotation_df[selected_cols].drop_duplicates(subset=[
-                                                                            'geneName'])
+        gene_annotation = self.annotation_df[selected_cols].drop_duplicates(subset=['geneName'])
 
         # 重命名列以保持一致性
         rename_map = {}
@@ -1550,6 +2128,18 @@ class FanseCounter:
 
         count_files = {}
 
+        # 输出格式控制
+        fmt = getattr(self, 'export_format', 'rsem')
+        fmt_set = set()
+        if fmt == 'all':
+            fmt_set = {'rsem', 'salmon', 'kallisto', 'featureCounts'}
+        elif fmt == 'single':
+            fmt_set = {'rsem'}
+        elif fmt == 'multi':
+            fmt_set = {'salmon', 'kallisto', 'featureCounts'}
+        else:
+            fmt_set = {fmt}
+
         # 生成转录本水平计数文件
         if self.level in ['isoform', 'both']:
             try:
@@ -1586,7 +2176,6 @@ class FanseCounter:
                 if self.verbose:
                     print(f'has_gene_data: {has_gene_data}')
                 if has_gene_data:
-                    # print('has_gene_data', has_gene_data)
                     gene_files = self._generate_gene_level_files(base_name)
                     count_files.update(gene_files)
                     if self.verbose:
@@ -1597,436 +2186,96 @@ class FanseCounter:
             except Exception as e:
                 print(f"基因水平计数文件生成失败: {e}")
 
+        # 生成RSEM兼容输出(iso/gene按level)
+        if 'rsem' in fmt_set:
+            if getattr(self, 'export_count_type', 'Final_EM') == 'all':
+                ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
+                for ct in ctype_list:
+                    if self.level in ['isoform','both']:
+                        rsem_iso_file = self._write_rsem_isoform_results(base_name, ct)
+                        if rsem_iso_file:
+                            count_files[f'rsem_isoform_{ct}'] = rsem_iso_file
+                    if self.level in ['gene','both']:
+                        rsem_gene_file = self._write_rsem_gene_results(base_name, ct)
+                        if rsem_gene_file:
+                            count_files[f'rsem_gene_{ct}'] = rsem_gene_file
+            else:
+                if self.level in ['isoform','both']:
+                    rsem_iso_file = self._write_rsem_isoform_results(base_name)
+                    if rsem_iso_file:
+                        count_files['rsem_isoform'] = rsem_iso_file
+                if self.level in ['gene','both']:
+                    rsem_gene_file = self._write_rsem_gene_results(base_name)
+                    if rsem_gene_file:
+                        count_files['rsem_gene'] = rsem_gene_file
+
+        # 生成Salmon/Kallisto/featureCounts兼容输出（CSV）
+        if 'salmon' in fmt_set:
+            if getattr(self, 'export_count_type', 'Final_EM') == 'all':
+                ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
+                for ct in ctype_list:
+                    if self.level in ['isoform','both']:
+                        salmon_iso_file = self._write_salmon_isoform_results(base_name, ct)
+                        if salmon_iso_file:
+                            count_files[f'salmon_isoform_{ct}'] = salmon_iso_file
+                    if self.level in ['gene','both']:
+                        salmon_gene_file = self._write_salmon_gene_results(base_name, ct)
+                        if salmon_gene_file:
+                            count_files[f'salmon_gene_{ct}'] = salmon_gene_file
+            else:
+                if self.level in ['isoform','both']:
+                    salmon_iso_file = self._write_salmon_isoform_results(base_name)
+                    if salmon_iso_file:
+                        count_files['salmon_isoform'] = salmon_iso_file
+                if self.level in ['gene','both']:
+                    salmon_gene_file = self._write_salmon_gene_results(base_name)
+                    if salmon_gene_file:
+                        count_files['salmon_gene'] = salmon_gene_file
+        if 'kallisto' in fmt_set:
+            if getattr(self, 'export_count_type', 'Final_EM') == 'all':
+                ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
+                for ct in ctype_list:
+                    if self.level in ['isoform','both']:
+                        kallisto_iso_file = self._write_kallisto_isoform_results(base_name, ct)
+                        if kallisto_iso_file:
+                            count_files[f'kallisto_isoform_{ct}'] = kallisto_iso_file
+                    if self.level in ['gene','both']:
+                        kallisto_gene_file = self._write_kallisto_gene_results(base_name, ct)
+                        if kallisto_gene_file:
+                            count_files[f'kallisto_gene_{ct}'] = kallisto_gene_file
+            else:
+                if self.level in ['isoform','both']:
+                    kallisto_iso_file = self._write_kallisto_isoform_results(base_name)
+                    if kallisto_iso_file:
+                        count_files['kallisto_isoform'] = kallisto_iso_file
+                if self.level in ['gene','both']:
+                    kallisto_gene_file = self._write_kallisto_gene_results(base_name)
+                    if kallisto_gene_file:
+                        count_files['kallisto_gene'] = kallisto_gene_file
+        if 'featureCounts' in fmt_set:
+            if getattr(self, 'export_count_type', 'Final_EM') == 'all':
+                ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
+                for ct in ctype_list:
+                    if self.level in ['isoform','both']:
+                        fc_iso_file = self._write_featurecounts_isoform_results(base_name, ct)
+                        if fc_iso_file:
+                            count_files[f'featureCounts_isoform_{ct}'] = fc_iso_file
+                    if self.level in ['gene','both']:
+                        fc_gene_file = self._write_featurecounts_gene_results(base_name, ct)
+                        if fc_gene_file:
+                            count_files[f'featureCounts_gene_{ct}'] = fc_gene_file
+            else:
+                if self.level in ['isoform','both']:
+                    fc_iso_file = self._write_featurecounts_isoform_results(base_name)
+                    if fc_iso_file:
+                        count_files['featureCounts_isoform'] = fc_iso_file
+                if self.level in ['gene','both']:
+                    fc_gene_file = self._write_featurecounts_gene_results(base_name)
+                    if fc_gene_file:
+                        count_files['featureCounts_gene'] = fc_gene_file
+
         return count_files
 ##########################################################################################
-# 新加的，看行不行，行就注释掉上面的20251125
-
-    # def generate_count_files(self):
-    #     """
-    #     生成isoform和gene level计数文件（包含分配比例）
-    #     """
-    #     if self.output_filename:
-    #         base_name = Path(self.output_filename).stem
-    #     else:
-    #         base_name = self.input_file.stem
-
-    #     count_files = {}
-
-    #     # 生成转录本水平计数文件
-    #     if self.level in ['isoform', 'both']:
-    #         try:
-    #             isoform_files = self._generate_isoform_level_files(base_name)
-    #             count_files.update(isoform_files)
-    #             print("isoform水平计数文件生成完成")
-    #         except Exception as e:
-    #             print(f"转录本水平计数文件生成失败: {e}")
-
-    #     # 生成基因水平计数文件（使用新版本，包含分配比例）
-    #     if self.annotation_df is not None and self.level in ['gene', 'both']:
-    #         try:
-    #             # 使用新版本的基因水平文件生成方法
-    #             gene_files = self._generate_gene_level_files_with_allocation(
-    #                 base_name)
-    #             count_files.update(gene_files)
-
-    #             # 生成分配比例摘要报告
-    #             if hasattr(self, 'counts_data') and f'{self.gene_prefix}allocation_ratios' in self.counts_data:
-    #                 report_file = self.generate_allocation_summary_report(
-    #                     base_name)
-    #                 if report_file:
-    #                     count_files['allocation_summary'] = report_file
-
-    #             print("基因水平计数文件（包含分配比例）生成完成")
-    #         except Exception as e:
-    #             print(f"基因水平计数文件生成失败: {e}")
-
-    #     return count_files
-
-    # def _generate_gene_level_files_with_allocation(self, base_name):
-    #     """生成包含分配比例的基因水平计数文件"""
-    #     if self.annotation_df is None:
-    #         print("没有注释信息，跳过基因水平文件生成")
-    #         return {}
-
-    #     print("生成基因水平计数文件（包含分配比例）...")
-    #     gene_files = {}
-
-    #     try:
-    #         # 检查是否有基因水平计数数据
-    #         has_unique_data = hasattr(
-    #             self, 'gene_level_counts_unique_genes') and self.gene_level_counts_unique_genes
-    #         has_multi_data = hasattr(
-    #             self, 'gene_level_counts_multi_genes') and self.gene_level_counts_multi_genes
-
-    #         if not has_unique_data and not has_multi_data:
-    #             print("没有基因水平计数数据，跳过文件生成")
-    #             return {}
-
-    #         # 获取分配比例数据
-    #         allocation_ratios = {}
-    #         if hasattr(self, 'counts_data') and f'{self.gene_prefix}allocation_ratios' in self.counts_data:
-    #             allocation_ratios = self.counts_data[f'{self.gene_prefix}allocation_ratios']
-    #             print(f"加载了 {len(allocation_ratios)} 个分配比例记录")
-
-    #         # 生成单个基因的计数文件
-    #         if has_unique_data:
-    #             print("开始生成单个基因计数文件（包含分配比例）...")
-    #             single_gene_data = []
-
-    #             # 收集所有唯一的基因
-    #             all_genes = set()
-    #             for counter in self.gene_level_counts_unique_genes.values():
-    #                 if counter:
-    #                     all_genes.update(counter.keys())
-
-    #             print(f"处理 {len(all_genes)} 个唯一基因")
-
-    #             # 为每个基因构建数据行
-    #             for gene in all_genes:
-    #                 gene_row = {'Gene': gene}
-
-    #                 # 收集该基因在所有计数类型中的值
-    #                 for count_type, counter in self.gene_level_counts_unique_genes.items():
-    #                     if counter:
-    #                         # 提取基础计数类型名称（去掉 gene_ 前缀）
-    #                         base_count_type = count_type.replace(
-    #                             self.gene_prefix, '')
-    #                         count_value = counter.get(gene, 0)
-    #                         gene_row[f'{base_count_type}_count'] = count_value
-
-    #                 # 添加分配比例信息（单基因的分配比例默认为1.0）
-    #                 gene_row['equal_allocation_ratio'] = 1.0
-    #                 gene_row['em_allocation_ratio'] = 1.0
-    #                 gene_row['allocation_method'] = 'single_gene'
-
-    #                 single_gene_data.append(gene_row)
-
-    #             if single_gene_data:
-    #                 # 转换为DataFrame
-    #                 single_gene_df = pd.DataFrame(single_gene_data)
-    #                 print(f"单个基因数据框形状: {single_gene_df.shape}")
-
-    #                 # 添加基因注释信息
-    #                 gene_annotation = self._get_gene_annotation_data()
-    #                 if gene_annotation is not None:
-    #                     print(f"合并基因注释信息，注释数据形状: {gene_annotation.shape}")
-    #                     single_gene_df = single_gene_df.merge(
-    #                         gene_annotation,
-    #                         left_on='Gene',
-    #                         right_on='geneName',
-    #                         how='left'
-    #                     )
-
-    #                     # 移除重复的geneName列
-    #                     if 'geneName' in single_gene_df.columns and 'Gene' in single_gene_df.columns:
-    #                         single_gene_df = single_gene_df.drop(
-    #                             'geneName', axis=1)
-
-    #                 # 保存文件
-    #                 gene_filename = self.output_dir / \
-    #                     f'{base_name}_gene_level.counts.csv'
-    #                 single_gene_df.to_csv(
-    #                     gene_filename, index=False, float_format='%.2f')
-    #                 gene_files['gene'] = gene_filename
-    #                 print(f"单个基因计数文件生成完成: {len(single_gene_df)} 个基因")
-    #             else:
-    #                 print("没有单个基因数据可生成文件")
-
-    #         # 生成多基因组合的计数文件（包含详细的分配比例）
-    #         if has_multi_data:
-    #             print("开始生成多基因组合计数文件（包含分配比例）...")
-    #             multi_genes_data = []
-
-    #             # 收集所有多基因组合
-    #             all_multi_combinations = set()
-    #             for counter in self.gene_level_counts_multi_genes.values():
-    #                 if counter:
-    #                     all_multi_combinations.update(counter.keys())
-
-    #             print(f"处理 {len(all_multi_combinations)} 个多基因组合")
-
-    #             for gene_combo in all_multi_combinations:
-    #                 combo_row = {'Gene_Combination': gene_combo}
-
-    #                 # 收集该组合在所有计数类型中的值
-    #                 for count_type, counter in self.gene_level_counts_multi_genes.items():
-    #                     if counter:
-    #                         base_count_type = count_type.replace(
-    #                             self.gene_prefix, '')
-    #                         count_value = counter.get(gene_combo, 0)
-    #                         combo_row[f'{base_count_type}_count'] = count_value
-
-    #                 # 添加分配比例信息
-    #                 genes = gene_combo.split(',')
-
-    #                 # 查找对应的分配比例
-    #                 equal_ratio_key = f"{gene_combo}_equal"
-    #                 em_ratio_key = f"{gene_combo}_EM"
-
-    #                 if equal_ratio_key in allocation_ratios:
-    #                     equal_ratios = allocation_ratios[equal_ratio_key]
-    #                     # 格式化为字符串，如 "geneA:0.4,geneB:0.6"
-    #                     equal_ratio_str = ','.join(
-    #                         [f"{gene}:{ratio:.3f}" for gene, ratio in equal_ratios.items()])
-    #                     combo_row['equal_allocation_ratios'] = equal_ratio_str
-    #                 else:
-    #                     # 默认平均分配
-    #                     equal_share = 1.0 / len(genes)
-    #                     equal_ratio_str = ','.join(
-    #                         [f"{gene}:{equal_share:.3f}" for gene in genes])
-    #                     combo_row['equal_allocation_ratios'] = equal_ratio_str
-
-    #                 if em_ratio_key in allocation_ratios and allocation_ratios[em_ratio_key] is not None:
-    #                     em_ratios = allocation_ratios[em_ratio_key]
-    #                     em_ratio_str = ','.join(
-    #                         [f"{gene}:{ratio:.3f}" for gene, ratio in em_ratios.items()])
-    #                     combo_row['em_allocation_ratios'] = em_ratio_str
-    #                     combo_row['allocation_method'] = 'EM'
-    #                 else:
-    #                     # 无法分配TPM的情况
-    #                     combo_row['em_allocation_ratios'] = 'N/A'
-    #                     combo_row['allocation_method'] = 'equal_or_cannot_allocate'
-
-    #                 # 计算分配比例的总和（应为1.0）
-    #                 if equal_ratio_key in allocation_ratios:
-    #                     total_equal = sum(
-    #                         allocation_ratios[equal_ratio_key].values())
-    #                     combo_row['equal_allocation_sum'] = f"{total_equal:.3f}"
-
-    #                 if em_ratio_key in allocation_ratios and allocation_ratios[em_ratio_key] is not None:
-    #                     total_em = sum(
-    #                         allocation_ratios[em_ratio_key].values())
-    #                     combo_row['em_allocation_sum'] = f"{total_em:.3f}"
-
-    #                 multi_genes_data.append(combo_row)
-
-    #             if multi_genes_data:
-    #                 multi_genes_df = pd.DataFrame(multi_genes_data)
-    #                 multi_genes_filename = self.output_dir / \
-    #                     f'{base_name}_multi_genes_level.counts.csv'
-    #                 multi_genes_df.to_csv(
-    #                     multi_genes_filename, index=False, float_format='%.2f')
-    #                 gene_files['multi_genes'] = multi_genes_filename
-    #                 print(f"多基因组合计数文件生成完成: {len(multi_genes_df)} 个组合")
-    #             else:
-    #                 print("没有多基因组合数据可生成文件")
-
-    #         # 生成分配比例详情文件
-    #         if allocation_ratios:
-    #             print("开始生成分配比例详情文件...")
-    #             allocation_detail_data = []
-
-    #             for ratio_key, ratios in allocation_ratios.items():
-    #                 if ratios is None:
-    #                     # 无法分配的情况
-    #                     detail_row = {
-    #                         'multi_mapping_event': ratio_key.replace('_equal', '').replace('_EM', ''),
-    #                         'allocation_method': ratio_key.split('_')[-1],
-    #                         'allocation_ratios': 'N/A (cannot allocate)',
-    #                         'genes_involved': ratio_key.split('_')[0],
-    #                         'ratio_sum': 'N/A'
-    #                     }
-    #                 else:
-    #                     # 正常分配情况
-    #                     genes = list(ratios.keys())
-    #                     ratio_str = ','.join(
-    #                         [f"{gene}:{ratio:.4f}" for gene, ratio in ratios.items()])
-    #                     ratio_sum = sum(ratios.values())
-
-    #                     detail_row = {
-    #                         'multi_mapping_event': ratio_key.replace('_equal', '').replace('_EM', ''),
-    #                         'allocation_method': ratio_key.split('_')[-1],
-    #                         'allocation_ratios': ratio_str,
-    #                         'genes_involved': ','.join(genes),
-    #                         'ratio_sum': f"{ratio_sum:.4f}",
-    #                         'gene_count': len(genes)
-    #                     }
-
-    #                 allocation_detail_data.append(detail_row)
-
-    #             if allocation_detail_data:
-    #                 allocation_df = pd.DataFrame(allocation_detail_data)
-    #                 allocation_filename = self.output_dir / \
-    #                     f'{base_name}_allocation_details.csv'
-    #                 allocation_df.to_csv(allocation_filename, index=False)
-    #                 gene_files['allocation_details'] = allocation_filename
-    #                 print(f"分配比例详情文件生成完成: {len(allocation_df)} 条记录")
-
-    #         return gene_files
-
-    #     except Exception as e:
-    #         print(f"生成基因水平计数文件时出错: {str(e)}")
-    #         import traceback
-    #         traceback.print_exc()
-    #         return {}
-
-    # def _get_gene_annotation_data(self):
-    #     """获取基因注释数据（包含分配比例信息）"""
-    #     if self.annotation_df is None:
-    #         return None
-
-    #     # 检查可用的注释列
-    #     available_columns = self.annotation_df.columns.tolist()
-
-    #     # 选择基因相关的注释列
-    #     selected_cols = ['geneName']
-
-    #     # 添加其他可能有用的列
-    #     optional_cols = {
-    #         'symbol': ['symbol', 'genename', 'gene_name'],
-    #         'genelongesttxLength': ['genelongesttxLength', 'genelonesttxlength', 'txLength'],
-    #         'genelongestcdsLength': ['genelongestcdsLength', 'genelongestcdslength', 'cdsLength'],
-    #         'description': ['description', 'gene_description', 'product']
-    #     }
-
-    #     for target_col, source_cols in optional_cols.items():
-    #         for col in source_cols:
-    #             if col in available_columns:
-    #                 selected_cols.append(col)
-    #                 break
-
-    #     print(f"使用的基因注释列: {selected_cols}")
-
-    #     # 获取去重的基因注释
-    #     gene_annotation = self.annotation_df[selected_cols].drop_duplicates(subset=[
-    #                                                                         'geneName'])
-
-    #     # 重命名列以保持一致性
-    #     rename_map = {}
-    #     if 'genename' in gene_annotation.columns:
-    #         rename_map['genename'] = 'symbol'
-    #     if 'genelonesttxlength' in gene_annotation.columns:
-    #         rename_map['genelonesttxlength'] = 'genelongesttxLength'
-    #     if 'genelongestcdslength' in gene_annotation.columns:
-    #         rename_map['genelongestcdslength'] = 'genelongestcdsLength'
-
-    #     if rename_map:
-    #         gene_annotation = gene_annotation.rename(columns=rename_map)
-
-    #     return gene_annotation
-
-    # def _format_allocation_ratios(self, ratios_dict):
-    #     """格式化分配比例为字符串"""
-    #     if not ratios_dict:
-    #         return "N/A"
-
-    #     ratio_strings = []
-    #     for gene, ratio in ratios_dict.items():
-    #         ratio_strings.append(f"{gene}:{ratio:.3f}")
-
-    #     return ','.join(ratio_strings)
-
-    # def _calculate_allocation_summary(self, allocation_ratios):
-    #     """计算分配比例的统计摘要"""
-    #     if not allocation_ratios:
-    #         return {}
-
-    #     summary = {
-    #         'total_events': len(allocation_ratios),
-    #         'equal_events': 0,
-    #         'em_events': 0,
-    #         'cannot_allocate_events': 0,
-    #         'average_genes_per_event': 0,
-    #         'ratio_deviation_stats': {}
-    #     }
-
-    #     gene_counts = []
-    #     ratio_deviations = []
-
-    #     for key, ratios in allocation_ratios.items():
-    #         if ratios is None:
-    #             summary['cannot_allocate_events'] += 1
-    #             continue
-
-    #         if key.endswith('_equal'):
-    #             summary['equal_events'] += 1
-    #         elif key.endswith('_EM'):
-    #             summary['em_events'] += 1
-
-    #         gene_counts.append(len(ratios))
-
-    #         # 计算比例与平均分配的偏差
-    #         if len(ratios) > 1:
-    #             equal_share = 1.0 / len(ratios)
-    #             deviations = [abs(ratio - equal_share)
-    #                           for ratio in ratios.values()]
-    #             avg_deviation = sum(deviations) / len(deviations)
-    #             ratio_deviations.append(avg_deviation)
-
-    #     if gene_counts:
-    #         summary['average_genes_per_event'] = sum(
-    #             gene_counts) / len(gene_counts)
-
-    #     if ratio_deviations:
-    #         summary['ratio_deviation_stats'] = {
-    #             'avg_deviation_from_equal': sum(ratio_deviations) / len(ratio_deviations),
-    #             'max_deviation': max(ratio_deviations) if ratio_deviations else 0,
-    #             'min_deviation': min(ratio_deviations) if ratio_deviations else 0
-    #         }
-
-    #     return summary
-
-    # def generate_allocation_summary_report(self, base_name):
-    #     """生成分配比例摘要报告"""
-    #     if not hasattr(self, 'counts_data') or f'{self.gene_prefix}allocation_ratios' not in self.counts_data:
-    #         return None
-
-    #     allocation_ratios = self.counts_data[f'{self.gene_prefix}allocation_ratios']
-    #     summary = self._calculate_allocation_summary(allocation_ratios)
-
-    #     if not summary:
-    #         return None
-
-    #     # 生成报告文件
-    #     report_lines = [
-    #         "基因水平多映射分配比例摘要报告",
-    #         "=" * 50,
-    #         f"报告生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-    #         f"输入文件: {self.input_file.name}",
-    #         f"注释文件: {self.gxf_file if self.gxf_file else 'N/A'}",
-    #         "",
-    #         "分配事件统计:",
-    #         f"  - 总多映射事件数: {summary['total_events']}",
-    #         f"  - 平均分配事件数: {summary['equal_events']}",
-    #         f"  - EM分配事件数: {summary['em_events']}",
-    #         f"  - 无法分配事件数: {summary['cannot_allocate_events']}",
-    #         f"  - 平均每个事件的基因数: {summary['average_genes_per_event']:.2f}",
-    #         ""
-    #     ]
-
-    #     if summary['ratio_deviation_stats']:
-    #         stats = summary['ratio_deviation_stats']
-    #         report_lines.extend([
-    #             "分配比例偏差统计 (与平均分配相比):",
-    #             f"  - 平均偏差: {stats['avg_deviation_from_equal']:.4f}",
-    #             f"  - 最大偏差: {stats['max_deviation']:.4f}",
-    #             f"  - 最小偏差: {stats['min_deviation']:.4f}",
-    #             ""
-    #         ])
-
-    #     # 添加前10个分配事件的详细信息
-    #     report_lines.append("前10个多映射事件分配详情:")
-    #     report_lines.append("-" * 50)
-
-    #     event_count = 0
-    #     for key, ratios in list(allocation_ratios.items())[:10]:
-    #         if ratios is None:
-    #             report_lines.append(f"{key}: 无法分配TPM")
-    #         else:
-    #             ratio_str = self._format_allocation_ratios(ratios)
-    #             report_lines.append(f"{key}: {ratio_str}")
-    #         event_count += 1
-    #         if event_count >= 10:
-    #             break
-
-    #     # 写入文件
-    #     report_filename = self.output_dir / \
-    #         f'{base_name}_allocation_summary.txt'
-    #     with open(report_filename, 'w', encoding='utf-8') as f:
-    #         f.write('\n'.join(report_lines))
-
-    #     print(f"分配比例摘要报告生成完成: {report_filename}")
-    #     return report_filename
     # 主运行进程
 
     def run(self):
@@ -2058,6 +2307,7 @@ class FanseCounter:
             if self.verbose and self.gene_level_counts_unique_genes:
                 print(
                     f"Gene level aggregation completed: {len(self.gene_level_counts_unique_genes)} unique-gene count types")
+            
             if self.verbose and self.gene_level_counts_multi_genes:
                 print(
                     f"Gene level aggregation completed: {len(self.gene_level_counts_multi_genes)} multi-gene count types")
@@ -2103,15 +2353,28 @@ class FanseCounter:
                 f.write(f"{stat}: {value}\n")
 
             f.write(f"\nMulti-mapping statistics:\n")
-            f.write(
-                f"Multi-mapping events: {len(self.counts_data['multi'])}\n")
-            if self.counts_data['multi']:
-                total_multi_reads = sum(self.counts_data['multi'].values())
-                avg_reads_per_event = total_multi_reads / \
-                    len(self.counts_data['multi'])
-                f.write(f"Total multi-mapped reads: {total_multi_reads}\n")
+            iso_multi_key = f"{self.isoform_prefix}multi_to_isoform"
+            if iso_multi_key in self.counts_data:
                 f.write(
-                    f"Average reads per multi-mapping event: {avg_reads_per_event:.2f}\n")
+                    f"Isoform-level multi-mapping events: {len(self.counts_data[iso_multi_key])}\n")
+                if self.counts_data[iso_multi_key]:
+                    total_multi_reads = sum(self.counts_data[iso_multi_key].values())
+                    avg_reads_per_event = total_multi_reads / \
+                        len(self.counts_data[iso_multi_key])
+                    f.write(f"Isoform-level total multi-mapped reads: {total_multi_reads}\n")
+                    f.write(
+                        f"Isoform-level average reads per multi-mapping event: {avg_reads_per_event:.2f}\n")
+            gene_multi_key = f"{self.gene_prefix}multi_to_gene"
+            if gene_multi_key in self.counts_data:
+                f.write(
+                    f"Gene-level multi-mapping events: {len(self.counts_data[gene_multi_key])}\n")
+                if self.counts_data[gene_multi_key]:
+                    total_multi_reads = sum(self.counts_data[gene_multi_key].values())
+                    avg_reads_per_event = total_multi_reads / \
+                        len(self.counts_data[gene_multi_key])
+                    f.write(f"Gene-level total multi-mapped reads: {total_multi_reads}\n")
+                    f.write(
+                        f"Gene-level average reads per multi-mapping event: {avg_reads_per_event:.2f}\n")
 
     def debug_gene_level_data(self):
         """调试基因水平数据"""
@@ -2180,7 +2443,7 @@ def print_mini_fansetools():
     # ]
 
     mini_art = ['''
-     FANSeTools - Summary the RNA-seq Count
+     FANSeTools Count - Summary the RNA-seq Count in various levels and methods.
      ''']
 
     for line in mini_art:
@@ -2228,7 +2491,6 @@ def load_annotation_data(args):
         genomic_df = load_annotation_to_dataframe(args.gxf)
         return genomic_df
 
-
 # 方法1：先读取注释行获取列名，然后读取数据
 def read_refflat_with_commented_header(file_path):
     """读取带有注释头部的refflat文件"""
@@ -2253,16 +2515,23 @@ def read_refflat_with_commented_header(file_path):
             "cdsStart", "cdsEnd", "exonCount", "exonStarts", "exonEnds",
             "symbol", "g_biotype", "t_biotype", "description", "protein_id",
             "txLength", "cdsLength", "utr5Length", "utr3Length",
-            "genelongesttxLength", "genelongestcdsLength", "geneEffectiveLength"
+            "genelongesttxLength", "genelongestcdsLength", "geneEffectiveLength",
+            "geneNonOverlapLength", "geneReadCoveredLength"
         ]
         df = pd.read_csv(file_path, sep='\t', header=None,
                          names=default_columns, dtype={'chrom': str})
 
     return df
 
-
 def add_count_subparser(subparsers):
-    """命令行主函数"""
+    """
+    添加count子命令的参数解析器。
+    此函数定义了FANSe3文件计数处理的所有命令行参数，包括输入/输出、注释文件、计数水平、
+    输出格式、计数类型选择、并行处理等。
+
+    :param subparsers: 子命令解析器对象。
+    :return: None
+    """
 
     parser = subparsers.add_parser(
         'count',
@@ -2271,14 +2540,14 @@ def add_count_subparser(subparsers):
         epilog="""
         使用示例:
             默认isoform level
-          单个文件处理:
+          单个文件/单端测序文件处理:
             fanse count -i sample.fanse3 -o results/ --gxf annotation.gtf
 
           批量处理目录中所有fanse3文件:
             fanse count -i /data/*.fanse3 -o /output/ --gxf annotation.gtf
 
-          双端测序数据:
-            fanse count -i R1.fanse3 -r R2.fanse3 -o results/ --gxf annotation.gtf
+          双端测序数据, 不支持通配符和文件夹等用此方法处理:
+            fanse count -1 R1.fanse3 -2 R2.fanse3 -o results/ --gxf annotation.gtf
 
         **如需要基因水平计数，需要输入gtf/gff/refflat/简单g-t对应文件，--gxf都可以解析
           基因水平计数:
@@ -2290,56 +2559,74 @@ def add_count_subparser(subparsers):
           处理中断后重新运行（自动跳过已处理的文件[输出文件夹中存在对应结果文件，需重新运行请删除]）
             fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --resume
 
-            # 指定4个并行进程
+            # 指定4个并行进程，展示总体运行进度和简易进度条
             fanse count -i "*.fanse3" -o results --gxf annotation.gtf --p 4
 
-            使用所有CPU核心并行处理:
+          使用所有CPU核心并行处理:
             fanse count -i *.fanse3 -o results --gxf annotation.gtf -p 0
+
+        基因定量归一化长度指标说明 (--len):
+          - geneEffectiveLength: 所有转录本外显子并集的非重叠长度，用于更稳健的TPM归一化
+          - genelongesttxLength: 每个基因的最长转录本长度，常作为简化替代
+          - txLength: 基于转录本长度的回退选项（按基因取最大）
+          - geneNonOverlapLength: 与 geneEffectiveLength 一致，显式提供非重叠外显子长度
+          - geneReadCoveredLength: 依据reads覆盖区间的长度（无覆盖信息时退化为有效长度）
+          - other: 自定义列名（若不存在自动回退至有效长度）
                 """
     )
 
-    parser.add_argument('-i', '--input', required=True,
-                        help='Input fanse3 file,输入FANSe3文件/目录/通配符（支持批量处理）')
-    parser.add_argument('-r', '--paired-end',
-                        help='Paired-end fanse3 file (optional)')
+    parser.add_argument('-i', '--input', required=False,
+                        help='输入FANSe3文件/目录/通配符（支持批量处理）')
+    parser.add_argument('-1', '--read1', required=False,
+                        help='双端测序 Read1 输入文件')
+    parser.add_argument('-2', '--read2', required=False,
+                        help='双端测序 Read2 输入文件,暂时不可用，输入无效')
+    # parser.add_argument('-r', '--paired-end', required=False,
+    #                     help='已废弃：双端 Read2 输入文件（请使用 -2/--read2）')
     parser.add_argument('-o', '--output', required=False,
                         help='Output directory,输出路径（文件或目录，自动检测）')
 
-    # parser.add_argument('--minreads', type=int, default=0,
-    #                     help='Minimum reads threshold for filtering')
-    parser.add_argument('--rpkm', type=float, default=0,
-                        help='RPKM threshold for filtering，尚未完成')
-
-    parser.add_argument('--gxf', required=False,
+    parser.add_argument('-g', '--gxf', required=False,
                         help='Input GXF file (GTF or GFF3),if not provided, just give out isoform level readcounts')
-    parser.add_argument('--annotation-output',
+    parser.add_argument('-a', '--annotation-output',
                         help='Output refFlat file prefix (optional)')
 
-    parser.add_argument('--level', choices=['gene', 'isoform', 'both'], default='gene',
-                        help='Counting level')
+    parser.add_argument('-l' ,'--level', choices=['gene', 'isoform', 'both'], default='gene',
+                        help='RNA seq Counting level')
+    parser.add_argument('-f', '--format', choices=['rsem', 'salmon', 'kallisto', 'featureCounts', 'all', 'single', 'multi'], default='salmon',
+                        help='输出常见定量格式选择，默认salmon')
+    parser.add_argument('-c', '--count-type', choices=['raw','unique','firstID','Final_EM','Final_EQ','Final_MA','all'], default='Final_EM',
+                        help="定量文件中用作计数与TPM计算的计数类型；选择'all'时为每种计数类型分别导出定量文件")
 
-    parser.add_argument('--resume', required=False, action='store_true',
-                        help='可从上次运行断掉的地方自动开始，自动检测文件夹中是否有输入文件对应的结果文件，有则跳过')
+    # 长度指标选择：标准 + 高级
+    parser.add_argument('--len', dest='len',
+                        choices=['geneEffectiveLength', 'genelongesttxLength', 'txLength',
+                                 'geneNonOverlapLength', 'geneReadCoveredLength', 'other'],
+                        default='geneEffectiveLength',
+                        help='TPM/EM 分配所用的长度指标：默认 geneEffectiveLength；可选 genelongesttxLength/txLength/geneNonOverlapLength/geneReadCoveredLength/other')
 
     parser.add_argument('-p', '--processes',  type=int, default=1,
-                        help='并行进程数 (默认: CPU核心数, 1=串行)')
+                        help='并行任务数 (默认=1: CPU核心数, 1=串行)')
     parser.add_argument('-v', '--verbose', action='store_true', help='显示详细信息')
+
+    parser.add_argument( '--resume', required=False, action='store_true',
+                        help='可从上次运行断掉的地方自动开始，自动检测文件夹中是否有输入文件对应的结果文件，有则跳过不计入，统计没有结果文件的输入文件并开始')
 
     # 根据是否并行选择执行函数
     def count_main_wrapper(args):
-        if getattr(args, 'processes', None) != 1:  # 不是明确设置为1
+        if getattr(args, 'processes', None) != 1:
             return count_main_parallel(args)
         else:
-            return count_main(args)  # 原有的串行版本
+            return count_main(args)
 
-    # 关键修复：设置处理函数，而不是直接解析参数
+    # 设置处理函数，而不是直接解析参数
     parser.set_defaults(func=count_main)
 
 
 def main():
     """主函数 - 用于直接运行此脚本"""
     parser = argparse.ArgumentParser(
-        description='fansetools count - Process fanse3 files for read counting'
+        description='fansetools Count - Process RNA seq read counting for fanse3 files in isoform  and gene level'
     )
 
     # 添加子命令
@@ -2396,28 +2683,12 @@ if __name__ == '__main__':
             print(f"解析完成，共 {total_count} 条记录")
             print(f"计数数据包含 {len(counts_data)} 种计数类型")
 
-            # # 显示一些统计信息
-            # for count_type, counter_obj in counts_data.items():
-            #     if counter_obj:  # 只显示非空的计数器
-            #         print(f"{count_type}: {len(counter_obj)} 个转录本")
-            #         # 显示前5个最高计数的转录本
-            #         top5 = counter_obj.most_common(5)
-            #         print(f"  前5个转录本: {top5}")
-
             print("\n开始生成isoform水平计数...")
             # 正确调用：传递参数
             counter.generate_isoform_level_counts(counts_data, total_count)
 
             print("开始基因水平聚合...")
             counter.gene_level_counts_unique_genes, counter.gene_level_counts_multi_genes = counter.aggregate_gene_level_counts()
-
-            # if gene_counts_unique_genes:
-            #     print("\n基因水平计数统计:")
-            #     for count_type, gene_counter in gene_counts_unique_genes.items():
-            #         if gene_counter:  # 只显示非空的计数器
-            #             print(f"{count_type}: {len(gene_counter)} 个基因")
-            #             top5_genes = gene_counter.most_common(5)
-            #             print(f"  前5个基因: {top5_genes}")
 
             # 在 generate_count_files 方法开始处添加
             counter.debug_gene_level_data()
@@ -2483,76 +2754,3 @@ if __name__ == '__main__':
             # 清理临时目录
             shutil.rmtree(temp_dir, ignore_errors=True)
             print(f"\n清理测试目录: {temp_dir}")
-
-    # def debug_gene_aggregation():
-    #     """调试基因聚合功能"""
-    #     # 创建测试数据
-    #     test_counts = {
-    #         'firstID': Counter({
-    #             'transcript1': 100,
-    #             'transcript2': 50,
-    #             'transcript3': 75,
-    #             'transcript4': 25
-    #         }),
-    #         'multi': Counter({
-    #             'transcript1,transcript2': 30,
-    #             'transcript3,transcript4': 20
-    #         })
-    #     }
-
-    #     test_annotation = pd.DataFrame({
-    #         'txname': ['transcript1', 'transcript2', 'transcript3', 'transcript4'],
-    #         'geneName': ['geneA', 'geneA', 'geneB', 'geneB']
-    #     })
-
-    #     # 手动测试聚合逻辑
-    #     transcript_to_gene = dict(zip(test_annotation['txname'], test_annotation['geneName']))
-    #     print("转录本到基因的映射:", transcript_to_gene)
-
-    #     for count_type, counter in test_counts.items():
-    #         print(f"\n处理 {count_type}:")
-    #         gene_counter = Counter()
-
-    #         for transcript_ids_str, count in counter.items():
-    #             print(f"  处理 '{transcript_ids_str}': 计数={count}")
-
-    #             if ',' in transcript_ids_str:
-    #                 transcript_ids = transcript_ids_str.split(',')
-    #                 print(f"    多映射转录本: {transcript_ids}")
-
-    #                 gene_counts = {}
-    #                 for tid in transcript_ids:
-    #                     gene = transcript_to_gene.get(tid)
-    #                     if gene:
-    #                         gene_counts[gene] = gene_counts.get(gene, 0) + 1
-
-    #                 print(f"    基因分布: {gene_counts}")
-
-    #                 if gene_counts:
-    #                     for gene, gene_count in gene_counts.items():
-    #                         allocation = count * (gene_count / len(transcript_ids))
-    #                         gene_counter[gene] += allocation
-    #                         print(f"    分配给基因 {gene}: {allocation}")
-    #             else:
-    #                 gene = transcript_to_gene.get(transcript_ids_str)
-    #                 if gene:
-    #                     gene_counter[gene] += count
-    #                     print(f"    单映射: 基因 {gene} 增加 {count}")
-
-    #         print(f"  最终基因计数: {dict(gene_counter)}")
-
-    # if __name__ == '__main__':
-    #     # 运行测试
-    #     print("=" * 60)
-    #     print("开始测试基因水平计数功能")
-    #     print("=" * 60)
-
-    #     # 先运行调试
-    #     debug_gene_aggregation()
-
-    #     print("\n" + "=" * 60)
-    #     print("开始完整测试")
-    #     print("=" * 60)
-
-    #     # 运行完整测试
-    #     test_gene_level_counting()

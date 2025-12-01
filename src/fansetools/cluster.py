@@ -1679,7 +1679,7 @@ FANSe3 集群管理工具
     return cluster_parser
     
     # 在add_cluster_subparser中添加新命令
-    deploy_parser = cluster_subparsers.add_parser('deploy', 
+    deploy_parser = cluster_subparsers.add_parser('deploy',   # pyright: ignore[reportUnreachable]
         help='部署FANSe3到节点')
     deploy_parser.add_argument('name', help='节点名称')
 
