@@ -108,10 +108,16 @@ def calculate_region_length(intervals):
     merged.append((current_start, current_end))
     return sum(end - start for start, end in merged)
 
-def calculate_gene_length_metrics(transcripts_df):
-    """Calculate three gene-level length metrics."""
+def calculate_gene_length_metrics(transcripts_df, coverage_intervals=None):
+    """计算基因层面的长度指标，标准化列名并补充高级指标
+    - genelongesttxLength: 基因内最长转录本长度
+    - genelongestcdsLength: 基因内最长CDS长度
+    - geneEffectiveLength: 所有转录本外显子并集的非重叠长度
+    - geneNonOverlapLength: 与geneEffectiveLength一致，显式提供非重叠外显子长度
+    - geneReadCoveredLength: 依据覆盖区间统计的被reads覆盖的外显子长度（无覆盖数据时退化为geneEffectiveLength）
+    """
     gene_metrics = {}
-    
+
     for gene_id, gene_df in transcripts_df.groupby('geneName'):
         # 1. genelonesttxlength: Length of the longest transcript (by txLength)
         longest_tx = gene_df.loc[gene_df['txLength'].idxmax()] if not gene_df.empty else None
@@ -120,16 +126,112 @@ def calculate_gene_length_metrics(transcripts_df):
         # 2. genelongestcdslength: Length of the longest CDS among all transcripts
         genelongestcdslength = gene_df['cdsLength'].max() if not gene_df['cdsLength'].empty else 0
         
-        # 3. geneEffectiveLength: Effective length for normalization (longest CDS)
-        geneEffectiveLength = genelongestcdslength
-        
+        # 3. geneEffectiveLength: Union length of all exons from all transcripts
+        # 不是很对，暂时可以先这样吧，后续在优化。这里应该是所有exons非重叠长度之和
+        #或者再多一个长度出来参考
+        all_exons = []
+        for _, row in gene_df.iterrows():
+            starts = row.get('exonStarts_list', [])
+            ends = row.get('exonEnds_list', [])
+            if starts and ends:
+                all_exons.extend(list(zip(starts, ends)))
+        non_overlap_len = calculate_region_length(all_exons)
+        geneEffectiveLength = int(non_overlap_len if non_overlap_len > 0 else genelongesttxLength)
+
+        # 若提供覆盖区间，则统计与外显子交集的覆盖长度；否则退化为有效长度
+        geneReadCoveredLength = geneEffectiveLength
+        if coverage_intervals and gene_id in coverage_intervals:
+            covered = coverage_intervals[gene_id]
+            # 合并覆盖区间后与外显子并集求交长度
+            covered_len = 0
+            if all_exons:
+                # 合并所有外显子为并集区间
+                exon_union_len = 0
+                merged_exons = []
+                for start, end in sorted(all_exons):
+                    if not merged_exons or start > merged_exons[-1][1]:
+                        merged_exons.append([start, end])
+                    else:
+                        merged_exons[-1][1] = max(merged_exons[-1][1], end)
+                # 计算覆盖区间与外显子并集的交集长度
+                merged_cov = []
+                for s, e in sorted(covered):
+                    if not merged_cov or s > merged_cov[-1][1]:
+                        merged_cov.append([s, e])
+                    else:
+                        merged_cov[-1][1] = max(merged_cov[-1][1], e)
+                i = j = 0
+                while i < len(merged_exons) and j < len(merged_cov):
+                    a_start, a_end = merged_exons[i]
+                    b_start, b_end = merged_cov[j]
+                    if a_end <= b_start:
+                        i += 1
+                        continue
+                    if b_end <= a_start:
+                        j += 1
+                        continue
+                    inter_start = max(a_start, b_start)
+                    inter_end = min(a_end, b_end)
+                    if inter_end > inter_start:
+                        covered_len += (inter_end - inter_start)
+                    if a_end < b_end:
+                        i += 1
+                    else:
+                        j += 1
+            geneReadCoveredLength = int(covered_len)
+
         gene_metrics[gene_id] = {
-            'genelonesttxlength': genelonesttxlength,
-            'genelongestcdslength': genelongestcdslength,
-            'geneEffectiveLength': geneEffectiveLength
+            'genelongesttxLength': genelongesttxLength,
+            'genelongestcdsLength': genelongestcdsLength,
+            'geneEffectiveLength': geneEffectiveLength,
+            'geneNonOverlapLength': int(non_overlap_len),
+            'geneReadCoveredLength': geneReadCoveredLength,
         }
-    
+
     return gene_metrics
+
+def validate_gene_non_overlap_length(df, sample_genes=None):
+    """验证 geneNonOverlapLength 的基本正确性与范围
+    - 检查非负
+    - 检查不超过所有转录本外显子并集长度
+    - 可选：对指定基因重算并集长度进行精确比对
+    """
+    ok = True
+    if 'geneNonOverlapLength' not in df.columns or 'geneName' not in df.columns:
+        return False
+    # 简单范围检查
+    if (df['geneNonOverlapLength'] < 0).any():
+        ok = False
+    # 精确比对（采样）
+    if sample_genes:
+        for g in sample_genes:
+            sub = df[df['geneName'] == g]
+            exons = []
+            for _, row in sub.iterrows():
+                starts = row.get('exonStarts_list', [])
+                ends = row.get('exonEnds_list', [])
+                exons.extend(list(zip(starts, ends)))
+            union = calculate_region_length(exons)
+            expected = int(union)
+            observed = int(sub['geneNonOverlapLength'].max()) if not sub.empty else 0
+            if observed != expected:
+                ok = False
+                break
+    return ok
+
+def validate_gene_read_covered_length(df):
+    """验证 geneReadCoveredLength 的基本正确性
+    - 非负
+    - 不超过 geneEffectiveLength
+    """
+    if 'geneReadCoveredLength' not in df.columns:
+        return False
+    if (df['geneReadCoveredLength'] < 0).any():
+        return False
+    if 'geneEffectiveLength' in df.columns:
+        if (df['geneReadCoveredLength'] > df['geneEffectiveLength']).any():
+            return False
+    return True
 
 def convert_to_rna_coordinates(genomic_df):
     """
@@ -219,8 +321,8 @@ def load_refflat_to_dataframe(input_file):
         'cdsStart', 'cdsEnd', 'exonCount', 'exonStarts', 'exonEnds',
         'genename', 'g_biotype', 't_biotype', 'protein_id',
         'txLength', 'cdsLength', 'utr5Length', 'utr3Length',
-        'genelonesttxlength', 'genelongestcdslength', 'geneEffectiveLength',
-        'description'
+        'genelongesttxLength', 'genelongestcdsLength', 'geneEffectiveLength',
+        'geneNonOverlapLength', 'geneReadCoveredLength', 'description'
     ]
 
     # Read the refflat file into a DataFrame
@@ -237,9 +339,13 @@ def load_refflat_to_dataframe(input_file):
     df['cdsLength'] = df['cdsLength'].astype(int)
     df['utr5Length'] = df['utr5Length'].astype(int)
     df['utr3Length'] = df['utr3Length'].astype(int)
-    df['genelonesttxlength'] = df['genelonesttxlength'].astype(int)
-    df['genelongestcdslength'] = df['genelongestcdslength'].astype(int)
+    df['genelongesttxLength'] = df['genelongesttxLength'].astype(int)
+    df['genelongestcdsLength'] = df['genelongestcdsLength'].astype(int)
     df['geneEffectiveLength'] = df['geneEffectiveLength'].astype(int)
+    if 'geneNonOverlapLength' in df.columns:
+        df['geneNonOverlapLength'] = df['geneNonOverlapLength'].astype(int)
+    if 'geneReadCoveredLength' in df.columns:
+        df['geneReadCoveredLength'] = df['geneReadCoveredLength'].astype(int)
 
     # Reconstruct exonStarts_list and exonEnds_list from string columns
     # These are needed for convert_to_rna_coordinates and track generation
@@ -429,12 +535,16 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
     gene_metrics = calculate_gene_length_metrics(df)
     
     # Add gene-level metrics to transcripts
-    df['genelonesttxlength'] = df['geneName'].map(
-        lambda x: gene_metrics.get(x, {}).get('genelonesttxlength', 0))
-    df['genelongestcdslength'] = df['geneName'].map(
-        lambda x: gene_metrics.get(x, {}).get('genelongestcdslength', 0))
+    df['genelongesttxLength'] = df['geneName'].map(
+        lambda x: gene_metrics.get(x, {}).get('genelongesttxLength', 0))
+    df['genelongestcdsLength'] = df['geneName'].map(
+        lambda x: gene_metrics.get(x, {}).get('genelongestcdsLength', 0))
     df['geneEffectiveLength'] = df['geneName'].map(
         lambda x: gene_metrics.get(x, {}).get('geneEffectiveLength', 0))
+    df['geneNonOverlapLength'] = df['geneName'].map(
+        lambda x: gene_metrics.get(x, {}).get('geneNonOverlapLength', 0))
+    df['geneReadCoveredLength'] = df['geneName'].map(
+        lambda x: gene_metrics.get(x, {}).get('geneReadCoveredLength', 0))
     
     # Prepare exon columns for output
     def prepare_exon_columns(row):
@@ -462,7 +572,8 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
     extra_columns = [
         'genename', 'g_biotype', 't_biotype', 'protein_id',
         'txLength', 'cdsLength', 'utr5Length', 'utr3Length',
-        'genelonesttxlength', 'genelongestcdslength', 'geneEffectiveLength', 'description',
+        'genelongesttxLength', 'genelongestcdsLength', 'geneEffectiveLength',
+        'geneNonOverlapLength', 'geneReadCoveredLength', 'description',
         'exonStarts_list','exonEnds_list',
     ]
     
@@ -494,7 +605,8 @@ def save_refflat_dataframe(df, output_file, add_header=False, is_rna=False):
         'cdsStart', 'cdsEnd', 'exonCount', 'exonStarts', 'exonEnds',
         'genename', 'g_biotype', 't_biotype', 'protein_id',
         'txLength', 'cdsLength', 'utr5Length', 'utr3Length',
-        'genelonesttxlength', 'genelongestcdslength', 'geneEffectiveLength',
+        'genelongesttxLength', 'genelongestcdsLength', 'geneEffectiveLength',
+        'geneNonOverlapLength', 'geneReadCoveredLength',
         'description'
     ]
     

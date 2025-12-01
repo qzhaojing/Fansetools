@@ -12,7 +12,7 @@ class PathProcessor:
     # 支持的fastq文件扩展名
     FASTQ_EXTENSIONS = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
     # 支持的fanse文件扩展名  
-    FANSE_EXTENSIONS = ['.fanse3', '.fanse3.gz']
+    FANSE_EXTENSIONS = ['.fanse3', '.fanse3.gz', '.fanse3.zip']
     
     def __init__(self, logger=None):
         self.logger = logger or logging.getLogger(__name__)

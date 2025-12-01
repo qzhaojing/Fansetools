@@ -44,11 +44,11 @@ setup(
     install_requires=[
         'tqdm>=4.0.0',
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
-        'pandas', 
-        'biopython',
-         'packaging', 
-        'requests', 
-        #'cutadapt', 
+        'pandas>=1.0.0',
+        'biopython>=1.78',
+        'packaging>=20.0',
+        'requests>=2.20.0',
+        # 'cutadapt',  # 如需 cutadapt 功能，请取消注释
     ],
 
     extras_require={

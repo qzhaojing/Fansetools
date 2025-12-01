@@ -5,9 +5,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import paramiko
 from dataclasses import dataclass
+# 修正：Windows下支持ESC键检测用于中断watch
+try:
+    import msvcrt  # Windows 控制台按键检测
+    _HAS_MSVCRT = True
+except Exception:
+    _HAS_MSVCRT = False
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import queue  # 新增：用于动态任务队列
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import glob  # 修正：本地扩展 -i 通配符
 
 @dataclass
 class ClusterNode:
@@ -15,12 +24,13 @@ class ClusterNode:
     name: str
     host: str
     user: str
-    fanse_path: str
+    fanse_path: Optional[str] = None  # 修正：Linux节点可不设置fanse可执行路径
     key_path: Optional[str] = None
     password: Optional[str] = None
     port: int = 22
     max_jobs: int = 1
     enabled: bool = True
+    work_dir: Optional[str] = None  # 修正：预留工作目录字段，便于后续 -w 更新
 
 class OptimizedClusterManager:
     """优化后的集群管理器"""
@@ -28,6 +38,7 @@ class OptimizedClusterManager:
     def __init__(self, config_dir: Path):
         self.config_dir = config_dir
         self.cluster_file = config_dir / "cluster.json"
+        self.status_file = config_dir / "cluster_status.json"  # 修正：缓存最近一次检查结果供 list 离线展示
         self.nodes: Dict[str, ClusterNode] = {}
         self._connection_pool: Dict[str, paramiko.SSHClient] = {}
         self._load_cluster_config()
@@ -54,7 +65,7 @@ class OptimizedClusterManager:
         except Exception as e:
             print(f"❌ 保存配置失败: {e}")
     
-    def _test_network_connectivity(self, host: str, port: int, timeout: int = 5) -> bool:
+    def _test_network_connectivity(self, host: str, port: int, timeout: int = 2) -> bool:
         """优化的网络连通性测试"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -64,7 +75,7 @@ class OptimizedClusterManager:
         except Exception:
             return False
     
-    def _create_ssh_connection(self, node: ClusterNode, timeout: int = 15) -> Optional[paramiko.SSHClient]:
+    def _create_ssh_connection(self, node: ClusterNode, timeout: int = 3) -> Optional[paramiko.SSHClient]:
         """创建SSH连接（带详细错误处理）"""
         try:
             ssh = paramiko.SSHClient()
@@ -195,35 +206,32 @@ class OptimizedClusterManager:
             if verbose:
                 print(f"  ✅ 检测为: {'Windows' if is_windows else 'Linux'}")
             
-            # 4. 验证路径存在性
-            if verbose:
-                print(f"  📁 验证路径: {node.fanse_path}")
-            path_exists = False
+            # 4. 验证路径存在性（修正：Windows/Linux 节点路径非必填，若提供则尝试验证）
             if is_windows:
-                path_exists = self._test_windows_path(ssh, node.fanse_path)
-            else:
-                path_exists = self._test_linux_path(ssh, node.fanse_path)
-            
-            if path_exists:
+                if node.fanse_path:
+                    if verbose:
+                        print(f"  📁 验证路径: {node.fanse_path}")
+                    path_ok = self._test_windows_path(ssh, node.fanse_path)
+                    if verbose:
+                        print("  ✅ 路径验证成功" if path_ok else "  ⚠️ 路径不可访问（可稍后更新）")
                 if verbose:
-                    print("  ✅ 路径验证成功")
+                    print("  ✅ Windows 节点连接通过")
                 return True
             else:
+                # Linux 节点：若未提供路径，直接认为连接成功；若提供路径，则尝试验证但失败不阻断
+                if node.fanse_path:
+                    if verbose:
+                        print(f"  📁 验证路径: {node.fanse_path}")
+                    _ = self._test_linux_path(ssh, node.fanse_path)
                 if verbose:
-                    print("  ❌ 路径不存在或不可访问")
-                    # 提供调试信息
-                    success, output, error = self._execute_remote_command(
-                        ssh, f'dir "{os.path.dirname(node.fanse_path)}"'
-                    )
-                    if success:
-                        print(f"  📂 目录内容: {output[:200]}...")
-                return False
+                    print("  ✅ Linux 节点连接与环境检测通过")
+                return True
                 
         finally:
             ssh.close()
     
-    def add_node(self, name: str, host: str, user: str, fanse_path: str, 
-                 key_path: str = None, password: str = None, port: int = 22) -> bool:
+    def add_node(self, name: str, host: str, user: str, fanse_path: Optional[str] = None, 
+                 key_path: Optional[str] = None, password: Optional[str] = None, port: int = 22) -> bool:
         """优化的添加节点方法"""
         if name in self.nodes:
             raise ValueError(f"节点 '{name}' 已存在")
@@ -241,7 +249,7 @@ class OptimizedClusterManager:
         steps = [
             ("网络连通性", self._test_network_connectivity, (host, port)),
             ("SSH连接", lambda: bool(self._create_ssh_connection(node)), ()),
-            ("路径具备", self.test_node_connection, (node, False))
+            ("环境检测", self.test_node_connection, (node, False))
         ]
         
         for step_name, test_func, test_args in steps:
@@ -255,15 +263,7 @@ class OptimizedClusterManager:
             except Exception as e:
                 print(f"❌ ({e})")
                 return False
-        # 在路径验证失败时尝试自动拷贝
-        if not path_exists:
-            print(f"  📦📦 目标路径不存在，尝试自动部署FANSe3...")
-            if self._deploy_fanse_to_remote(node, ssh):
-                print("  ✅ FANSe3部署成功")
-                path_exists = True
-            else:
-                print("  ❌❌ 自动部署失败")
-                return False
+        # 修正：添加阶段不再强制部署FANSe3，后续可通过 update 命令更新路径
         
         # 保存节点配置
         self.nodes[name] = node
@@ -271,8 +271,8 @@ class OptimizedClusterManager:
         
         print("=" * 60)
         print(f"✅ 节点 '{name}' 添加成功!")
-        print(f"   地址: {user}@{host}:{port}")
-        print(f"   路径: {fanse_path}")
+        print(f"   地址: {node.user}@{node.host}:{node.port}")
+        print(f"   路径: {node.fanse_path if node.fanse_path else '-'}")
         print("=" * 60)
         return True
     
@@ -326,6 +326,109 @@ class OptimizedClusterManager:
         return None
     
     
+    def install_node_software(self, node: ClusterNode, install_conda: bool, install_fansetools: bool, pip_mirror: str) -> bool:
+        """在节点上安装软件（Conda/fansetools）"""
+        print(f"🔧 正在节点 '{node.name}' 上执行安装任务...")
+        ssh = self._create_ssh_connection(node)
+        if not ssh:
+            print(f"❌ 无法连接到节点 '{node.name}'")
+            return False
+        
+        try:
+            is_windows = self._is_windows_system(ssh)
+            cmd = ""
+            
+            if is_windows:
+                # Windows 安装脚本 (PowerShell)
+                # 构建一个复合命令串
+                ps_lines = [
+                    '$ErrorActionPreference = "Stop"',
+                    'Write-Host "--- Windows 安装环境检查 ---"'
+                ]
+                
+                if install_conda:
+                    ps_lines.extend([
+                        'if (-not (Test-Path "$env:USERPROFILE\\miniconda3")) {',
+                        '  Write-Host "正在下载 Miniconda..."',
+                        '  $installer = "$env:TEMP\\miniconda_setup.exe"',
+                        '  Invoke-WebRequest -Uri "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe" -OutFile $installer',
+                        '  Write-Host "正在安装 Miniconda (静默模式)..."',
+                        '  Start-Process -FilePath $installer -ArgumentList "/S", "/D=$env:USERPROFILE\\miniconda3", "/RegisterPython=1", "/AddToPath=1" -Wait',
+                        '  Remove-Item $installer',
+                        '  Write-Host "Miniconda 安装完成"',
+                        '} else { Write-Host "Miniconda 目录已存在，跳过安装" }'
+                    ])
+                
+                if install_fansetools:
+                    ps_lines.extend([
+                        'Write-Host "正在安装 fansetools..."',
+                        '$py = "$env:USERPROFILE\\miniconda3\\python.exe"',
+                        'if (-not (Test-Path $py)) { $py = "python" }',
+                        f'& $py -m pip install fansetools -i {pip_mirror} --upgrade',
+                        'Write-Host "fansetools 安装/更新完成"'
+                    ])
+                
+                full_script = "; ".join(ps_lines)
+                cmd = f'powershell -NoProfile -Command "{full_script}"'
+                
+            else:
+                # Linux 安装脚本 (Bash)
+                sh_lines = [
+                    'set -e',
+                    'echo "--- Linux 安装环境检查 ---"'
+                ]
+                
+                if install_conda:
+                    sh_lines.extend([
+                        'if [ ! -d "$HOME/miniconda3" ]; then',
+                        '  echo "正在下载 Miniconda..."',
+                        '  wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh',
+                        '  echo "正在安装 Miniconda..."',
+                        '  bash ~/miniconda.sh -b -p $HOME/miniconda3',
+                        '  rm ~/miniconda.sh',
+                        '  $HOME/miniconda3/bin/conda init bash',
+                        '  echo "Miniconda 安装完成"',
+                        'else',
+                        '  echo "Miniconda 目录已存在，跳过安装"',
+                        'fi'
+                    ])
+                
+                if install_fansetools:
+                    sh_lines.extend([
+                        'echo "正在安装 fansetools..."',
+                        'source $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true',
+                        'conda activate base 2>/dev/null || true',
+                        f'pip install fansetools -i {pip_mirror} --upgrade',
+                        'echo "fansetools 安装/更新完成"'
+                    ])
+                
+                # 构造单行命令
+                full_script = "\n".join(sh_lines)
+                # 转义双引号
+                full_script_escaped = full_script.replace('"', '\\"')
+                cmd = f'bash -c "{full_script_escaped}"'
+            
+            # 执行并实时输出
+            print(f"🚀 发送指令到 '{node.name}'...")
+            stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=True)
+            
+            for line in iter(stdout.readline, ""):
+                print(f"  [{node.name}] {line.strip()}")
+                
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == 0:
+                print(f"✅ 节点 '{node.name}' 任务成功")
+                return True
+            else:
+                print(f"❌ 节点 '{node.name}' 任务失败 (Code {exit_status})")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 安装异常: {e}")
+            return False
+        finally:
+            ssh.close()
+
     def remove_node(self, name: str):
         """移除节点"""
         if name not in self.nodes:
@@ -337,11 +440,207 @@ class OptimizedClusterManager:
         """列出所有节点"""
         return list(self.nodes.values())
     
-    def check_all_nodes_parallel(self, max_workers: int = 3) -> Dict[str, bool]:
-        """并行检查所有节点状态"""
+    def check_all_nodes_parallel(self, max_workers: int = 3, detail: bool = False) -> Dict[str, Dict[str, any]]:
+        """并行检查所有节点状态，返回详细信息
+        修正说明：此函数返回 {node_name: info_dict}，不再返回布尔值。
+        适配调用方时需使用 info['online'] 判断在线状态。
+        """
+        def _collect_node_info(node: ClusterNode) -> Dict[str, any]:
+            """收集单个节点的完整信息"""
+            info = {
+                'online': False,
+                'response_time': None,
+                'cpu_cores': None,
+                'cpu_usage': None,
+                'cpu_model': None,   # 修正：新增CPU型号
+                'cpu_freq_mhz': None,  # 修正：新增CPU当前频率
+                'memory_usage': None,
+                'disk_usage': None,
+                'load_avg': None,
+                'net_rx_mbps': None,
+                'net_tx_mbps': None,
+                'kernel_version': None  # 修正：detail模式下新增Linux内核版本
+            }
+            
+            # 1. 网络连通性与响应时间
+            start = time.time()
+            if not self._test_network_connectivity(node.host, node.port, timeout=2):
+                return info
+            info['response_time'] = round((time.time() - start) * 1000, 2)  # ms
+            
+            # 2. SSH连接
+            ssh = self._create_ssh_connection(node, timeout=3)
+            if not ssh:
+                return info
+            info['online'] = True
+            
+            try:
+                is_windows = self._is_windows_system(ssh)
+                
+                # 3. CPU核数
+                if is_windows:
+                    cmd = 'wmic cpu get NumberOfCores /value'
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success and 'NumberOfCores=' in out:
+                        info['cpu_cores'] = int(out.split('NumberOfCores=')[1].strip())
+                else:
+                    cmd = 'nproc'
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success and out.isdigit():
+                        info['cpu_cores'] = int(out)
+                
+                # 4. CPU使用率
+                if is_windows:
+                    cmd = 'wmic cpu get loadpercentage /value'
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success and 'LoadPercentage=' in out:
+                        info['cpu_usage'] = f"{out.split('LoadPercentage=')[1].strip()}%"
+                    # 修正：采集CPU型号与频率
+                    cmd = 'wmic cpu get Name,CurrentClockSpeed /value'
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success:
+                        m_name = re.search(r'Name=(.+)', out)
+                        m_freq = re.search(r'CurrentClockSpeed=(\d+)', out)
+                        if m_name:
+                            info['cpu_model'] = m_name.group(1).strip()
+                        if m_freq:
+                            info['cpu_freq_mhz'] = int(m_freq.group(1))
+                else:
+                    cmd = "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1"
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success:
+                        info['cpu_usage'] = f"{float(out):.1f}%"
+                    # 修正：采集CPU型号与频率（Linux）
+                    # 型号
+                    cmd = "lscpu | sed -n 's/Model name:\\s*//p'"
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success and out:
+                        info['cpu_model'] = out.strip()
+                    else:
+                        cmd = "awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo"
+                        success, out, _ = self._execute_remote_command(ssh, cmd)
+                        if success and out:
+                            info['cpu_model'] = out.strip()
+                    # 频率（取平均MHz）
+                    cmd = "awk -F: '/cpu MHz/ {sum+=$2; cnt++} END {if(cnt>0) printf \"%.0f\", sum/cnt}' /proc/cpuinfo"
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success and out:
+                        try:
+                            info['cpu_freq_mhz'] = int(float(out))
+                        except:
+                            pass
+                
+                # 5. 内存使用率
+                if is_windows:
+                    cmd = 'wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value'
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success:
+                        total = round(int(re.search(r'TotalVisibleMemorySize=(\d+)', out).group(1))/1e6, 1)
+                        free  = round(int(re.search(r'FreePhysicalMemory=(\d+)', out).group(1))/1e6, 1)
+                        used_percent = (total - free) / total * 100
+                        info['memory_usage'] = f"{(total - free):.1f}/{total:.1f} GB, {used_percent:.1f}%"
+                else:
+                    # 修正：显示已用/总量（GB）和百分比
+                    cmd = "free -b | awk '/Mem:/ {printf \"%.1f/%.1f GB, %.1f%%\", $3/1e9, $2/1e9, ($3/$2)*100}'"
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success and out:
+                        info['memory_usage'] = out.strip()
+                
+                # 6. 本地硬盘使用情况（取根分区）
+                if is_windows:
+                    cmd = 'wmic logicaldisk get size,freespace,caption | findstr "^C:"'
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success:
+                        parts = out.split()
+                        free  = round(int(parts[1])/1e9, 1)
+                        total = round(int(parts[2])/1e9, 1)
+                        used_percent = (total - free) / total * 100
+                        info['disk_usage'] = f"C: {(total - free):.1f}/{total:.1f} GB, {used_percent:.1f}%"
+                else:
+                    # 修正：显示已用/总量与百分比
+                    cmd = "df -B1 / | tail -1 | awk '{printf \"%.1f/%.1f GB, %s\", $3/1e9, $2/1e9, $5}'"
+                    success, out, _ = self._execute_remote_command(ssh, cmd)
+                    if success:
+                        info['disk_usage'] = f"/ {out.strip()}"
+
+                # 7. 负载均值 & 网络带宽（detail模式）
+                if detail:
+                    if is_windows:
+                        # Windows 无标准loadavg，网络带宽尝试获取，每秒采样一次
+                        # 负载均值使用CPU百分比近似或置为'-'
+                        info['load_avg'] = '-'
+                        cmd = 'wmic path Win32_PerfFormattedData_Tcpip_NetworkInterface get BytesReceivedPersec,BytesSentPersec /value'
+                        success1, out1, _ = self._execute_remote_command(ssh, cmd)
+                        time.sleep(1)
+                        success2, out2, _ = self._execute_remote_command(ssh, cmd)
+                        if success1 and success2:
+                            try:
+                                r1 = sum(int(x) for x in re.findall(r'BytesReceivedPersec=(\d+)', out1))
+                                s1 = sum(int(x) for x in re.findall(r'BytesSentPersec=(\d+)', out1))
+                                r2 = sum(int(x) for x in re.findall(r'BytesReceivedPersec=(\d+)', out2))
+                                s2 = sum(int(x) for x in re.findall(r'BytesSentPersec=(\d+)', out2))
+                                rx_bps = max(0, r2 - r1)
+                                tx_bps = max(0, s2 - s1)
+                                info['net_rx_mbps'] = round(rx_bps * 8 / 1e6, 1)
+                                info['net_tx_mbps'] = round(tx_bps * 8 / 1e6, 1)
+                            except:
+                                pass
+                    else:
+                        # Linux 负载均值
+                        cmd = "cat /proc/loadavg | awk '{printf \"%s,%s,%s\", $1,$2,$3}'"
+                        success, out, _ = self._execute_remote_command(ssh, cmd)
+                        if success and out:
+                            info['load_avg'] = out.strip()
+                        # 修正：Linux 内核版本（uname -r）
+                        cmd = 'uname -r'
+                        success, out, _ = self._execute_remote_command(ssh, cmd)
+                        if success and out:
+                            info['kernel_version'] = out.strip()
+                        # Linux 网络带宽，采样两次 /proc/net/dev
+                        success, out1, _ = self._execute_remote_command(ssh, 'cat /proc/net/dev')
+                        time.sleep(1)
+                        success2, out2, _ = self._execute_remote_command(ssh, 'cat /proc/net/dev')
+                        if success and success2:
+                            def parse_netdev(text):
+                                stats = {}
+                                for line in text.splitlines():
+                                    if ':' in line:
+                                        name, data = line.split(':', 1)
+                                        name = name.strip()
+                                        parts = [p for p in data.strip().split() if p]
+                                        if len(parts) >= 10:
+                                            rx = int(parts[0])
+                                            tx = int(parts[8])
+                                            stats[name] = (rx, tx)
+                                return stats
+                            s1 = parse_netdev(out1)
+                            s2 = parse_netdev(out2)
+                            best_iface = None
+                            best_delta = -1
+                            for iface in s1:
+                                if iface in s2:
+                                    drx = s2[iface][0] - s1[iface][0]
+                                    dtx = s2[iface][1] - s1[iface][1]
+                                    delta = drx + dtx
+                                    if delta > best_delta and not iface.startswith(('lo',)):
+                                        best_delta = delta
+                                        best_iface = (drx, dtx)
+                            if best_iface:
+                                info['net_rx_mbps'] = round(best_iface[0] * 8 / 1e6, 1)
+                                info['net_tx_mbps'] = round(best_iface[1] * 8 / 1e6, 1)
+                        
+            except Exception as e:
+                # 静默忽略细节错误，保证主流程
+                pass
+            finally:
+                ssh.close()
+            
+            return info
+        
+        # 并行收集
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_node = {
-                executor.submit(self.test_node_connection, node, False): node.name 
+                executor.submit(_collect_node_info, node): node.name
                 for node in self.nodes.values()
             }
             
@@ -350,10 +649,27 @@ class OptimizedClusterManager:
                 node_name = future_to_node[future]
                 try:
                     results[node_name] = future.result()
-                except Exception as e:
-                    results[node_name] = False
-                    print(f"节点 {node_name} 检查异常: {e}")
+                except Exception:
+                    results[node_name] = {
+                        'online': False,
+                        'response_time': None,
+                        'cpu_cores': None,
+                        'cpu_usage': None,
+                        'memory_usage': None,
+                        'disk_usage': None
+                    }
             
+            # 修正：将最近一次检查结果写入本地缓存，供 list 离线展示
+            try:
+                cache = {
+                    'timestamp': time.time(),
+                    'results': results
+                }
+                self.config_dir.mkdir(parents=True, exist_ok=True)
+                with open(self.status_file, 'w', encoding='utf-8') as f:
+                    json.dump(cache, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
             return results
 
     # 在OptimizedClusterManager中添加以下方法
@@ -366,8 +682,14 @@ class OptimizedClusterManager:
         node = self.nodes.get(node_name)
         ssh = self._create_ssh_connection(node)
         return self._deploy_fanse_to_remote(node, ssh)
-    def monitor_node_execution(self, node_name: str, command: str):
-        """实时监控远程节点执行"""
+    def monitor_node_execution(self, node_name: str, command: str, quiet: bool = False, log_file: Optional[str] = None, prefix: Optional[str] = None, idle_timeout: Optional[int] = None, hard_timeout: Optional[int] = None, heartbeat_sec: int = 0, stop_event: Optional[any] = None):
+        """实时监控远程节点执行（支持静默、日志、心跳与超时）
+        修改说明：
+        - 增加 idle_timeout：长时间无输出判定假死并主动结束
+        - 增加 hard_timeout：总时长限制，超时后主动结束
+        - 增加 heartbeat_sec：启用SSH keepalive，避免长连接被断开
+        - 增加 stop_event：控制端触发中止时立即结束远端执行
+        """
         node = self.nodes.get(node_name)
         if not node:
             raise ValueError(f"节点不存在: {node_name}")
@@ -379,27 +701,143 @@ class OptimizedClusterManager:
         try:
             # 创建交互式会话
             transport = ssh.get_transport()
+            # 修正：开启SSH心跳，防止长时间运行被网络设备中断
+            try:
+                if heartbeat_sec and heartbeat_sec > 0:
+                    transport.set_keepalive(heartbeat_sec)
+            except Exception:
+                pass
             channel = transport.open_session()
             
             # 设置伪终端以获得实时输出
             channel.get_pty()
             channel.exec_command(command)
             
-            # 实时读取输出
+            # 实时读取输出（修正：稳健解码，避免UTF-8解码错误；支持静默、写日志、超时与心跳）
+            lf = None
+            if log_file:
+                try:
+                    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                    lf = open(log_file, 'a', encoding='utf-8', errors='ignore')
+                except Exception:
+                    lf = None
+            start_time = time.time()
+            last_activity = start_time
             while True:
+                # 修正：支持控制端中止（Ctrl+C触发的 stop_event）
+                if stop_event is not None and getattr(stop_event, 'is_set', None) and stop_event.is_set():
+                    try:
+                        if not quiet:
+                            print(f"{prefix or ''} 🔴 控制端请求终止，关闭远端会话")
+                        channel.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.kill_remote_fanse_processes(node_name)
+                    except Exception:
+                        pass
+                    return False
                 if channel.recv_ready():
-                    data = channel.recv(1024).decode('utf-8')
-                    print(data, end='', flush=True)
+                    raw = channel.recv(4096)
+                    try:
+                        data = raw.decode('utf-8', errors='ignore')
+                    except Exception:
+                        try:
+                            data = raw.decode('gbk', errors='ignore')
+                        except Exception:
+                            data = ''
+                    if data:
+                        last_activity = time.time()
+                        if lf:
+                            lf.write(data)
+                        if not quiet:
+                            if prefix:
+                                print(f"{prefix} {data}", end='', flush=True)
+                            else:
+                                print(data, end='', flush=True)
                 if channel.recv_stderr_ready():
-                    data = channel.recv_stderr(1024).decode('utf-8')
-                    print(f"[STDERR] {data}", end='', flush=True)
+                    raw_err = channel.recv_stderr(4096)
+                    try:
+                        data_err = raw_err.decode('utf-8', errors='ignore')
+                    except Exception:
+                        try:
+                            data_err = raw_err.decode('gbk', errors='ignore')
+                        except Exception:
+                            data_err = ''
+                    if data_err:
+                        last_activity = time.time()
+                        if lf:
+                            lf.write(data_err)
+                        if not quiet:
+                            if prefix:
+                                print(f"{prefix} [STDERR] {data_err}", end='', flush=True)
+                            else:
+                                print(f"[STDERR] {data_err}", end='', flush=True)
                 if channel.exit_status_ready():
                     break
+                # 修正：假死与超时检测
+                now = time.time()
+                if hard_timeout and hard_timeout > 0 and (now - start_time) > hard_timeout:
+                    try:
+                        if not quiet:
+                            print(f"{prefix or ''} ⚠️ 超过总时长限制({hard_timeout}s)，主动终止远程进程")
+                        channel.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.kill_remote_fanse_processes(node_name)
+                    except Exception:
+                        pass
+                    return False
+                if idle_timeout and idle_timeout > 0 and (now - last_activity) > idle_timeout:
+                    try:
+                        if not quiet:
+                            print(f"{prefix or ''} ⚠️ 长时间无输出({idle_timeout}s)，判定远端假死，主动结束")
+                        channel.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.kill_remote_fanse_processes(node_name)
+                    except Exception:
+                        pass
+                    return False
                 time.sleep(0.1)
-                    
+            if lf:
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+            
             exit_status = channel.recv_exit_status()
             return exit_status == 0
             
+        finally:
+            ssh.close()
+
+    # 修正：新增远程进程终止（Windows 节点）
+    def kill_remote_fanse_processes(self, node_name: str) -> bool:
+        node = self.nodes.get(node_name)
+        if not node:
+            return False
+        ssh = self._create_ssh_connection(node)
+        if not ssh:
+            return False
+        try:
+            is_windows = self._is_windows_system(ssh)
+            if is_windows:
+                cmds = [
+                    'taskkill /F /IM FANSe3g.exe /T',
+                    'taskkill /F /IM FANSe3.exe /T'
+                ]
+                ok = True
+                for cmd in cmds:
+                    success, _, _ = self._execute_remote_command(ssh, cmd)
+                    ok = ok and success
+                return ok
+            else:
+                return True
+        except Exception:
+            return False
         finally:
             ssh.close()
 
@@ -417,6 +855,45 @@ def cluster_command(args):
             )
             if not success:
                 return 1
+        
+        elif args.cluster_command == 'update':
+            # 修正：支持更新节点配置（host/user/password/key/port/fanse_path/max_jobs/enabled/work_dir）
+            name = getattr(args, 'name', None) or getattr(args, 'n', None)
+            node = cluster_mgr.nodes.get(name) if name else None
+            if not node:
+                print(f"❌ 节点 '{name}' 不存在")
+                return 1
+            changed = []
+            # 应用变更
+            if getattr(args, 'host', None):
+                node.host = args.host; changed.append('host')
+            if getattr(args, 'user', None):
+                node.user = args.user; changed.append('user')
+            if getattr(args, 'password', None):
+                node.password = args.password; changed.append('password')
+            if getattr(args, 'key', None):
+                node.key_path = args.key; changed.append('key')
+            if getattr(args, 'port', None):
+                node.port = args.port; changed.append('port')
+            if getattr(args, 'fanse_path', None):
+                node.fanse_path = args.fanse_path; changed.append('fanse_path')
+            if getattr(args, 'max_jobs', None) is not None:
+                node.max_jobs = args.max_jobs; changed.append('max_jobs')
+            if getattr(args, 'enable', False):
+                node.enabled = True; changed.append('enabled=TRUE')
+            if getattr(args, 'disable', False):
+                node.enabled = False; changed.append('enabled=FALSE')
+            if getattr(args, 'work_dir', None):
+                node.work_dir = args.work_dir; changed.append('work_dir')
+            cluster_mgr._save_cluster_config()
+            print(f"✅ 节点 '{name}' 已更新: {', '.join(changed) if changed else '无变更'}")
+            if getattr(args, 'test', False):
+                print(f"🔍 变更后测试节点 '{name}'...")
+                if cluster_mgr.test_node_connection(node):
+                    print("✅ 连接测试成功")
+                else:
+                    print("❌ 连接测试失败")
+                    return 1
                 
         elif args.cluster_command == 'remove':
             cluster_mgr.remove_node(args.name)
@@ -429,32 +906,536 @@ def cluster_command(args):
                 return
                 
             print("🏢 集群节点列表:")
-            print("-" * 80)
-            status_map = cluster_mgr.check_all_nodes_parallel()
-            
-            for node in nodes:
-                status = "✅" if status_map.get(node.name, False) else "❌"
-                auth_type = "密钥" if node.key_path else "密码"
-                print(f"{status} {node.name}")
-                print(f"   地址: {node.user}@{node.host}:{node.port}")
-                print(f"   路径: {node.fanse_path}")
-                print(f"   认证: {auth_type}")
-                print(f"   状态: {'在线' if status_map.get(node.name, False) else '离线'}")
+            # 离线读取缓存
+            status_map = {}
+            try:
+                with open(cluster_mgr.status_file, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+                    status_map = cache.get('results', {}) or {}
+            except Exception:
+                status_map = {}
+
+            if getattr(args, 'table', False):
+                headers = ['Name','Online','Resp(ms)','CPU','Mem','Disk','Address','Path','Auth']
+                print("-" * 120)
+                print(" ".join([f"{h:<10}" for h in headers]))
+                print("-" * 120)
+                for node in nodes:
+                    info = status_map.get(node.name, {})
+                    is_online = bool(info.get('online'))
+                    rt = info.get('response_time')
+                    cores = info.get('cpu_cores')
+                    cpu = info.get('cpu_usage')
+                    mem = info.get('memory_usage')
+                    disk = info.get('disk_usage')
+                    address = f"{node.user}@{node.host}:{node.port}"
+                    path = node.fanse_path if node.fanse_path else '-'
+                    auth = '密钥' if node.key_path else '密码'
+                    row = [
+                        f"{node.name:<10}",
+                        f"{'在线' if is_online else '离线':<10}",
+                        f"{(str(rt) if rt is not None else '-'):<10}",
+                        f"{(str(cores) if cores is not None else '-'):<10}",
+                        f"{(cpu if cpu is not None else '-'):<10}",
+                        f"{(mem if mem is not None else '-'):<10}",
+                        f"{address:<24}",
+                        f"{path:<24}",
+                        f"{auth:<8}"
+                    ]
+                    print(" ".join(row))
+                print("-" * 120)
+            else:
                 print("-" * 80)
+                for node in nodes:
+                    info = status_map.get(node.name, {})
+                    is_online = bool(info.get('online'))
+                    status = "✅" if is_online else "❌"
+                    auth_type = "密钥" if node.key_path else "密码"
+                    # print(f"{status} {node.name}")
+                    # print(f"   地址: {node.user}@{node.host}:{node.port}")
+                    # print(f"   路径: {node.fanse_path if node.fanse_path else '-'}")
+                    # print(f"   认证: {auth_type}")
+                    # print(f"   状态: {'在线' if is_online else '离线'}")
+                    rt = info.get('response_time')
+                    cores = info.get('cpu_cores')
+                    cpu = info.get('cpu_usage')
+                    mem = info.get('memory_usage')
+                    disk = info.get('disk_usage')
+                    # print(f"   响应: {rt if rt is not None else '-'} ms")
+                    # print(f"   CPU核: {cores if cores is not None else '-'}")
+                    # print(f"   CPU用量: {cpu if cpu is not None else '-'}")
+                    # print(f"   内存用量: {mem if mem is not None else '-'}")
+                    # print(f"   磁盘用量: {disk if disk is not None else '-'}")
+                    print(f"Node: {status} {node.name} | 地址: {node.user}@{node.host}:{node.port} | FANse路径: {node.fanse_path if node.fanse_path else '-'} | 认证: {auth_type} | CPU核心数: {cores if cores is not None else '-'} | 内存信息: {mem if mem is not None else '-'} | 磁盘信息: {disk if disk is not None else '-'} | 最近响应速度: {rt if rt is not None else '-'} ms")
+ 
+                    print("-" * 80)
                 
         elif args.cluster_command == 'check':
-            status_map = cluster_mgr.check_all_nodes_parallel()
-            if not status_map:
-                print("📭 集群中暂无节点")
-                return
+            # 修正：支持 --watch 实时刷新
+            interval = max(1, min(5, getattr(args, 'watch', 0) or 0))
+            iterations = getattr(args, 'count', 0) or 0
+            run_forever = interval > 0 and iterations == 0
+            loop_count = iterations if iterations > 0 else 1
+            try:
+                while True:
+                    status_map = cluster_mgr.check_all_nodes_parallel(detail=getattr(args, 'detail', False))
+                    if not status_map:
+                        print("📭 集群中暂无节点")
+                        return
+
+                    online_count = sum(1 for info in status_map.values() if info.get('online'))
+                    print(f"📊 节点状态: {online_count}/{len(status_map)} 在线")
+
+                    if getattr(args, 'table', False):
+                        headers = ['Name','Online','Resp(ms)','CPU','Mem','Disk','CPU模型','频率(MHz)']
+                        if getattr(args, 'detail', False):
+                            headers += ['Kernel','LoadAvg','Net RX','Net TX']  # 修正：detail增加Kernel列
+                        widths = [12,8,10,8,22,22,28,12]
+                        if getattr(args, 'detail', False):
+                            widths += [18,16,10,10]  # 修正：为Kernel与扩展列分配宽度
+                        sep_len = sum(widths) + len(widths) - 1
+                        print("-" * sep_len)
+                        print(" ".join([h.ljust(w) for h, w in zip(headers, widths)]))
+                        print("-" * sep_len)
+                        for name, info in status_map.items():
+                            is_online = bool(info.get('online'))
+                            rt = info.get('response_time')
+                            cores = info.get('cpu_cores')
+                            cpu = info.get('cpu_usage')
+                            mem = info.get('memory_usage')
+                            disk = info.get('disk_usage')
+                            model = info.get('cpu_model') or '-'
+                            freq = info.get('cpu_freq_mhz')
+                            freq_str = str(freq) if freq is not None else '-'
+                            row = [
+                                str(name),
+                                '在线' if is_online else '离线',
+                                str(rt) if rt is not None else '-',
+                                str(cores) if cores is not None else '-',
+                                mem if mem is not None else '-',
+                                disk if disk is not None else '-',
+                                model,
+                                freq_str
+                            ]
+                            if getattr(args, 'detail', False):
+                                row += [info.get('kernel_version') or '-',
+                                        info.get('load_avg') or '-',
+                                        str(info.get('net_rx_mbps')) if info.get('net_rx_mbps') is not None else '-',
+                                        str(info.get('net_tx_mbps')) if info.get('net_tx_mbps') is not None else '-']
+                            print(" ".join([str(v)[:widths[i]].ljust(widths[i]) for i, v in enumerate(row)]))
+                        print("-" * sep_len)
+                    else:
+                        for name, info in status_map.items():
+                            is_online = bool(info.get('online'))
+                            status_icon = "✅" if is_online else "❌"
+                            print(f"{status_icon} {name}: {'在线' if is_online else '离线'}")
+                            rt = info.get('response_time')
+                            cores = info.get('cpu_cores')
+                            cpu = info.get('cpu_usage')
+                            mem = info.get('memory_usage')
+                            disk = info.get('disk_usage')
+                            model = info.get('cpu_model') or '-'
+                            freq = info.get('cpu_freq_mhz')
+                            base = f"    响应: {rt if rt is not None else '-'} ms | 核心: {cores if cores is not None else '-'} | CPU: {cpu if cpu is not None else '-'} | 内存: {mem if mem is not None else '-'} | 磁盘: {disk if disk is not None else '-'} | 型号: {model} | 频率: {freq if freq is not None else '-'} MHz"
+                            if getattr(args, 'detail', False):
+                                base += f" | 内核: {info.get('kernel_version') or '-'} | 负载: {info.get('load_avg') or '-'} | 网速: RX {info.get('net_rx_mbps') if info.get('net_rx_mbps') is not None else '-'} Mb/s, TX {info.get('net_tx_mbps') if info.get('net_tx_mbps') is not None else '-'} Mb/s"
+                            print(base)
+
+                    if interval > 0:
+                        if not run_forever:
+                            loop_count -= 1
+                            if loop_count <= 0:
+                                break
+                        # 修正：支持Windows下ESC立即终止watch
+                        slept = 0.0
+                        step = 0.1
+                        while slept < interval:
+                            if _HAS_MSVCRT and msvcrt.kbhit():
+                                ch = msvcrt.getch()
+                                if ch in (b'\x1b',):  # ESC键
+                                    print("🔴 监控已终止（ESC）")
+                                    return
+                            time.sleep(step)
+                            slept += step
+                    else:
+                        break
+            except KeyboardInterrupt:
+                pass
                 
-            online_count = sum(status_map.values())
-            print(f"📊 节点状态: {online_count}/{len(status_map)} 在线")
-            
-            for name, is_online in status_map.items():
-                status_icon = "✅" if is_online else "❌"
-                print(f"{status_icon} {name}: {'在线' if is_online else '离线'}")
+        elif args.cluster_command == 'run':
+            # 修正：支持直接传 run 参数；支持 -n/--nodes 和 -p 自动选择
+            node_list = getattr(args, 'nodes', None)
+            jobs_file = getattr(args, 'jobs', None)
+            pick_n = int(getattr(args, 'p', 0) or 0)
+            wait_sec = int(getattr(args, 'wait', 0) or 0)
+            auto_yes = bool(getattr(args, 'yes', False))
+            quiet = bool(getattr(args, 'quiet', False))
+            log_dir = getattr(args, 'log_dir', None)
+            # 修正：读取运行稳定性参数
+            hard_timeout = int(getattr(args, 'timeout', 0) or 0)
+            idle_timeout = int(getattr(args, 'idle_timeout', 0) or 0)
+            heartbeat_sec = int(getattr(args, 'heartbeat', 0) or 0)
+            native_mode = bool(getattr(args, 'native', False))
+            # 修正：优先使用未知参数集合，以完整保留 -i/-r/-E 等原run参数
+            remainder = []
+            if hasattr(args, '_unknown') and args._unknown:
+                remainder.extend(list(args._unknown))
+            if getattr(args, 'command', []):
+                remainder.extend(list(getattr(args, 'command')))
+
+            def _build_remote_cmd(tokens: List[str], node_name: str) -> str:
+                # 修正：将原run参数组装为远程命令，默认前缀 'fanse run '
+                # 修正：为 -i/-r/-o 的参数值加引号，避免中文/空格路径被拆分
+                # 修正：支持 native 模式，直接调用 fanse3g.exe 并转换参数
                 
+                if native_mode:
+                    node = cluster_mgr.nodes.get(node_name)
+                    exe_path = node.fanse_path if node and node.fanse_path else "fanse3g.exe"
+                    
+                    # 解析并转换参数: -i -> -D, -r -> -R, -o -> -O
+                    # 保留其他参数
+                    cmd_parts = [f'"{exe_path}"'] if ' ' in exe_path else [exe_path]
+                    
+                    i = 0
+                    while i < len(tokens):
+                        t = tokens[i]
+                        if t == '-i':
+                            if i + 1 < len(tokens):
+                                val = tokens[i+1].strip('"')
+                                cmd_parts.append(f'-D"{val}"')
+                                i += 2
+                                continue
+                        elif t == '-r':
+                            if i + 1 < len(tokens):
+                                val = tokens[i+1].strip('"')
+                                cmd_parts.append(f'-R"{val}"')
+                                i += 2
+                                continue
+                        elif t == '-o':
+                            if i + 1 < len(tokens):
+                                val = tokens[i+1].strip('"')
+                                cmd_parts.append(f'-O"{val}"')
+                                i += 2
+                                continue
+                        elif t == '-y': # fanse3g 不需要 -y
+                            i += 1
+                            continue
+                        else:
+                            cmd_parts.append(t)
+                            i += 1
+                    return " ".join(cmd_parts)
+                
+                # 常规 fanse run 模式
+                safe_tokens: List[str] = []
+                i = 0
+                while i < len(tokens):
+                    t = tokens[i]
+                    safe_tokens.append(t)
+                    if t in ('-i', '-r', '-o') and (i + 1) < len(tokens):
+                        v = tokens[i + 1]
+                        if not (v.startswith('"') and v.endswith('"')):
+                            v = f'"{v}"'
+                        safe_tokens.append(v)
+                        i += 2
+                        continue
+                    i += 1
+                prefix = ['fanse', 'run']
+                return " ".join(prefix + safe_tokens)
+
+            # 选择节点集合：指定 -n 或者按响应时间选择 -p 台
+            selected_nodes: List[str] = []
+            if node_list:
+                selected_nodes = [n.strip() for n in str(node_list).split(',') if n.strip()]
+            elif pick_n > 0:
+                # 修正：支持等待节点就绪并选择最快N台
+                deadline = time.time() + max(0, wait_sec)
+                while True:
+                    status_map = cluster_mgr.check_all_nodes_parallel()
+                    candidates = [
+                        (name, info.get('response_time'))
+                        for name, info in status_map.items()
+                        if info.get('online') and isinstance(info.get('response_time'), (int, float))
+                    ]
+                    candidates.sort(key=lambda x: x[1])
+                    selected_nodes = [name for name, _ in candidates[:pick_n]]
+                    if selected_nodes:
+                        break
+                    if wait_sec > 0 and time.time() < deadline:
+                        # 支持ESC终止等待
+                        slept = 0.0
+                        step = 0.1
+                        while slept < 2.0:
+                            if _HAS_MSVCRT and msvcrt.kbhit():
+                                ch = msvcrt.getch()
+                                if ch in (b'\x1b',):
+                                    print("🔴 已终止等待（ESC）")
+                                    selected_nodes = []
+                                    break
+                            time.sleep(step)
+                            slept += step
+                        if selected_nodes:
+                            break
+                        continue
+                    break
+            else:
+                print("❌ 需要指定节点：使用 -n/--nodes 或 -p 选择最快N台")
+                return 1
+            if not selected_nodes:
+                print("❌ 未找到可用节点，请检查集群状态")
+                return 1
+
+            # 修正：运行 fanse run 时仅分发到 Windows 节点，自动跳过 Linux 节点
+            # 这样避免远端无 fanse.exe 的 Linux 系统导致执行失败
+            win_nodes: List[str] = []
+            skipped_nodes: List[str] = []
+            try:
+                for name in selected_nodes:
+                    node_obj = cluster_mgr.nodes.get(name)
+                    ssh = cluster_mgr._create_ssh_connection(node_obj)
+                    if not ssh:
+                        skipped_nodes.append(name)
+                        continue
+                    try:
+                        if cluster_mgr._is_windows_system(ssh):
+                            win_nodes.append(name)
+                        else:
+                            skipped_nodes.append(name)
+                    finally:
+                        ssh.close()
+            except KeyboardInterrupt:
+                print("\n🔴 已取消节点筛选，退出运行")
+                return 1
+            if not win_nodes:
+                print("❌ 所选节点均非Windows或不可连接，run命令将跳过Linux节点")
+                return 1
+            if skipped_nodes:
+                print(f"⚠️ 已跳过非Windows或不可连接节点: {', '.join(skipped_nodes)}")
+            selected_nodes = win_nodes
+
+            # 修正：输出可连接Windows节点列表与响应速度，便于快速确认
+            try:
+                status_map_print = cluster_mgr.check_all_nodes_parallel()
+                summary = []
+                for n in selected_nodes:
+                    info = status_map_print.get(n, {})
+                    rt = info.get('response_time')
+                    summary.append(f"{n}:{(str(rt)+'ms') if rt is not None else '-'}")
+                if summary:
+                    print(f"✅ 可连接Windows节点: {' | '.join(summary)}")
+            except Exception:
+                pass
+
+            # 准备作业列表：优先使用 --jobs，其次解析 -i 模式
+            jobs: List[List[str]] = []
+            if jobs_file:
+                try:
+                    with open(jobs_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s or s.startswith('#'):
+                                continue
+                            tokens = s.split()
+                            if ('-i' not in tokens) or ('-r' not in tokens):
+                                print(f"❌ 作业行缺少必要参数 -i/-r: {s}")
+                                return 1
+                            jobs.append(tokens)
+                except Exception as e:
+                    print(f"❌ 读取作业文件失败: {e}")
+                    return 1
+            else:
+                # 修正：解析 -i <pattern>，在首个选定节点上展开为文件列表
+                tokens = list(remainder)
+                # 修正：最少参数校验 -i/-r
+                if ('-r' not in tokens):
+                    print("❌ 缺少必要参数: -r <参考序列路径>")
+                    return 1
+                try:
+                    i_idx = tokens.index('-i')
+                except ValueError:
+                    i_idx = -1
+                if i_idx >= 0 and i_idx + 1 < len(tokens):
+                    pattern = tokens[i_idx + 1]
+                    # 修正：解析 -o 参数（若为目录，为每个输入生成专属输出文件）
+                    o_val = None
+                    try:
+                        o_idx = tokens.index('-o')
+                        if o_idx + 1 < len(tokens):
+                            o_val = tokens[o_idx + 1]
+                    except ValueError:
+                        o_val = None
+                    first_node = selected_nodes[0]
+                    # 根据远端系统类型选择展开命令
+                    node_obj = cluster_mgr.nodes.get(first_node)
+                    ssh = cluster_mgr._create_ssh_connection(node_obj)
+                    if not ssh:
+                        print(f"❌ 无法连接用于解析输入的节点: {first_node}")
+                        return 1
+                    try:
+                        is_win = cluster_mgr._is_windows_system(ssh)
+                        if is_win:
+                            # 修正：使用PowerShell并设置UTF-8输出编码，避免中文路径乱码
+                            # -File 仅文件；-ErrorAction 静默错误；输出 FullName
+                            cmd = (
+                                'powershell -NoProfile -Command '
+                                f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                                f"Get-ChildItem -Path \"{pattern}\" -File -ErrorAction SilentlyContinue | ForEach-Object {{ $_.FullName }}"
+                            )
+                        else:
+                            cmd = f'ls -1 {pattern}'
+                        success, out, _ = cluster_mgr._execute_remote_command(ssh, cmd)
+                        files = [line.strip() for line in (out or '').splitlines() if line.strip()]
+                    finally:
+                        ssh.close()
+                    if not files:
+                        # 修正：远端未匹配到文件时，回退到本地展开（适配UNC与中文路径）
+                        # 优先目录展开，其次通配符展开
+                        try:
+                            p_clean = pattern.strip('"')
+                            if os.path.isdir(p_clean):
+                                try:
+                                    names = os.listdir(p_clean)
+                                    files = [os.path.normpath(os.path.join(p_clean, nm)) for nm in names if os.path.isfile(os.path.join(p_clean, nm))]
+                                except Exception:
+                                    files = []
+                            if not files:
+                                local_files = glob.glob(p_clean)
+                                files = [os.path.normpath(f) for f in local_files if os.path.isfile(f)]
+                        except Exception:
+                            files = []
+                        if not files:
+                            print(f"📭 未解析到匹配的输入文件: {pattern}")
+                            return 1
+                    # 以每个文件生成一条作业，将 -i 参数替换为具体文件
+                    base = tokens[:i_idx] + tokens[i_idx+2:]
+                    for f in files:
+                        jt = base + ['-i', f]
+                        # 修正：-o 为目录时，按输入文件名生成唯一输出文件，避免目录解析错误
+                        if o_val:
+                            try:
+                                out_dir = o_val.strip('"')
+                                file_base = os.path.basename(f.strip('"'))
+                                out_file = os.path.join(out_dir, f"{file_base}.fanse3")
+                                try:
+                                    oi = jt.index('-o')
+                                    if oi + 1 < len(jt):
+                                        jt[oi + 1] = out_file
+                                    else:
+                                        jt.extend(['-o', out_file])
+                                except ValueError:
+                                    jt.extend(['-o', out_file])
+                            except Exception:
+                                pass
+                        # 修正：为 fanse run 自动添加 -y，确保非交互
+                        if '-y' not in jt:
+                            jt.append('-y')
+                        jobs.append(jt)
+                else:
+                    # 无 -i 模式，作为单作业直接运行
+                    # 修正：最少参数校验 -i 缺失
+                    print("❌ 缺少必要参数: -i <输入文件或通配符>")
+                    return 1
+
+            # 分发并并发执行（新增：动态任务队列，支持抢占式调度）
+            job_queue = queue.Queue()
+            for j in jobs:
+                job_queue.put(j)
+            print(f"🚀 将 {len(jobs)} 个作业放入动态队列，由 {len(selected_nodes)} 个节点抢占执行：{', '.join(selected_nodes)}")
+
+            # 进度条初始化（tqdm），若不可用则回退为简单计数
+            pbar = None
+            progress_failed = 0
+            try:
+                from tqdm import tqdm  # 仅在需要时导入
+                pbar = tqdm(total=len(jobs), desc="cluster run 进度", unit="job")
+            except Exception:
+                pbar = None
+
+            import threading
+            lock = threading.Lock()
+
+            futures = []
+            import threading
+            stop_event = threading.Event()
+            try:
+                with ThreadPoolExecutor(max_workers=len(selected_nodes)) as executor:
+                    for node in selected_nodes:
+                        def run_node_jobs(n=node):
+                            nonlocal pbar, progress_failed
+                            while True:
+                                if stop_event.is_set():
+                                    return False
+                                try:
+                                    jt = job_queue.get(block=False)
+                                except queue.Empty:
+                                    break
+                                
+                                # 修正：为 fanse run 自动添加 -y（双保险）
+                                if not native_mode and '-y' not in jt:
+                                    jt.append('-y')
+                                
+                                remote_cmd = _build_remote_cmd(jt, n)
+                                # print(f"➡️ [{n}] {remote_cmd}") # 减少刷屏，仅出错或debug显示
+                                
+                                # 修正：输出管理：前缀与日志文件
+                                job_input = None
+                                try:
+                                    ii = jt.index('-i')
+                                    if ii + 1 < len(jt):
+                                        job_input = jt[ii + 1].strip('"')
+                                except Exception:
+                                    pass
+                                log_file = None
+                                if log_dir and job_input:
+                                    try:
+                                        base = os.path.basename(job_input)
+                                        ts = int(time.time())
+                                        log_file = os.path.join(log_dir, f"{n}_{base}_{ts}.log")
+                                    except Exception:
+                                        log_file = None
+                                
+                                ok = cluster_mgr.monitor_node_execution(n, remote_cmd, quiet=quiet, log_file=log_file, prefix=f"[{n}]", idle_timeout=idle_timeout or None, hard_timeout=hard_timeout or None, heartbeat_sec=heartbeat_sec, stop_event=stop_event)
+                                
+                                with lock:
+                                    if pbar:
+                                        pbar.update(1)
+                                    else:
+                                        print(f"✅ [{n}] 完成 1 项（剩余 {job_queue.qsize()}）")
+                                    if not ok:
+                                        progress_failed += 1
+                                        print(f"❌ 节点 {n} 执行失败: {remote_cmd}")
+                                
+                                job_queue.task_done()
+                                
+                                if stop_event.is_set():
+                                    return False
+                            return True
+                        futures.append(executor.submit(run_node_jobs))
+                    all_ok = True
+                    for fut in as_completed(futures):
+                        try:
+                            if not fut.result():
+                                all_ok = False
+                        except Exception as e:
+                            print(f"❌ 并发执行错误: {e}")
+                            all_ok = False
+            except KeyboardInterrupt:
+                print("\n🔴 接收到终止请求，正在停止远程作业...")
+                stop_event.set()
+                for n in selected_nodes:
+                    try:
+                        cluster_mgr.kill_remote_fanse_processes(n)
+                    except Exception:
+                        pass
+                print("🛑 远程作业已发送终止信号（Windows节点 taskkill）")
+                return 1
+            finally:
+                if pbar:
+                    pbar.close()
+                if progress_failed:
+                    print(f"⚠️ 共有 {progress_failed} 项作业失败")
+
+            return 0 if progress_failed == 0 else 1
+
         elif args.cluster_command == 'test':
             node = cluster_mgr.nodes.get(args.name)
             if not node:
@@ -468,6 +1449,39 @@ def cluster_command(args):
                 print(f"❌ 节点 '{args.name}' 连接测试失败")
                 return 1
                 
+        elif args.cluster_command == 'install':
+            target_nodes = []
+            if args.nodes.lower() == 'all':
+                target_nodes = list(cluster_mgr.nodes.values())
+            else:
+                names = [n.strip() for n in args.nodes.split(',') if n.strip()]
+                for name in names:
+                    node = cluster_mgr.nodes.get(name)
+                    if node:
+                        target_nodes.append(node)
+                    else:
+                        print(f"⚠️ 节点 '{name}' 不存在，跳过")
+            
+            if not target_nodes:
+                print("❌ 未指定有效节点")
+                return 1
+            
+            print(f"📦 准备在 {len(target_nodes)} 个节点上安装软件...")
+            success_count = 0
+            for node in target_nodes:
+                print("-" * 60)
+                if cluster_mgr.install_node_software(
+                    node, 
+                    install_conda=args.conda, 
+                    install_fansetools=args.fansetools, 
+                    pip_mirror=args.pip_mirror
+                ):
+                    success_count += 1
+            
+            print("-" * 60)
+            print(f"✅ 安装完成: {success_count}/{len(target_nodes)} 成功")
+            return 0 if success_count == len(target_nodes) else 1
+
         else:
             print("❌ 未知的子命令")
             return 1
@@ -546,7 +1560,7 @@ FANSe3 集群管理工具
     add_parser.add_argument('name', help='节点唯一标识名称')
     add_parser.add_argument('host', help='远程主机地址（IP或域名）')
     add_parser.add_argument('user', help='SSH登录用户名')
-    add_parser.add_argument('fanse_path', help='远程FANSe3可执行文件完整路径')
+    add_parser.add_argument('--fanse-path', help='远程FANSe3可执行文件完整路径（可选，可后续update再配置）')
     
     auth_group = add_parser.add_mutually_exclusive_group()
     auth_group.add_argument('--key', help='SSH私钥文件路径（推荐使用）')
@@ -576,6 +1590,7 @@ FANSe3 集群管理工具
   ❌ 节点离线或无法连接
         '''
     )
+    list_parser.add_argument('-t', '--table', action='store_true', help='以表格形式显示（离线缓存）')
     
     # 检查节点
     check_parser = cluster_subparsers.add_parser('check', 
@@ -587,6 +1602,12 @@ FANSe3 集群管理工具
   ❌ node2: 离线（可能网络问题或服务未启动）
         '''
     )
+    check_parser.add_argument('-t', '--table', action='store_true', help='以表格形式显示（实时检测）')
+    # 修正：新增实时监控刷新参数
+    check_parser.add_argument('-w', '--watch', type=int, default=0, help='持续监控，间隔秒数（1-5）')
+    check_parser.add_argument('-c', '--count', type=int, default=0, help='刷新次数（0为无限直到Ctrl+C）')
+    # 修正：新增扩展指标
+    check_parser.add_argument('--detail', action='store_true', help='显示负载均值与网络带宽信息')
     
     # 测试节点
     test_parser = cluster_subparsers.add_parser('test', 
@@ -598,6 +1619,62 @@ FANSe3 集群管理工具
         '''
     )
     test_parser.add_argument('name', help='要测试的节点名称')
+
+    # 更新节点
+    update_parser = cluster_subparsers.add_parser('update',
+        help='更新节点配置',
+        description='更新已存在的节点字段（host/user/password/key/port/fanse_path/max_jobs/enabled/work_dir）',
+        epilog='示例: fanse cluster update -n c128 --fanse-path C:\\FANSe3\\FANSe3g.exe --max-jobs 2 --enable'
+    )
+    update_parser.add_argument('-n', '--name', help='节点名称', required=True)
+    update_parser.add_argument('--host', help='主机地址（IP或域名）')
+    update_parser.add_argument('--user', help='SSH用户名')
+    auth_group_u = update_parser.add_mutually_exclusive_group()
+    auth_group_u.add_argument('--key', help='SSH私钥文件路径')
+    auth_group_u.add_argument('--password', help='SSH密码')
+    update_parser.add_argument('--port', type=int, help='SSH端口')
+    update_parser.add_argument('--fanse-path', help='FANSe3可执行路径')
+    update_parser.add_argument('--max-jobs', type=int, help='节点最大并行作业数')
+    en_group = update_parser.add_mutually_exclusive_group()
+    en_group.add_argument('--enable', action='store_true', help='启用节点')
+    en_group.add_argument('--disable', action='store_true', help='禁用节点')
+    update_parser.add_argument('-w', '--work-dir', help='工作目录（可选）')
+    update_parser.add_argument('--test', action='store_true', help='更新后立即测试连接')
+
+    # 运行作业（最小版）
+    run_parser = cluster_subparsers.add_parser('run', 
+        help='在节点上运行命令（最小版）',
+        description='将原 fanse run 参数通过 SSH 在指定节点执行（支持 -i 通配符展开、--jobs 作业文件、-p 自动选择最快N台）',
+        epilog='示例: fanse cluster run -n nodeA -i C\\data\\*.fastq.gz -r C\\ref\\ref.fa -E5 -C20')
+    # 修正：统一 -n/--nodes，支持单/多；新增 -p 选择最快N台
+    run_parser.add_argument('-n', '--nodes', help='节点名称（单个或逗号分隔多个）')
+    run_parser.add_argument('-p', type=int, default=0, help='自动选择响应最快的N台节点')
+    run_parser.add_argument('--jobs', help='作业文件（每行一个命令参数串）')
+    run_parser.add_argument('--wait', type=int, default=0, help='等待节点就绪的秒数（用于 -p 自动选择），0 为不等待')
+    # 修正：使用REMAINDER捕获剩余的原run参数（无需 --）
+    run_parser.add_argument('command', nargs=argparse.REMAINDER, help='原 fanse run 参数（可直接跟在此命令后）')
+    # 修正：新增 cluster 级别确认选项，缺省会自动为 fanse run 添加 -y
+    run_parser.add_argument('-y', '--yes', action='store_true', help='在远端 fanse run 中自动添加确认（等同添加 -y）')
+    # 修正：输出管理：静默与日志目录
+    run_parser.add_argument('-q','--quiet', action='store_true', help='静默模式，不显示远端输出，仅显示进度与结果')
+    run_parser.add_argument('--log-dir', help='保存每个作业的远端输出到本地目录（文件名含节点与输入基名）')
+    # 修正：新增稳定性参数，避免远端假死
+    run_parser.add_argument('--timeout', type=int, default=0, help='总超时时长（秒），超时后主动结束远端进程并标记失败（0为不限制）')
+    run_parser.add_argument('--idle-timeout', type=int, default=0, help='空闲超时时长（秒），长时间无输出视为假死并主动结束（0为不限制）')
+    run_parser.add_argument('--heartbeat', type=int, default=0, help='SSH心跳间隔（秒），用于保持长连接稳定（0为关闭）')
+    # 修正：新增原生模式，直接调用fanse3g.exe而不是fanse run
+    run_parser.add_argument('--native', action='store_true', help='原生模式，直接调用远端 fanse3g.exe，不依赖远端 fansetools 环境')
+
+    # 安装命令
+    install_parser = cluster_subparsers.add_parser('install',
+        help='在节点上安装软件',
+        description='在远程节点上安装 Conda 环境和 fansetools',
+        epilog='示例: fanse cluster install -n node1 --conda --fansetools'
+    )
+    install_parser.add_argument('-n', '--nodes', help='节点名称（单个或逗号分隔多个，all表示所有）', required=True)
+    install_parser.add_argument('--conda', action='store_true', help='安装 Miniconda')
+    install_parser.add_argument('--fansetools', action='store_true', help='安装 fansetools')
+    install_parser.add_argument('--pip-mirror', help='指定 pip 镜像源', default='https://pypi.tuna.tsinghua.edu.cn/simple')
 
     return cluster_parser
     
@@ -630,4 +1707,3 @@ if __name__ != "__main__":
         'cluster_command',
         'get_config_dir'
     ]
-    

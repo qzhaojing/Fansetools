@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Created on Wed Jun 18 11:06:35 2025
-
+v0.2 解析FANSe3结果文件时使用turple存储比对结果，减少内存占用,优化解析速度
+v0.1 初始版本，解析FANSe3结果文件，返回FANSeRecord对象
 @author: Administrator
 """
 
 import re
+import os
+import io
+import gzip
+import zipfile
+import subprocess
+import shutil
 # import os
 from dataclasses import dataclass
 from typing import List, Generator
@@ -42,11 +49,35 @@ class FANSeRecord:
         if self.positions is None:
             self.positions = []
 
+    def __str__(self):
+        """自定义__str__方法，确保ref_names元组转换为逗号分隔的字符串"""
+        ref_names_str = ','.join(self.ref_names) if self.ref_names else ''
+        return f"FANSeRecord(header='{self.header}', seq='{self.seq}', alignment='{self.alignment}', " \
+               f"strands={self.strands}, ref_names='{ref_names_str}', mismatches={self.mismatches}, " \
+               f"positions={self.positions}, multi_count={self.multi_count})"
+
     @property
     def is_multi(self) -> bool:
         """判断是否为多映射记录"""
         return len(self.ref_names) > 1
 
+
+def _open_fanse_text(file_path: str):
+    if file_path.endswith('.gz'):
+        pigz = shutil.which('pigz')
+        if pigz:
+            p = subprocess.Popen([pigz, '-dc', file_path], stdout=subprocess.PIPE)
+            return io.TextIOWrapper(p.stdout, encoding='utf-8', errors='ignore')
+        return gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore')
+    if file_path.endswith('.zip'):
+        z = zipfile.ZipFile(file_path)
+        names = z.namelist()
+        target = names[0] if names else None
+        if target is None:
+            raise ValueError('Empty zip archive')
+        f = z.open(target, 'r')
+        return io.TextIOWrapper(f, encoding='utf-8', errors='ignore')
+    return open(file_path, 'r', encoding='utf-8', errors='ignore', buffering=1024 * 1024 * 16)
 
 def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     """
@@ -60,7 +91,7 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     """
     # tab_split = re.compile(r'\t+').split
     
-    with open(file_path, 'r', buffering=1024 * 1024*16 ) as f:  #  16 MB缓冲区
+    with _open_fanse_text(file_path) as f:
         while True:
             # 读取两行作为一个完整记录
             line1 = f.readline().rstrip()
@@ -87,15 +118,15 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
             multi_count = int(fields2[4])
             # 处理可能的多值字段
             if multi_count!=1:
-                strands = fields2[0].split(',')
-                ref_names = fields2[1].split(',')
+                strands = tuple(fields2[0].split(','))
+                ref_names = tuple(fields2[1].split(','))
                 mismatches = [int(fields2[2])]    #fanse 文件中此字段只有一个而非多个用逗号分割，因此测试注释掉上面行
                 positions = [int(x) for x in fields2[3].split(',')]
 
             else:  # single-mapping reads
                 # 单映射reads，直接使用字段值
-                strands = [fields2[0]]
-                ref_names = [fields2[1]]
+                strands = (fields2[0],)
+                ref_names = (fields2[1],)
                 mismatches = [int(fields2[2])]
                 positions = [int(fields2[3])]
             
@@ -134,7 +165,7 @@ def fanse_parser_high_performance(file_path: str) -> Generator[FANSeRecord, None
     # 预编译分割器（小幅度提升）
     comma_split = re.compile(',').split
     
-    with open(file_path, 'r', buffering=1024 * 1024 * 16) as f:  # 更大缓冲区
+    with _open_fanse_text(file_path) as f:
         batch = []  # 批量处理减少yield开销
         batch_size = 5000
         
@@ -173,15 +204,13 @@ def fanse_parser_high_performance(file_path: str) -> Generator[FANSeRecord, None
             
             # 根据multi_count分支处理
             if multi_count != 1:
-                # 多映射：使用预编译分割器
-                strands = comma_split(strand_field)
-                ref_names = comma_split(ref_field)
+                strands = tuple(comma_split(strand_field))
+                ref_names = tuple(comma_split(ref_field))
                 positions = [int(x) for x in comma_split(position_field)]
                 mismatches = [mismatch_val] * len(positions)
             else:
-                # 单映射：直接使用缓存值
-                strands = [strand_field]
-                ref_names = [ref_field] 
+                strands = (strand_field,)
+                ref_names = (ref_field,)
                 positions = [int(position_field)]
                 mismatches = [mismatch_val]
             

@@ -1,0 +1,16 @@
+{
+  "samtools": {
+    "path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\samtools.exe",
+    "is_jar": false,
+    "platform": "windows",
+    "installed_at": "1764324508.3279142",
+    "entry_path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\samtools.exe"
+  },
+  "snpeff": {
+    "path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\snpeff",
+    "is_jar": true,
+    "platform": "windows",
+    "installed_at": "1764324779.098236",
+    "entry_path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\snpeff\\snpEff\\examples\\examples.sh"
+  }
+}

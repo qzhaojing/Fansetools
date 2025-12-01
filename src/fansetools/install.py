@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import posixpath
 
 # 预定义的软件包列表
+REPO_URL = "https://github.com/qzhaojing/Fansetools/wiki"
 PREDEFINED_PACKAGES = {
     "samtools": {
         "windows": "https://github.com/qzhaojing/Fansetools/raw/main/src/fansetools/bin/windows/samtools.exe",
@@ -55,8 +56,7 @@ PREDEFINED_PACKAGES = {
 }
 
 # 安装信息文件路径
-INSTALL_INFO_FILE = os.path.join(
-    os.path.dirname(__file__), "installed_packages.json")
+INSTALL_INFO_FILE = Path(__file__).parent / "installed_packages.json"
 
 
 def get_platform():
@@ -67,10 +67,11 @@ def get_platform():
 def get_install_dir():
     """获取安装目录"""
     current_platform = get_platform()
-    if current_platform == "windows":
-        return os.path.join("src", "fansetools", "bin", "windows")
-    else:
-        return "/usr/local/bin"
+    prefix = os.environ.get("FANSE_HOME") or os.environ.get("FANSE_PREFIX")
+    if prefix:
+        return os.path.join(prefix, "bin", current_platform)
+    base = Path(__file__).parent / "bin" / current_platform
+    return str(base)
 
 
 def get_filename_from_url(url):
@@ -168,12 +169,12 @@ def extract_archive(archive_path, extract_dir):
 
 def load_install_info():
     """加载安装信息"""
-    if os.path.exists(INSTALL_INFO_FILE):
-        try:
-            with open(INSTALL_INFO_FILE, 'r') as f:
+    try:
+        if INSTALL_INFO_FILE.exists():
+            with open(INSTALL_INFO_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
-            pass
+    except Exception:
+        pass
     return {}
 
 
@@ -219,13 +220,54 @@ def install_package(package_name_or_url):
                     shutil.rmtree(package_dir)
                 shutil.copytree(extract_dir, package_dir)
 
-                # 使用最大的jar文件作为主jar
+                # 优先使用厂商脚本（bat/sh）
+                vendor_script = None
+                for root, dirs, files in os.walk(package_dir):
+                    for f in files:
+                        if f.lower().endswith(('.bat', '.sh')):
+                            vendor_script = os.path.join(root, f)
+                            break
+                    if vendor_script:
+                        break
+
+                if vendor_script:
+                    rel_jars = []
+                    try:
+                        for j in jar_files:
+                            rel_jars.append(os.path.relpath(os.path.join(package_dir, os.path.basename(j)), package_dir))
+                    except Exception:
+                        rel_jars = [os.path.basename(j) for j in jar_files]
+                    if create_launcher(install_dir, package_name, exec_path=vendor_script):
+                        save_install_info(
+                            package_name,
+                            package_dir,
+                            is_jar=True,
+                            entry_path=vendor_script,
+                            extra_info={"jar_files": rel_jars, "vendor_script": vendor_script}
+                        )
+                        print(f"✓ Java应用安装完成（脚本）: {package_name}")
+                        return True
+
+                # 回退：使用最大的 jar
                 main_jar = max(jar_files, key=lambda x: os.path.getsize(x))
                 main_jar_name = os.path.basename(main_jar)
+                main_jar_path = os.path.join(package_dir, main_jar_name)
 
-                # 创建启动脚本
-                if create_launcher(install_dir, package_name, os.path.join(package_dir, main_jar_name)):
-                    save_install_info(package_name, package_dir, is_jar=True)
+                rel_jars = []
+                try:
+                    for j in jar_files:
+                        rel_jars.append(os.path.relpath(os.path.join(package_dir, os.path.basename(j)), package_dir))
+                except Exception:
+                    rel_jars = [os.path.basename(j) for j in jar_files]
+
+                if create_launcher(install_dir, package_name, jar_path=main_jar_path, exec_path=None):
+                    save_install_info(
+                        package_name,
+                        package_dir,
+                        is_jar=True,
+                        entry_path=main_jar_path,
+                        extra_info={"jar_files": rel_jars}
+                    )
                     print(f"✓ Java应用安装完成: {package_name}")
                     return True
             else:
@@ -234,24 +276,28 @@ def install_package(package_name_or_url):
                 for root, dirs, files in os.walk(extract_dir):
                     for file in files:
                         file_path = os.path.join(root, file)
-                        if (file.lower().endswith(('.exe', '.bin')) or
-                                (get_platform() != "windows" and os.access(file_path, os.X_OK))):
+                        if (
+                            file.lower().endswith(('.exe', '.bin', '.bat', '.cmd', '.ps1', '.py', '.sh', '.r')) or
+                            (get_platform() != "windows" and os.access(file_path, os.X_OK))
+                        ):
                             executables.append(file_path)
 
                 if executables:
                     # 复制可执行文件
+                    copied = []
                     for exec_path in executables:
                         exec_name = os.path.basename(exec_path)
                         dest_path = os.path.join(install_dir, exec_name)
                         shutil.copy2(exec_path, dest_path)
+                        copied.append(dest_path)
                         if get_platform() != "windows":
                             os.chmod(dest_path, 0o755)
 
-                    # 创建启动脚本（使用包名）
-                    main_exec = os.path.basename(executables[0])
-                    if create_launcher(install_dir, package_name):
+                    # 创建启动脚本（使用真实入口）
+                    main_exec = copied[0]
+                    if create_launcher(install_dir, package_name, exec_path=main_exec):
                         save_install_info(
-                            package_name, install_dir, is_jar=False)
+                            package_name, main_exec, is_jar=False, entry_path=main_exec)
                         print(f"✓ 安装完成: {package_name}")
                         return True
         else:
@@ -262,8 +308,8 @@ def install_package(package_name_or_url):
             if get_platform() != "windows":
                 os.chmod(dest_path, 0o755)
 
-            if create_launcher(install_dir, package_name):
-                save_install_info(package_name, install_dir, is_jar=False)
+            if create_launcher(install_dir, package_name, exec_path=dest_path):
+                save_install_info(package_name, dest_path, is_jar=False, entry_path=dest_path)
                 print(f"✓ 安装完成: {package_name}")
                 return True
 
@@ -283,7 +329,14 @@ def list_installed_packages():
     for package, details in info.items():
         status = "可用" if os.path.exists(details["path"]) else "缺失"
         package_type = "Java应用" if details.get("is_jar") else "可执行文件"
-        print(f"  {package:<15} - {package_type} ({status})")
+        extra = ""
+        if details.get("is_jar"):
+            jars = details.get("jar_files") or []
+            extra = f" | JARs: {len(jars)}"
+        alias = details.get("alias")
+        if alias and alias != package:
+            extra += f" | 别名: {alias}"
+        print(f"  {package:<15} - {package_type} ({status}){extra}")
     print("-" * 40)
 
 
@@ -304,6 +357,7 @@ def list_available_packages():
 
     print("-" * 40)
     print("使用 'fanse install <包名>' 安装")
+    print(f"更多软件与安装说明: {REPO_URL}")
 
 
 def show_package_help():
@@ -324,23 +378,9 @@ def show_package_help():
     print()
 
 
-def handle_install_command(args):
-    """处理install命令"""
-    if not args.packages:
-        show_package_help()
-        return
-
-    if args.packages[0] == "list":
-        list_available_packages()
-        return
-    elif args.packages[0] == "installed":
-        list_installed_packages()
-        return
-
-    for package in args.packages:
-        print(f"\n处理: {package}")
-        if not install_package(package):
-            print(f"安装失败: {package}")
+def _legacy_install_command(args):
+    """保留旧入口，委托到统一实现"""
+    return handle_install_command(args)
 
 
 def find_jar_files(directory):
@@ -363,29 +403,56 @@ def find_jar_files(directory):
     return jar_files
 
 
-def create_launcher(install_dir, package_name, jar_path=None):
-    """创建启动脚本 - 优化版本"""
+def _find_local_java():
+    is_windows = get_platform() == "windows"
+    base = Path(__file__).parent / "bin" / ("windows" if is_windows else "linux") / "runtime" / "java"
+    candidates = [
+        base / "bin" / ("java.exe" if is_windows else "java"),
+        base / ("java.exe" if is_windows else "java"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+def create_launcher(install_dir, package_name, jar_path=None, exec_path=None):
+    """创建启动脚本 - 使用真实入口路径并支持多类型"""
     try:
-        if get_platform() == "windows":
-            launcher_path = os.path.join(install_dir, f"{package_name}.bat")
-            if jar_path:
-                # 使用原始字符串避免转义问题
-                content = f'@echo off\njava -jar "{jar_path}" %*\n'
-            else:
-                content = f'@echo off\n"{package_name}.exe" %*\n'
-        else:
-            launcher_path = os.path.join(install_dir, package_name)
-            if jar_path:
-                content = f'#!/bin/bash\njava -jar "{jar_path}" "$@"\n'
-            else:
-                content = f'#!/bin/bash\n./{package_name} "$@"\n'
+        is_windows = get_platform() == "windows"
+        launcher_path = os.path.join(install_dir, f"{package_name}.bat" if is_windows else package_name)
 
-        # 一次性写入文件
+        if jar_path:
+            java_cmd = _find_local_java() or "java"
+            content = (
+                f'@echo off\n"{java_cmd}" -jar "{jar_path}" %*\n' if is_windows
+                else f'#!/bin/bash\n"{java_cmd}" -jar "{jar_path}" "$@"\n'
+            )
+        elif exec_path:
+            if is_windows:
+                ext = Path(exec_path).suffix.lower()
+                if ext in ('.bat', '.cmd'):
+                    content = f'@echo off\ncall "{exec_path}" %*\n'
+                elif ext == '.ps1':
+                    content = f'@echo off\npowershell -ExecutionPolicy Bypass -File "{exec_path}" %*\n'
+                elif ext == '.py':
+                    content = f'@echo off\npy -3 "{exec_path}" %*\n'
+                elif ext == '.r':
+                    content = f'@echo off\nRscript "{exec_path}" %*\n'
+                elif ext == '.sh':
+                    content = f'@echo off\nbash "{exec_path}" %*\n'
+                else:
+                    content = f'@echo off\n"{exec_path}" %*\n'
+            else:
+                content = f'#!/bin/bash\n"{exec_path}" "$@"\n'
+        else:
+            content = (
+                f'@echo off\n"{package_name}.exe" %*\n' if is_windows
+                else f'#!/bin/bash\n./{package_name} "$@"\n'
+            )
+
         with open(launcher_path, 'w', encoding='utf-8') as f:
             f.write(content)
 
-        # 设置执行权限
-        if get_platform() != "windows":
+        if not is_windows:
             os.chmod(launcher_path, 0o755)
 
         return True
@@ -394,25 +461,29 @@ def create_launcher(install_dir, package_name, jar_path=None):
         return False
 
 
-def save_install_info(package_name, install_path, is_jar=False):
-    """保存安装信息 - 优化版本"""
+def save_install_info(package_name, install_path, is_jar=False, alias=None, entry_path=None, extra_info=None):
+    """保存安装信息 - 使用 Path 与入口信息"""
     try:
-        # 使用Path对象进行路径操作
         install_info = load_install_info()
-        install_info[package_name] = {
+        entry = {
             "path": str(Path(install_path)),
             "is_jar": is_jar,
             "platform": get_platform(),
             "installed_at": str(Path(install_path).stat().st_mtime) if Path(install_path).exists() else "unknown"
         }
+        if alias:
+            entry["alias"] = alias
+        if entry_path:
+            entry["entry_path"] = str(entry_path)
+        if extra_info:
+            for k, v in (extra_info or {}).items():
+                entry[k] = v
 
-        # 确保目录存在
+        install_info[package_name] = entry
+
         INSTALL_INFO_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-        # 使用json.dump确保编码正确
         with open(INSTALL_INFO_FILE, 'w', encoding='utf-8') as f:
             json.dump(install_info, f, indent=2, ensure_ascii=False)
-
         return True
     except Exception as e:
         print(f"保存安装信息失败: {e}")
@@ -516,10 +587,10 @@ def find_executables_fast(directory):
             for file in files:
                 file_path = os.path.join(root, file)
                 # 使用文件扩展名快速过滤
-                if (file.lower().endswith(('.exe', '.bin')) or
-                    (get_platform() != "windows" and
-                     (file.lower().endswith(('.sh', '.bat')) or
-                      os.access(file_path, os.X_OK)))):
+                if (
+                    file.lower().endswith(('.exe', '.bin', '.bat', '.cmd', '.ps1', '.py', '.sh')) or
+                    (get_platform() != "windows" and os.access(file_path, os.X_OK))
+                ):
                     executables.append(file_path)
                     if len(executables) >= 3:  # 最多找3个
                         return executables
@@ -564,10 +635,9 @@ def install_executable(exec_path, install_dir, package_name):
 
         if get_platform() != "windows":
             os.chmod(dest_path, 0o755)
-
-        # 创建启动器（使用包名）
-        if create_launcher(install_dir, package_name):
-            save_install_info(package_name, str(dest_path), is_jar=False)
+        # 创建启动器（使用真实入口）
+        if create_launcher(install_dir, package_name, exec_path=str(dest_path)):
+            save_install_info(package_name, str(dest_path), is_jar=False, entry_path=str(dest_path))
             print(f"✓ 安装完成: {package_name}")
             return True
     except Exception as e:
@@ -618,21 +688,20 @@ def main():
 
     # 检查是否是已安装的包命令
     if len(sys.argv) > 1 and sys.argv[1] in load_install_info():
-        # 执行已安装的包
         package_name = sys.argv[1]
-        package_info = load_install_info()[package_name]
-
-        if package_info.get("is_jar"):
-            # Java应用
-            jar_path = package_info["path"]
-            if get_platform() == "windows":
-                os.system(f'java -jar "{jar_path}" {" ".join(sys.argv[2:])}')
-            else:
-                os.system(f'java -jar {jar_path} {" ".join(sys.argv[2:])}')
+        install_dir = get_install_dir()
+        launcher = os.path.join(install_dir, f"{package_name}.bat" if get_platform() == "windows" else package_name)
+        args = " ".join(sys.argv[2:])
+        if os.path.exists(launcher):
+            os.system(f'"{launcher}" {args}')
         else:
-            # 可执行文件
-            exec_path = package_info["path"]
-            os.system(f'"{exec_path}" {" ".join(sys.argv[2:])}')
+            # 回退：直接按记录的入口执行
+            details = load_install_info().get(package_name, {})
+            entry_path = details.get("entry_path") or details.get("path")
+            if entry_path:
+                os.system(f'"{entry_path}" {args}')
+            else:
+                print(f"未找到包入口: {package_name}")
     else:
         # 其他命令
         parser = argparse.ArgumentParser(description='FANSe 工具集')
@@ -645,6 +714,8 @@ def main():
         # 列表命令
         list_parser = subparsers.add_parser('list', help='列出可安装的包')
         installed_parser = subparsers.add_parser('installed', help='列出已安装的包')
+        uninstall_parser = subparsers.add_parser('uninstall', help='卸载软件包')
+        uninstall_parser.add_argument('packages', nargs='*', help='要卸载的包名')
 
         args = parser.parse_args()
 
@@ -654,6 +725,8 @@ def main():
             list_available_packages()
         elif args.command == 'installed':
             list_installed_packages()
+        elif args.command == 'uninstall':
+            uninstall_packages(args.packages or [])
 
 # install.py
 
@@ -670,28 +743,83 @@ def add_install_subparser(subparsers):
         nargs='*',
         help='要安装的包名或URL（使用"list"查看可用包）'
     )
+    install_parser.add_argument(
+        '--name', '-n',
+        dest='name',
+        help='安装后使用的自定义别名（默认用包名）'
+    )
     install_parser.set_defaults(func=handle_install_command)
     return install_parser
 
 
 def handle_install_command(args):
-    """处理install命令"""
-    if not args.packages or (len(args.packages) == 1 and args.packages[0] == 'list'):
-        # 显示帮助信息
-        print("可安装的预定义软件包:")
-        print("-" * 20)
-        for package_name in PREDEFINED_PACKAGES:
-            print(f"  {package_name}")
-        print("-" * 20)
+    """处理install命令（统一实现）"""
+    if not args.packages:
+        list_available_packages()
+        list_installed_packages()
         return
 
-    packages = args.packages
-    for package in packages:
+    if len(args.packages) == 1 and args.packages[0] == 'list':
+        list_available_packages()
+        return
+
+    for package in args.packages:
         print(f"\n正在处理: {package}")
         if install_package(package):
             print(f"✓ 安装成功: {package}")
+            if getattr(args, 'name', None):
+                alias = args.name
+                if alias and alias != package:
+                    install_dir = get_install_dir()
+                    is_windows = get_platform() == "windows"
+                    src = os.path.join(install_dir, f"{package}.bat" if is_windows else package)
+                    dst = os.path.join(install_dir, f"{alias}.bat" if is_windows else alias)
+                    try:
+                        shutil.copy2(src, dst)
+                        info = load_install_info()
+                        if package in info:
+                            info[package]["alias"] = alias
+                            with open(INSTALL_INFO_FILE, 'w', encoding='utf-8') as f:
+                                json.dump(info, f, indent=2, ensure_ascii=False)
+                        print(f"✓ 已创建别名: {alias}")
+                    except Exception as e:
+                        print(f"创建别名失败: {e}")
         else:
             print(f"✗ 安装失败: {package}")
+
+
+def uninstall_packages(packages):
+    """卸载软件包"""
+    info = load_install_info()
+    changed = False
+    for pkg in packages:
+        details = info.get(pkg)
+        if not details:
+            print(f"未找到已安装包: {pkg}")
+            continue
+        try:
+            install_dir = get_install_dir()
+            launcher = os.path.join(install_dir, f"{pkg}.bat" if get_platform() == "windows" else pkg)
+            if os.path.exists(launcher):
+                os.remove(launcher)
+            path = details.get("path")
+            if path and os.path.exists(path):
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            info.pop(pkg, None)
+            changed = True
+            print(f"✓ 已卸载: {pkg}")
+        except Exception as e:
+            print(f"卸载失败 {pkg}: {e}")
+    if changed:
+        try:
+            INSTALL_INFO_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(INSTALL_INFO_FILE, 'w', encoding='utf-8') as f:
+                json.dump(info, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"更新安装信息失败: {e}")
 
 
 if __name__ == "__main__":

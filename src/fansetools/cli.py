@@ -235,7 +235,15 @@ def create_parser():
     from .fastx import add_fastx_subparser
     from .sort import add_sort_subparser
     from .mpileup import add_mpileup_subparser
-    from .install import add_install_subparser, handle_install_command  # 新增导入
+    from .install import (
+        add_install_subparser,
+        handle_install_command,
+        list_available_packages,
+        list_installed_packages,
+        uninstall_packages,
+    )  # 新增导入
+    from .flows.flow import add_flow_subparser
+    from .runtime import add_runtime_subparser, add_java_subparser
     from .cluster import add_cluster_subparser, cluster_command
     
     # 创建主解析器
@@ -307,6 +315,28 @@ def create_parser():
     # 子命令：install (新增)
     install_parser = add_install_subparser(subparsers)
     install_parser.set_defaults(func=handle_install_command)
+    # 顶层代理：list
+    list_parser = subparsers.add_parser(
+        'list',
+        help='列出可安装的包',
+        description='列出可安装的预定义包并显示仓库网址'
+    )
+    list_parser.set_defaults(func=lambda args: list_available_packages())
+    # 顶层代理：installed
+    installed_parser = subparsers.add_parser(
+        'installed',
+        help='列出已安装的包',
+        description='列出已安装的包及其状态'
+    )
+    installed_parser.set_defaults(func=lambda args: list_installed_packages())
+    # 顶层命令：uninstall
+    uninstall_parser = subparsers.add_parser(
+        'uninstall',
+        help='卸载软件包',
+        description='卸载已安装的软件包'
+    )
+    uninstall_parser.add_argument('packages', nargs='*', help='要卸载的包名')
+    uninstall_parser.set_defaults(func=lambda args: uninstall_packages(args.packages or []))
     
     # 子命令：update
     update_parser = subparsers.add_parser(
@@ -317,6 +347,12 @@ def create_parser():
     update_parser.add_argument('-y', '--yes', action='store_true', 
                               help='自动确认更新，无需交互')
     update_parser.set_defaults(func=update_fansetools)
+
+    # 子命令：flow（由模块提供）
+    add_flow_subparser(subparsers)
+    # 子命令：runtime 与 java（由模块提供）
+    add_runtime_subparser(subparsers)
+    add_java_subparser(subparsers)
     
     return parser, subparsers.choices
 
@@ -405,9 +441,10 @@ def main():
         subparsers_choices[remaining_args[0]].print_help()
         return
     
-    # 解析参数
+    # 解析参数（修正：允许子命令携带未知参数，供 cluster run 转发）
     try:
-        args = parser.parse_args(remaining_args)
+        args, unknown = parser.parse_known_args(remaining_args)
+        setattr(args, '_unknown', unknown)
     except SystemExit:
         return 1
     
