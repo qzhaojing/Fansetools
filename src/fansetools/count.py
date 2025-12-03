@@ -15,6 +15,7 @@ fansetools count 组件 - 用于处理fanse3文件的read计数
 
 import argparse
 from collections import Counter, defaultdict, deque
+from itertools import chain  # 修正：用于生成器级展开multi2all，避免构建巨大的中间列表
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import glob
 import multiprocessing as mp
@@ -539,6 +540,8 @@ class FanseCounter:
 
         if self.verbose:
             print(f'Parsing {self.input_file.name}')
+            # 修正：输出所选解析器与批处理大小，便于定位性能问题
+            print(f"Parser: {'high_performance' if fanse_parser_selected is fanse_parser_high_performance else 'standard'}")
         start_time = time.time()
 
         # 预初始化数据结构，针对isoform。默认所有reads都比对到isoform,后续再根据这个，multi_to_isoform判断是否属于gene
@@ -565,7 +568,11 @@ class FanseCounter:
         # 默认策略：若未指定，采用 800_000 作为保守高效的批大小；
         # 可通过 CLI --batch-size 覆盖以适配不同机器与数据规模
         batch_size = int(self.batch_size) if self.batch_size else 800_000
-        # update_interval = 10000
+        if self.verbose:
+            print(f"Using batch size: {batch_size}")
+        # 修正：根据批大小动态设置进度更新步长，减少频繁刷新带来的开销
+        # 大批量时放宽刷新频率，小批量保持默认
+        update_interval = max(10_000, batch_size // 4)
 
         # 3. 本地变量缓存，消除属性查找
         raw      = counts_data[f'{self.isoform_prefix}raw']
@@ -706,10 +713,11 @@ class FanseCounter:
                 unique_ids_to_add.append(first_id)
             else:
                 # 多重比对分支
-                joined_ids = ','.join(ids)  # 将多个ID拼接成字符串作为联合键
-                raw_ids_to_add.append(joined_ids)
+                # 修正：统一组合键类型为 tuple，内部统一使用元组以减少重复字符串拼接与哈希重分配；导出阶段再格式化为逗号分隔字符串
+                joined_tuple = tuple(ids)
+                raw_ids_to_add.append(joined_tuple)
                 first_ids_to_add.append(first_id)
-                multi_joined_to_add.append(joined_ids)
+                multi_joined_to_add.append(joined_tuple)
                 # 展开到每个转录本
                 # 注意：这里不去重，保留重复以准确累计每条reads对应的每个转录本
                 multi2all_ids_to_add.extend(ids)
@@ -724,6 +732,23 @@ class FanseCounter:
             multi.update(multi_joined_to_add)
         if multi2all_ids_to_add:
             multi2all.update(multi2all_ids_to_add)
+
+        # # 修正：使用生成器进行Counter.update，避免构建巨大中间列表导致的内存压力与GC抖动
+        # # 说明：保持“每批每类型1次update”的策略，同时用生成器表达式与chain展开multi2all
+        # raw.update(
+        #     (
+        #         (record.ref_names[0] if not record.is_multi else tuple(record.ref_names))
+        #         for record in batch
+        #     )
+        # )
+        # firstID.update((record.ref_names[0] for record in batch))
+        # unique.update((record.ref_names[0] for record in batch if not record.is_multi))
+        # multi.update((tuple(record.ref_names) for record in batch if record.is_multi))
+        # # 将多重比对展开到每个转录本ID：使用chain避免一次性构建巨大的列表
+        # multi2all.update(
+        #     chain.from_iterable((record.ref_names for record in batch if record.is_multi))
+        # )
+
 
     def calculate_average_record_size(self, file_path, sample_size=100_000):
         """
@@ -1147,8 +1172,12 @@ class FanseCounter:
         start_time = time.time()
 
         # 创建转录本到基因的映射列表
-        transcript_to_gene = dict(
-            zip(self.annotation_df['txname'], self.annotation_df['geneName']))
+        # 修正：对 geneName 应用 sys.intern，稳定键匹配并降低内存占用（与解析器中对 ref_names 的驻留一致）
+        import sys
+        transcript_to_gene = {
+            str(tx): sys.intern(str(gn))
+            for tx, gn in zip(self.annotation_df['txname'], self.annotation_df['geneName'])
+        }
 
         # 初始化基因水平计数器
         # gene_level_counts_unique_genes：存放“唯一比对到某个基因”的各类计数结果
@@ -1177,28 +1206,6 @@ class FanseCounter:
 
         # gene_level_counts_unique_genes[f'{self.gene_prefix}multi_to_isoform'] = self.counts_data.get(f'{self.isoform_prefix}multi_to_isoform', Counter())
         # gene_level_counts_unique_genes[f'{self.gene_prefix}multi_to_gene']    = Counter()
-
-        # gene_level_counts_unique_genes[f'{self.gene_prefix}multi_to_gene']    = self.counts_data.get(f'{self.isoform_prefix}multi_to_gene', Counter())      
-        # 重新计算基因水平的 multi2all：仅当某条 read 的多重比对组合全部落在不同基因时才累加到每个gene id
-        # iso_multi2all = self.counts_data.get(f'{self.isoform_prefix}multi_to_isoform', Counter())
-        # for combo_key, read_count in iso_multi2all.items():
-        #     # combo_key 形如 "txA,txB,txC"
-        #     tx_ids = combo_key.split(',') if isinstance(combo_key, str) else list(combo_key)
-        #     gene_set = {transcript_to_gene.get(tx) for tx in tx_ids if transcript_to_gene.get(tx)}
-        #     # 必须所有转录本都能映射到同一基因
-        #     if len(gene_set) == 1:
-        #         gene_id = gene_set.pop()
-        #         gene_level_counts_unique_genes[f'{self.gene_prefix}multi2all'][gene_id] += read_count
-
-        # 第一步：计算基因水平的unique reads计数和multi计数
-        # gene_unique_counts = Counter()
-        # 遍历 self.counts_data 中的每一种 isoform 级计数类型及其对应的 Counter
-        # 例如：'isoform_raw'、'isoform_unique_to_isoform'、'isoform_multi_to_isoform'...
-        # for count_type, counter in self.counts_data.items():
-        #     # 跳过需要后续重新计算的 'multi2all' 类型，避免重复累加
-        #     # （multi2all 会在后面单独按基因维度重新统计）
-        #     if 'multi2all' in count_type:
-        #         continue
 
         count_type = f'{self.isoform_prefix}raw'
         counter_raw = self.counts_data[count_type]  #提取isoform_raw的counter计数器，gene level 的所有count统计 采用这个计数器来计数就够了，避免AI幻觉
@@ -1244,14 +1251,12 @@ class FanseCounter:
 
                 # 2) 多转录本 → 多基因：gene 不唯一
                 elif len(genes) > 1:
-                    gene_key = ','.join(sorted(genes))
+                    # 修正：统一组合键为 tuple（按字典序排序保证稳定），导出阶段再格式化
+                    gene_key = tuple(sorted(genes))
                     # 全部归入“基因-多重”计数器
                     gene_level_counts_multi_genes[f'{self.gene_prefix}raw'].update({gene_key: event_count})
                     gene_level_counts_multi_genes[f'{self.gene_prefix}multi_to_gene'].update({gene_key: event_count})
                     gene_level_counts_multi_genes[f'{self.gene_prefix}multi_to_isoform'].update({gene_key: event_count})
-                    # 修正：genes 为 set，不支持下标，使用迭代器安全获取第一个基因
-                    # first_gene = next(iter(genes))
-                    # gene_level_counts_unique_genes[f'{self.gene_prefix}firstID'].update({first_gene: event_count})
 
             # 3) 单转录本 → 单基因：isoform & gene 均唯一
             else:
@@ -1472,11 +1477,27 @@ class FanseCounter:
 
             multi_key = f'{self.isoform_prefix}multi_to_isoform'
             if multi_key in self.counts_data and self.counts_data[multi_key]:
+                # 注释映射：为多转录本组合提供 geneName/symbol/description 输出
                 length_map = {}
-                if self.annotation_df is not None and 'txname' in self.annotation_df.columns and 'txLength' in self.annotation_df.columns:
-                    length_map = dict(zip(self.annotation_df['txname'], self.annotation_df['txLength']))
+                gene_name_map = {}
+                symbol_map = {}
+                desc_map = {}
+                if self.annotation_df is not None:
+                    if 'txname' in self.annotation_df.columns and 'txLength' in self.annotation_df.columns:
+                        length_map = dict(zip(self.annotation_df['txname'], self.annotation_df['txLength']))
+                    if 'txname' in self.annotation_df.columns and 'geneName' in self.annotation_df.columns:
+                        # 修正：对 geneName 应用 sys.intern，减少重复字符串开销
+                        import sys
+                        gene_name_map = {str(tx): sys.intern(str(gn)) for tx, gn in zip(self.annotation_df['txname'], self.annotation_df['geneName'])}
+                    if 'txname' in self.annotation_df.columns and 'symbol' in self.annotation_df.columns:
+                        symbol_map = dict(zip(self.annotation_df['txname'], self.annotation_df['symbol']))
+                    if 'txname' in self.annotation_df.columns and 'description' in self.annotation_df.columns:
+                        desc_map = dict(zip(self.annotation_df['txname'], self.annotation_df['description']))
+
                 # 修正：使用 isoform 层唯一计数键 unique_to_isoform 计算 TPM，避免取空
                 tpm_values = self._calculate_tpm(self.counts_data.get(f'{self.isoform_prefix}unique_to_isoform', Counter()), length_map)
+
+                # 数值格式化：未检测到的空值标记为 0
                 def _fmt_val(v):
                     if v is None:
                         return '*'
@@ -1520,8 +1541,16 @@ class FanseCounter:
                         ) for t in ids
                     ]
 
+                    # 注释拼接：为多转录本组合提供 geneName/symbol/description（多基因用逗号分隔）
+                    gene_names = ','.join([str(gene_name_map.get(t, '0')) for t in ids]) if gene_name_map else ''
+                    gene_symbols = ','.join([str(symbol_map.get(t, '0')) for t in ids]) if symbol_map else ''
+                    gene_descs = ','.join([str(desc_map.get(t, '0')) for t in ids]) if desc_map else ''
+
                     rows.append({
                         'Transcripts': ids_key if isinstance(ids_key, str) else ','.join(ids),
+                        'GeneNames': gene_names,
+                        'Symbols': gene_symbols if gene_symbols else None,
+                        'Descriptions': gene_descs if gene_descs else None,
                         f'{self.isoform_prefix}raw': ';'.join(raw_vals),
                         f'{self.isoform_prefix}firstID': ';'.join(firstID_vals),
                         f'{self.isoform_prefix}unique_to_isoform': ';'.join(uniq_vals),
@@ -1647,13 +1676,14 @@ class FanseCounter:
                     for count_type, counter in self.gene_level_counts_unique_genes.items():
                         if counter:  # 确保计数器非空
                             # 提取基础计数类型名称（去掉 gene_ 前缀）
-                            base_count_type = count_type.replace(
-                                self.gene_prefix, '')
-                            count_value = counter.get(gene, 0)
-                            if base_count_type.endswith('_ratio'):
-                                gene_row[f'{base_count_type}'] = count_value
-                            else:
-                                gene_row[f'{base_count_type}'] = count_value
+                            if not "unique_gene_to_gene_and_isoform" and "unique_to_gene_but_not_isoform":
+                                base_count_type = count_type.replace(
+                                    self.gene_prefix, '')
+                                count_value = counter.get(gene, 0)
+                                if base_count_type.endswith('_ratio'):
+                                    gene_row[f'{base_count_type}'] = count_value
+                                else:
+                                    gene_row[f'{base_count_type}'] = count_value
 
                     single_gene_data.append(gene_row)
 
@@ -1685,7 +1715,7 @@ class FanseCounter:
                         'Gene',
                         'raw',
                         'multi_to_isoform',
-                        'unique_to_isoform',
+                        # 'unique_to_isoform',
                         'unique_to_gene',
                         'firstID',
                         'multi2all',
@@ -1698,7 +1728,8 @@ class FanseCounter:
                     ]
                     drop_cols = [
                         'unique',
-                        'multi_EM_cannot_allocate_tpm'
+                        'multi_EM_cannot_allocate_tpm',
+                        'unique_to_isoform',
                     ]
                     for dc in drop_cols:
                         if dc in single_gene_df.columns:
@@ -1760,30 +1791,35 @@ class FanseCounter:
                 gene_final_em_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}Final_EM', Counter())
                 gene_final_eq_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}Final_EQ', Counter())
 
-                # 收集所有多基因组合
+                # 收集所有多基因组合（过滤掉单基因条目，确保 gene multi 文件不包含 unique 到单基因的记录）
                 all_multi_combinations = set()
                 for counter in self.gene_level_counts_multi_genes.values():
                     if counter:  # 确保计数器非空
-                        all_multi_combinations.update(counter.keys())
+                        for k in counter.keys():
+                            if (isinstance(k, str) and ',' in k) or (isinstance(k, tuple) and len(k) > 1):
+                                all_multi_combinations.add(k)
 
                 if self.verbose:
                     print(f"处理 {len(all_multi_combinations)} 个多基因组合")
 
                 for gene_combo in all_multi_combinations:
-                    combo_row = {'Gene_Combination': gene_combo}
+                    # 修正：兼容 tuple 键，导出时统一格式化为逗号分隔字符串
+                    genes_list = gene_combo.split(',') if isinstance(gene_combo, str) else list(gene_combo)
+                    combo_row = {'Gene_Combination': gene_combo if isinstance(gene_combo, str) else ','.join(genes_list)}
 
                     # 收集该组合在所有计数类型中的值
                     for count_type, counter in self.gene_level_counts_multi_genes.items():
                         if counter:  # 确保计数器非空
-                            base_count_type = count_type.replace(
-                                self.gene_prefix, '')
-                            count_value = counter.get(gene_combo, 0)
-                            if base_count_type.endswith('_ratio'):
-                                combo_row[f'{base_count_type}'] = count_value
-                            else:
-                                combo_row[f'{base_count_type}'] = count_value
+                            if not "unique_to_gene_and_isoform" and "unique_to_gene_but_not_isoform":
+                                base_count_type = count_type.replace(
+                                    self.gene_prefix, '')
+                                count_value = counter.get(gene_combo, 0)
+                                if base_count_type.endswith('_ratio'):
+                                    combo_row[f'{base_count_type}'] = count_value
+                                else:
+                                    combo_row[f'{base_count_type}'] = count_value
 
-                    genes = gene_combo.split(',')
+                    genes = genes_list
                     def _fmt_val(v):
                         if v is None:
                             return '*'
@@ -1801,14 +1837,17 @@ class FanseCounter:
                     else:
                         em_vals = ['*' for _ in genes]
                         combo_row['multi_EM_cannot_allocate_tpm_gene'] = event_count
-                    m2a_vals = [_fmt_val(float(gene_m2a_counter.get(g, 0))) for g in genes]
+                    # 修正：gene multi 文件不再展示 multi2all（该指标在基因组合维度语义不清晰，避免误导）
+                    # m2a_vals = [_fmt_val(float(gene_m2a_counter.get(g, 0))) for g in genes]
                     uniq_vals = [_fmt_val(float(gene_uniq_counter.get(g, 0))) for g in genes]
                     final_em_vals = [_fmt_val(float(gene_final_em_counter.get(g, 0))) for g in genes]
                     final_eq_vals = [_fmt_val(float(gene_final_eq_counter.get(g, 0))) for g in genes]
                     combo_row['multi_EM'] = ';'.join(em_vals)
                     combo_row['multi_equal'] = ';'.join(eq_vals)
-                    combo_row['multi2all'] = ';'.join(m2a_vals)
-                    combo_row['unique'] = ';'.join(uniq_vals)
+                    # 修正：移除 multi2all 列
+                    # combo_row['multi2all'] = ';'.join(m2a_vals)
+                    # 修正：重命名 unique 列为 unique_to_gene，更清晰
+                    combo_row['unique_to_gene'] = ';'.join(uniq_vals)
                     combo_row['Final_EM'] = ';'.join(final_em_vals)
                     combo_row['Final_EQ'] = ';'.join(final_eq_vals)
                     
@@ -2106,6 +2145,126 @@ class FanseCounter:
         out_df.to_csv(out_path, sep='\t', index=False)
         return out_path
 
+    # 修正：抽象通用定量写出函数，统一处理 RSEM/Salmon/Kallisto/featureCounts 四种工具的 isoform/gene 两个层级
+    from typing import Optional
+    def _write_quant_file(self, tool: str, level: str, base_name: str, count_type: Optional[str] = None):
+        """
+        通用写出函数，减少重复代码：
+        - tool: 'rsem' | 'salmon' | 'kallisto' | 'featureCounts'
+        - level: 'isoform' | 'gene'
+        - count_type: 计数类型，默认使用 self.export_count_type
+        返回：生成的文件路径或 None
+        """
+        if self.annotation_df is None:
+            return None
+        ctype = count_type if count_type is not None else (self.export_count_type if self.export_count_type != 'all' else 'Final_EM')
+        prefix = self.isoform_prefix if level == 'isoform' else self.gene_prefix
+        counter = (self.counts_data if level == 'isoform' else self.gene_level_counts_unique_genes).get(f"{prefix}{ctype}", Counter())
+        if not counter:
+            return None
+
+        df_anno = self.annotation_df
+        # 选择ID与长度列
+        if level == 'isoform':
+            id_key = 'txname' if 'txname' in df_anno.columns else 'transcript_id'
+            len_key = 'txLength' if 'txLength' in df_anno.columns else 'length'
+            eff_key = 'txEffectiveLength' if 'txEffectiveLength' in df_anno.columns else len_key
+            if id_key in df_anno.columns and len_key in df_anno.columns:
+                length_map = dict(zip(df_anno[id_key], df_anno[len_key]))
+            else:
+                length_map = {}
+            if id_key in df_anno.columns and eff_key in df_anno.columns:
+                eff_length_map = dict(zip(df_anno[id_key], df_anno[eff_key]))
+            else:
+                eff_length_map = {}
+        else:
+            id_key = 'geneName'
+            # gene 长度优先使用 genelongesttxLength → 回退到 txLength（按基因聚合）
+            len_key = 'genelongesttxLength' if 'genelongesttxLength' in df_anno.columns else ('txLength' if 'txLength' in df_anno.columns else None)
+            eff_key = 'geneEffectiveLength' if 'geneEffectiveLength' in df_anno.columns else len_key
+            if len_key and id_key in df_anno.columns:
+                if len_key == 'txLength':
+                    length_map = dict(df_anno.groupby(id_key)[len_key].max())
+                else:
+                    length_map = dict(df_anno.groupby(id_key)[len_key].max())
+            else:
+                length_map = {}
+            if eff_key and id_key in df_anno.columns:
+                gene_eff_map = dict(df_anno.groupby(id_key)[eff_key].max())
+            else:
+                gene_eff_map = {}
+
+        # 构建输出行
+        rows = []
+        if tool == 'rsem':
+            # RSEM 不包含 TPM 输出，写 expected_count + 长度
+            for ident, count in counter.items():
+                if level == 'isoform':
+                    length = length_map.get(ident, 0)
+                    eff_len = eff_length_map.get(ident, length)
+                    rows.append((ident, length, eff_len, round(float(count), 1)))
+                    columns = ['transcript_id', 'length', 'effective_length', 'expected_count']
+                    out_name = f"{base_name}.rsem.isoforms.{ctype}.results" if count_type is not None else f"{base_name}.rsem.isoforms.results"
+                else:
+                    length = length_map.get(ident, 0)
+                    eff_len = gene_eff_map.get(ident, length)
+                    rows.append((ident, length, eff_len, round(float(count), 1)))
+                    columns = ['gene_id', 'length', 'effective_length', 'expected_count']
+                    out_name = f"{base_name}.rsem.genes.{ctype}.results" if count_type is not None else f"{base_name}.rsem.genes.results"
+            out_df = pd.DataFrame(rows, columns=columns)
+            out_path = self.output_dir / out_name
+            out_df.to_csv(out_path, sep='\t', index=False)
+            return out_path
+
+        # 计算 TPM（基于当前 counter 与长度）
+        tpm_map = self._calculate_tpm(counter, length_map if level == 'isoform' else length_map)
+        for ident, count in counter.items():
+            _len_val = length_map.get(ident, 0)
+            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
+            eff_len = (eff_length_map.get(ident, length) if level == 'isoform' else gene_eff_map.get(ident, length))
+            cval = float(count)
+            # 按工具选择列与数值格式
+            if tool == 'salmon':
+                num_reads = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
+                tpm = round(float(tpm_map.get(ident, 0.0)), 2)
+                rows.append((ident, length, eff_len, tpm, num_reads))
+                columns = ['Name', 'Length', 'EffectiveLength', 'TPM', 'NumReads']
+            elif tool == 'kallisto':
+                est_counts = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
+                tpm = round(float(tpm_map.get(ident, 0.0)), 2)
+                if level == 'isoform':
+                    columns = ['target_id', 'length', 'eff_length', 'est_counts', 'tpm']
+                else:
+                    columns = ['target_id', 'length', 'eff_length', 'est_counts', 'tpm']
+                rows.append((ident, length, eff_len, est_counts, tpm))
+            elif tool == 'featureCounts':
+                fc_count = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
+                if level == 'isoform':
+                    columns = ['Geneid', 'Length', 'EffectiveLength', 'Count']
+                else:
+                    columns = ['Geneid', 'Length', 'EffectiveLength', 'Count']
+                rows.append((ident, length, eff_len, fc_count))
+            else:
+                return None
+
+        out_df = pd.DataFrame(rows, columns=columns)
+        if tool == 'salmon':
+            out_name = (f"{base_name}.salmon.{ctype}.quant.sf" if level == 'isoform' else f"{base_name}.salmon.genes.{ctype}.sf") if count_type is not None else (f"{base_name}.salmon.quant.sf" if level == 'isoform' else f"{base_name}.salmon.genes.sf")
+        elif tool == 'kallisto':
+            out_name = (f"{base_name}.kallisto.isoforms.{ctype}.abundance.tsv" if level == 'isoform' else f"{base_name}.kallisto.genes.{ctype}.abundance.tsv") if count_type is not None else (f"{base_name}.kallisto.isoforms.abundance.tsv" if level == 'isoform' else f"{base_name}.kallisto.genes.abundance.tsv")
+        elif tool == 'featureCounts':
+            out_name = (f"{base_name}.featureCounts.isoforms.{ctype}.tsv" if level == 'isoform' else f"{base_name}.featureCounts.genes.{ctype}.tsv") if count_type is not None else (f"{base_name}.featureCounts.isoforms.tsv" if level == 'isoform' else f"{base_name}.featureCounts.genes.tsv")
+        else:
+            return None
+
+        out_path = self.output_dir / out_name
+        # salmon/kallisto 输出 CSV，featureCounts 使用 TSV
+        if tool == 'featureCounts':
+            out_df.to_csv(out_path, sep='\t', index=False)
+        else:
+            out_df.to_csv(out_path, index=False)
+        return out_path
+
     def _get_gene_annotation_data(self):
         """获取基因注释数据"""
         if self.annotation_df is None:
@@ -2242,91 +2401,93 @@ class FanseCounter:
             except Exception as e:
                 print(f"基因水平计数文件生成失败: {e}")
 
-        # 生成RSEM兼容输出(iso/gene按level)
+        # 生成RSEM兼容输出(iso/gene按level) —— 使用通用写出函数
         if 'rsem' in fmt_set:
             if getattr(self, 'export_count_type', 'Final_EM') == 'all':
                 ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
                 for ct in ctype_list:
                     if self.level in ['isoform','both']:
-                        rsem_iso_file = self._write_rsem_isoform_results(base_name, ct)
+                        rsem_iso_file = self._write_quant_file('rsem', 'isoform', base_name, ct)
                         if rsem_iso_file:
                             count_files[f'rsem_isoform_{ct}'] = rsem_iso_file
                     if self.level in ['gene','both']:
-                        rsem_gene_file = self._write_rsem_gene_results(base_name, ct)
+                        rsem_gene_file = self._write_quant_file('rsem', 'gene', base_name, ct)
                         if rsem_gene_file:
                             count_files[f'rsem_gene_{ct}'] = rsem_gene_file
             else:
                 if self.level in ['isoform','both']:
-                    rsem_iso_file = self._write_rsem_isoform_results(base_name)
+                    rsem_iso_file = self._write_quant_file('rsem', 'isoform', base_name)
                     if rsem_iso_file:
                         count_files['rsem_isoform'] = rsem_iso_file
                 if self.level in ['gene','both']:
-                    rsem_gene_file = self._write_rsem_gene_results(base_name)
+                    rsem_gene_file = self._write_quant_file('rsem', 'gene', base_name)
                     if rsem_gene_file:
                         count_files['rsem_gene'] = rsem_gene_file
 
-        # 生成Salmon/Kallisto/featureCounts兼容输出（CSV）
+        # 生成 Salmon/Kallisto/featureCounts 兼容输出（统一调用）
         if 'salmon' in fmt_set:
             if getattr(self, 'export_count_type', 'Final_EM') == 'all':
                 ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
                 for ct in ctype_list:
                     if self.level in ['isoform','both']:
-                        salmon_iso_file = self._write_salmon_isoform_results(base_name, ct)
+                        salmon_iso_file = self._write_quant_file('salmon', 'isoform', base_name, ct)
                         if salmon_iso_file:
                             count_files[f'salmon_isoform_{ct}'] = salmon_iso_file
                     if self.level in ['gene','both']:
-                        salmon_gene_file = self._write_salmon_gene_results(base_name, ct)
+                        salmon_gene_file = self._write_quant_file('salmon', 'gene', base_name, ct)
                         if salmon_gene_file:
                             count_files[f'salmon_gene_{ct}'] = salmon_gene_file
             else:
                 if self.level in ['isoform','both']:
-                    salmon_iso_file = self._write_salmon_isoform_results(base_name)
+                    salmon_iso_file = self._write_quant_file('salmon', 'isoform', base_name)
                     if salmon_iso_file:
                         count_files['salmon_isoform'] = salmon_iso_file
                 if self.level in ['gene','both']:
-                    salmon_gene_file = self._write_salmon_gene_results(base_name)
+                    salmon_gene_file = self._write_quant_file('salmon', 'gene', base_name)
                     if salmon_gene_file:
                         count_files['salmon_gene'] = salmon_gene_file
+
         if 'kallisto' in fmt_set:
             if getattr(self, 'export_count_type', 'Final_EM') == 'all':
                 ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
                 for ct in ctype_list:
                     if self.level in ['isoform','both']:
-                        kallisto_iso_file = self._write_kallisto_isoform_results(base_name, ct)
+                        kallisto_iso_file = self._write_quant_file('kallisto', 'isoform', base_name, ct)
                         if kallisto_iso_file:
                             count_files[f'kallisto_isoform_{ct}'] = kallisto_iso_file
                     if self.level in ['gene','both']:
-                        kallisto_gene_file = self._write_kallisto_gene_results(base_name, ct)
+                        kallisto_gene_file = self._write_quant_file('kallisto', 'gene', base_name, ct)
                         if kallisto_gene_file:
                             count_files[f'kallisto_gene_{ct}'] = kallisto_gene_file
             else:
                 if self.level in ['isoform','both']:
-                    kallisto_iso_file = self._write_kallisto_isoform_results(base_name)
+                    kallisto_iso_file = self._write_quant_file('kallisto', 'isoform', base_name)
                     if kallisto_iso_file:
                         count_files['kallisto_isoform'] = kallisto_iso_file
                 if self.level in ['gene','both']:
-                    kallisto_gene_file = self._write_kallisto_gene_results(base_name)
+                    kallisto_gene_file = self._write_quant_file('kallisto', 'gene', base_name)
                     if kallisto_gene_file:
                         count_files['kallisto_gene'] = kallisto_gene_file
+
         if 'featureCounts' in fmt_set:
             if getattr(self, 'export_count_type', 'Final_EM') == 'all':
                 ctype_list = ['raw','unique','firstID','Final_EM','Final_EQ','Final_MA']
                 for ct in ctype_list:
                     if self.level in ['isoform','both']:
-                        fc_iso_file = self._write_featurecounts_isoform_results(base_name, ct)
+                        fc_iso_file = self._write_quant_file('featureCounts', 'isoform', base_name, ct)
                         if fc_iso_file:
                             count_files[f'featureCounts_isoform_{ct}'] = fc_iso_file
                     if self.level in ['gene','both']:
-                        fc_gene_file = self._write_featurecounts_gene_results(base_name, ct)
+                        fc_gene_file = self._write_quant_file('featureCounts', 'gene', base_name, ct)
                         if fc_gene_file:
                             count_files[f'featureCounts_gene_{ct}'] = fc_gene_file
             else:
                 if self.level in ['isoform','both']:
-                    fc_iso_file = self._write_featurecounts_isoform_results(base_name)
+                    fc_iso_file = self._write_quant_file('featureCounts', 'isoform', base_name)
                     if fc_iso_file:
                         count_files['featureCounts_isoform'] = fc_iso_file
                 if self.level in ['gene','both']:
-                    fc_gene_file = self._write_featurecounts_gene_results(base_name)
+                    fc_gene_file = self._write_quant_file('featureCounts', 'gene', base_name)
                     if fc_gene_file:
                         count_files['featureCounts_gene'] = fc_gene_file
 

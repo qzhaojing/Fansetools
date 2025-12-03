@@ -7,6 +7,7 @@ v0.1 初始版本，解析FANSe3结果文件，返回FANSeRecord对象
 """
 
 import re
+import sys  # 新增：使用 sys.intern 对高重复字符串进行驻留，降低内存占用与比较开销
 import os
 import io
 import gzip
@@ -119,14 +120,16 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
             # 处理可能的多值字段
             if multi_count!=1:
                 strands = tuple(fields2[0].split(','))
-                ref_names = tuple(fields2[1].split(','))
+                # 修正：对 ref_names 应用 sys.intern，驻留高重复的转录本/参考序列ID，减少内存与哈希成本
+                ref_names = tuple(sys.intern(name) for name in fields2[1].split(','))
                 mismatches = [int(fields2[2])]    #fanse 文件中此字段只有一个而非多个用逗号分割，因此测试注释掉上面行
                 positions = [int(x) for x in fields2[3].split(',')]
 
             else:  # single-mapping reads
                 # 单映射reads，直接使用字段值
                 strands = (fields2[0],)
-                ref_names = (fields2[1],)
+                # 修正：对单映射的 ref_names 同样应用 sys.intern，确保与多映射保持一致
+                ref_names = (sys.intern(fields2[1]),)
                 mismatches = [int(fields2[2])]
                 positions = [int(fields2[3])]
             
@@ -205,12 +208,14 @@ def fanse_parser_high_performance(file_path: str) -> Generator[FANSeRecord, None
             # 根据multi_count分支处理
             if multi_count != 1:
                 strands = tuple(comma_split(strand_field))
-                ref_names = tuple(comma_split(ref_field))
+                # 修正：高性能解析同样对 ref_names 执行 sys.intern，降低字符串重复与比较开销
+                ref_names = tuple(sys.intern(name) for name in comma_split(ref_field))
                 positions = [int(x) for x in comma_split(position_field)]
                 mismatches = [mismatch_val] * len(positions)
             else:
                 strands = (strand_field,)
-                ref_names = (ref_field,)
+                # 修正：单映射情形下驻留 ref_names
+                ref_names = (sys.intern(ref_field),)
                 positions = [int(position_field)]
                 mismatches = [mismatch_val]
             
