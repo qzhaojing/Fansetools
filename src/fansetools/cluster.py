@@ -327,94 +327,58 @@ class OptimizedClusterManager:
     
     
     def install_node_software(self, node: ClusterNode, install_conda: bool, install_fansetools: bool, pip_mirror: str) -> bool:
-        """在节点上安装软件（Conda/fansetools）"""
+        """在节点上安装软件（Conda/Miniforge、git、fansetools）
+        修正：读取本地 utils 安装脚本并在远端执行，统一Windows/Linux行为，避免复杂引号问题；并修复 Windows 安装器路径引号问题
+        """
         print(f"🔧 正在节点 '{node.name}' 上执行安装任务...")
         ssh = self._create_ssh_connection(node)
         if not ssh:
             print(f"❌ 无法连接到节点 '{node.name}'")
             return False
-        
+
         try:
             is_windows = self._is_windows_system(ssh)
+            utils_dir = Path(__file__).resolve().parent / 'utils'
             cmd = ""
-            
+
             if is_windows:
-                # Windows 安装脚本 (PowerShell)
-                # 构建一个复合命令串
-                ps_lines = [
-                    '$ErrorActionPreference = "Stop"',
-                    'Write-Host "--- Windows 安装环境检查 ---"'
+                # 修正：读取 PowerShell 安装脚本并附加调用参数
+                ps_path = utils_dir / 'install_win.ps1'
+                if not ps_path.exists():
+                    raise FileNotFoundError(str(ps_path))
+                with open(ps_path, 'r', encoding='utf-8') as f:
+                    script_body = f.read()
+                inv = [
+                    'Invoke-FansetoolsInstall',
+                    f'-InstallConda:{"$true" if install_conda else "$false"}',
+                    f'-InstallFansetools:{"$true" if install_fansetools else "$false"}',
+                    f'-PipMirror "{pip_mirror}"'
                 ]
-                
-                if install_conda:
-                    ps_lines.extend([
-                        'if (-not (Test-Path "$env:USERPROFILE\\miniconda3")) {',
-                        '  Write-Host "正在下载 Miniconda..."',
-                        '  $installer = "$env:TEMP\\miniconda_setup.exe"',
-                        '  Invoke-WebRequest -Uri "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe" -OutFile $installer',
-                        '  Write-Host "正在安装 Miniconda (静默模式)..."',
-                        '  Start-Process -FilePath $installer -ArgumentList "/S", "/D=$env:USERPROFILE\\miniconda3", "/RegisterPython=1", "/AddToPath=1" -Wait',
-                        '  Remove-Item $installer',
-                        '  Write-Host "Miniconda 安装完成"',
-                        '} else { Write-Host "Miniconda 目录已存在，跳过安装" }'
-                    ])
-                
-                if install_fansetools:
-                    ps_lines.extend([
-                        'Write-Host "正在安装 fansetools..."',
-                        '$py = "$env:USERPROFILE\\miniconda3\\python.exe"',
-                        'if (-not (Test-Path $py)) { $py = "python" }',
-                        f'& $py -m pip install fansetools -i {pip_mirror} --upgrade',
-                        'Write-Host "fansetools 安装/更新完成"'
-                    ])
-                
-                full_script = "; ".join(ps_lines)
-                cmd = f'powershell -NoProfile -Command "{full_script}"'
-                
+                full_script = script_body + "\n" + " ".join(inv)
+                import base64
+                encoded_cmd = base64.b64encode(full_script.encode('utf-16le')).decode('utf-8')
+                cmd = f'powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded_cmd}'
             else:
-                # Linux 安装脚本 (Bash)
-                sh_lines = [
-                    'set -e',
-                    'echo "--- Linux 安装环境检查 ---"'
+                # 修正：读取 Bash 安装脚本并附加调用参数
+                sh_path = utils_dir / 'install_linux.sh'
+                if not sh_path.exists():
+                    raise FileNotFoundError(str(sh_path))
+                with open(sh_path, 'r', encoding='utf-8') as f:
+                    script_body = f.read()
+                inv = [
+                    'fansetools_install',
+                    f'--conda {"true" if install_conda else "false"}',
+                    f'--fansetools {"true" if install_fansetools else "false"}',
+                    f'--pip-mirror "{pip_mirror}"'
                 ]
-                
-                if install_conda:
-                    sh_lines.extend([
-                        'if [ ! -d "$HOME/miniconda3" ]; then',
-                        '  echo "正在下载 Miniconda..."',
-                        '  wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh',
-                        '  echo "正在安装 Miniconda..."',
-                        '  bash ~/miniconda.sh -b -p $HOME/miniconda3',
-                        '  rm ~/miniconda.sh',
-                        '  $HOME/miniconda3/bin/conda init bash',
-                        '  echo "Miniconda 安装完成"',
-                        'else',
-                        '  echo "Miniconda 目录已存在，跳过安装"',
-                        'fi'
-                    ])
-                
-                if install_fansetools:
-                    sh_lines.extend([
-                        'echo "正在安装 fansetools..."',
-                        'source $HOME/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true',
-                        'conda activate base 2>/dev/null || true',
-                        f'pip install fansetools -i {pip_mirror} --upgrade',
-                        'echo "fansetools 安装/更新完成"'
-                    ])
-                
-                # 构造单行命令
-                full_script = "\n".join(sh_lines)
-                # 转义双引号
+                full_script = script_body + "\n" + " ".join(inv)
                 full_script_escaped = full_script.replace('"', '\\"')
                 cmd = f'bash -c "{full_script_escaped}"'
-            
-            # 执行并实时输出
+
             print(f"🚀 发送指令到 '{node.name}'...")
             stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=True)
-            
             for line in iter(stdout.readline, ""):
                 print(f"  [{node.name}] {line.strip()}")
-                
             exit_status = stdout.channel.recv_exit_status()
             if exit_status == 0:
                 print(f"✅ 节点 '{node.name}' 任务成功")
@@ -422,7 +386,6 @@ class OptimizedClusterManager:
             else:
                 print(f"❌ 节点 '{node.name}' 任务失败 (Code {exit_status})")
                 return False
-                
         except Exception as e:
             print(f"❌ 安装异常: {e}")
             return False
@@ -459,7 +422,14 @@ class OptimizedClusterManager:
                 'load_avg': None,
                 'net_rx_mbps': None,
                 'net_tx_mbps': None,
-                'kernel_version': None  # 修正：detail模式下新增Linux内核版本
+                'kernel_version': None,  # 修正：detail模式下新增Linux内核版本
+                # 修正：新增环境与路径检查结果，用于列表与筛选
+                'conda_ok': None,
+                'conda_version': None,
+                'fansetools_ok': None,
+                'fansetools_version': None,
+                'fanse_path_ok': None,
+                'temp_folder_ok': None
             }
             
             # 1. 网络连通性与响应时间
@@ -495,6 +465,7 @@ class OptimizedClusterManager:
                     success, out, _ = self._execute_remote_command(ssh, cmd)
                     if success and 'LoadPercentage=' in out:
                         info['cpu_usage'] = f"{out.split('LoadPercentage=')[1].strip()}%"
+                    
                     # 修正：采集CPU型号与频率
                     cmd = 'wmic cpu get Name,CurrentClockSpeed /value'
                     success, out, _ = self._execute_remote_command(ssh, cmd)
@@ -510,6 +481,7 @@ class OptimizedClusterManager:
                     success, out, _ = self._execute_remote_command(ssh, cmd)
                     if success:
                         info['cpu_usage'] = f"{float(out):.1f}%"
+                    
                     # 修正：采集CPU型号与频率（Linux）
                     # 型号
                     cmd = "lscpu | sed -n 's/Model name:\\s*//p'"
@@ -521,6 +493,7 @@ class OptimizedClusterManager:
                         success, out, _ = self._execute_remote_command(ssh, cmd)
                         if success and out:
                             info['cpu_model'] = out.strip()
+                    
                     # 频率（取平均MHz）
                     cmd = "awk -F: '/cpu MHz/ {sum+=$2; cnt++} END {if(cnt>0) printf \"%.0f\", sum/cnt}' /proc/cpuinfo"
                     success, out, _ = self._execute_remote_command(ssh, cmd)
@@ -540,6 +513,7 @@ class OptimizedClusterManager:
                         used_percent = (total - free) / total * 100
                         info['memory_usage'] = f"{(total - free):.1f}/{total:.1f} GB, {used_percent:.1f}%"
                 else:
+                    
                     # 修正：显示已用/总量（GB）和百分比
                     cmd = "free -b | awk '/Mem:/ {printf \"%.1f/%.1f GB, %.1f%%\", $3/1e9, $2/1e9, ($3/$2)*100}'"
                     success, out, _ = self._execute_remote_command(ssh, cmd)
@@ -562,6 +536,92 @@ class OptimizedClusterManager:
                     success, out, _ = self._execute_remote_command(ssh, cmd)
                     if success:
                         info['disk_usage'] = f"/ {out.strip()}"
+
+                # 修正：环境与路径检查（Conda/Fansetools/FANSe路径/工作目录）
+                try:
+                    if is_windows:
+                        # Conda 检查：优先检测 Miniforge/Miniconda 安装目录与版本
+                        cmd = '$c = Get-Command conda -ErrorAction SilentlyContinue; if ($c) { conda -V }'
+                        success, out, _ = self._execute_remote_command(ssh, f'powershell -NoProfile -Command "{cmd}"')
+                        if success and out:
+                            info['conda_ok'] = True
+                            info['conda_version'] = out.strip()
+                        else:
+                            # 路径存在性回退检测
+                            success, out, _ = self._execute_remote_command(ssh, 'if exist "%USERPROFILE%\\miniforge3\\python.exe" echo YES')
+                            if not success:
+                                success, out, _ = self._execute_remote_command(ssh, 'if exist "%USERPROFILE%\\miniconda3\\python.exe" echo YES')
+                            info['conda_ok'] = True if (success and 'YES' in out) else False
+                            info['conda_version'] = None
+
+                        # Fansetools 检查：优先使用 conda python
+                        py_candidates = [
+                            '%USERPROFILE%\\miniforge3\\python.exe',
+                            '%USERPROFILE%\\miniconda3\\python.exe',
+                            'python'
+                        ]
+                        fans_ok = False
+                        fans_ver = None
+                        for py in py_candidates:
+                            cmd = f'"{py}" -c "import fansetools, sys; sys.stdout.write(getattr(fansetools,\"__version__\",\"\"))"'
+                            success, out, _ = self._execute_remote_command(ssh, cmd)
+                            if success:
+                                fans_ok = True
+                                fans_ver = out.strip() or None
+                                break
+                        info['fansetools_ok'] = fans_ok
+                        info['fansetools_version'] = fans_ver
+
+                        # FANSe 路径检查
+                        if node.fanse_path:
+                            info['fanse_path_ok'] = self._test_windows_path(ssh, node.fanse_path)
+                        else:
+                            info['fanse_path_ok'] = None
+
+                        # 工作目录检查（作为临时目录）
+                        if node.work_dir:
+                            cmd = f'powershell -NoProfile -Command "Test-Path \"{node.work_dir}\" -PathType Container"'
+                            success, out, _ = self._execute_remote_command(ssh, cmd)
+                            info['temp_folder_ok'] = True if (success and ('True' in out)) else False
+                        else:
+                            info['temp_folder_ok'] = None
+                    else:
+                        # Linux Conda 检查
+                        success, out, _ = self._execute_remote_command(ssh, 'bash -lc "conda -V"')
+                        if success and out:
+                            info['conda_ok'] = True
+                            info['conda_version'] = out.strip()
+                        else:
+                            success, out, _ = self._execute_remote_command(ssh, 'test -d "$HOME/miniforge3" && echo YES || test -d "$HOME/miniconda3" && echo YES')
+                            info['conda_ok'] = True if (success and 'YES' in out) else False
+                            info['conda_version'] = None
+
+                        # Fansetools 检查
+                        fans_ok = False
+                        fans_ver = None
+                        for py in ['python3', 'python']:
+                            success, out, _ = self._execute_remote_command(ssh, f'bash -lc "{py} -c \"import fansetools, sys; sys.stdout.write(getattr(fansetools,\\\"__version__\\\",\\\"\\\"))\""')
+                            if success:
+                                fans_ok = True
+                                fans_ver = out.strip() or None
+                                break
+                        info['fansetools_ok'] = fans_ok
+                        info['fansetools_version'] = fans_ver
+
+                        # FANSe 路径检查
+                        if node.fanse_path:
+                            info['fanse_path_ok'] = self._test_linux_path(ssh, node.fanse_path)
+                        else:
+                            info['fanse_path_ok'] = None
+
+                        # 工作目录检查
+                        if node.work_dir:
+                            success, out, _ = self._execute_remote_command(ssh, f'bash -lc "test -d \"{node.work_dir}\" && echo YES"')
+                            info['temp_folder_ok'] = True if (success and 'YES' in out) else False
+                        else:
+                            info['temp_folder_ok'] = None
+                except Exception:
+                    pass
 
                 # 7. 负载均值 & 网络带宽（detail模式）
                 if detail:
@@ -682,6 +742,7 @@ class OptimizedClusterManager:
         node = self.nodes.get(node_name)
         ssh = self._create_ssh_connection(node)
         return self._deploy_fanse_to_remote(node, ssh)
+
     def monitor_node_execution(self, node_name: str, command: str, quiet: bool = False, log_file: Optional[str] = None, prefix: Optional[str] = None, idle_timeout: Optional[int] = None, hard_timeout: Optional[int] = None, heartbeat_sec: int = 0, stop_event: Optional[any] = None):
         """实时监控远程节点执行（支持静默、日志、心跳与超时）
         修改说明：
@@ -916,7 +977,7 @@ def cluster_command(args):
                 status_map = {}
 
             if getattr(args, 'table', False):
-                headers = ['Name','Online','Resp(ms)','CPU','Mem','Disk','Address','Path','Auth']
+                headers = ['Node_name','Online','Resp(ms)','CPU_usage','Mem_usage','Disk_usage','Address','Path','Auth']
                 print("-" * 120)
                 print(" ".join([f"{h:<10}" for h in headers]))
                 print("-" * 120)
@@ -971,7 +1032,7 @@ def cluster_command(args):
                     print("-" * 80)
                 
         elif args.cluster_command == 'check':
-            # 修正：支持 --watch 实时刷新
+            # 修正：支持 --watch 实时刷新；重构输出为两行，第一列始终为 node_name，并在第二行显示环境与路径检查
             interval = max(1, min(5, getattr(args, 'watch', 0) or 0))
             iterations = getattr(args, 'count', 0) or 0
             run_forever = interval > 0 and iterations == 0
@@ -986,60 +1047,82 @@ def cluster_command(args):
                     online_count = sum(1 for info in status_map.values() if info.get('online'))
                     print(f"📊 节点状态: {online_count}/{len(status_map)} 在线")
 
-                    if getattr(args, 'table', False):
-                        headers = ['Name','Online','Resp(ms)','CPU','Mem','Disk','CPU模型','频率(MHz)']
+                    # 行1：核心硬件与负载信息
+                    headers1 = ['Node_name','Online','Resp(ms)','CPU_usage','Mem_usage','Disk_usage','CPU型号','频率(MHz)']
+                    widths1 = [16,8,10,10,30,30,32,12]
+                    sep_len1 = sum(widths1) + len(widths1) - 1
+                    print("-" * sep_len1)
+                    print(" ".join([h.ljust(w) for h, w in zip(headers1, widths1)]))
+                    print("-" * sep_len1)
+
+
+
+                    for name, info in status_map.items():
+                        # 行1数据
+                        is_online = bool(info.get('online'))
+                        rt = info.get('response_time')
+                        cores = info.get('cpu_cores')
+                        cpu = info.get('cpu_usage')
+                        mem = info.get('memory_usage')
+                        disk = info.get('disk_usage')
+                        model = info.get('cpu_model') or '-'
+                        freq = info.get('cpu_freq_mhz')
+                        freq_str = str(freq) if freq is not None else '-'
+                        row1 = [
+                            str(name),
+                            '在线' if is_online else '离线',
+                            str(rt) if rt is not None else '-',
+                            cpu if cpu is not None else '-',
+                            mem if mem is not None else '-',
+                            disk if disk is not None else '-',
+                            model,
+                            freq_str
+                        ]
+                        print(" ".join([str(v)[:widths1[i]].ljust(widths1[i]) for i, v in enumerate(row1)]))
+
+                    # 行2：环境与路径检查 + 可选网络信息（同时显示路径与检查结果）
+                    headers2 = ['Node_name','Conda','Fansetools','Fanse_Path','Fanse_Path(ck)','TempFolder(-w)','TempFolder(ck)']
+                    widths2 = [16,16,16,28,12,28,12]
+                    if getattr(args, 'detail', False):
+                        headers2 += ['Kernel','LoadAvg','Net RX','Net TX']
+                        widths2 += [20,16,10,10]
+                    sep_len2 = sum(widths2) + len(widths2) - 1
+                    print("-" * sep_len2)
+                    print(" ".join([h.ljust(w) for h, w in zip(headers2, widths2)]))
+                    print("-" * sep_len2)
+                    for name, info in status_map.items():
+                        # 行2数据（带检查标记与路径）
+                        c_ok = info.get('conda_ok')
+                        c_ver = info.get('conda_version')
+                        c_str = '-' if c_ok is None else (f"✓ {c_ver}" if c_ok and c_ver else ("✓" if c_ok else "✗"))
+                        f_ok = info.get('fansetools_ok')
+                        f_ver = info.get('fansetools_version')
+                        f_str = '-' if f_ok is None else (f"✓ {f_ver}" if f_ok and f_ver else ("✓" if f_ok else "✗"))
+                        node_obj = cluster_mgr.nodes.get(name)
+                        fanse_path_str = (node_obj.fanse_path if (node_obj and node_obj.fanse_path) else '-')
+                        p_ok = info.get('fanse_path_ok')
+                        p_ck = '-' if p_ok is None else ('✓' if p_ok else '✗')
+                        temp_folder_str = (node_obj.work_dir if (node_obj and node_obj.work_dir) else '-')
+                        t_ok = info.get('temp_folder_ok')
+                        t_ck = '-' if t_ok is None else ('✓' if t_ok else '✗')
+
+                        row2 = [str(name), c_str, f_str, fanse_path_str, p_ck, temp_folder_str, t_ck]
                         if getattr(args, 'detail', False):
-                            headers += ['Kernel','LoadAvg','Net RX','Net TX']  # 修正：detail增加Kernel列
-                        widths = [12,8,10,8,22,22,28,12]
-                        if getattr(args, 'detail', False):
-                            widths += [18,16,10,10]  # 修正：为Kernel与扩展列分配宽度
-                        sep_len = sum(widths) + len(widths) - 1
-                        print("-" * sep_len)
-                        print(" ".join([h.ljust(w) for h, w in zip(headers, widths)]))
-                        print("-" * sep_len)
-                        for name, info in status_map.items():
-                            is_online = bool(info.get('online'))
-                            rt = info.get('response_time')
-                            cores = info.get('cpu_cores')
-                            cpu = info.get('cpu_usage')
-                            mem = info.get('memory_usage')
-                            disk = info.get('disk_usage')
-                            model = info.get('cpu_model') or '-'
-                            freq = info.get('cpu_freq_mhz')
-                            freq_str = str(freq) if freq is not None else '-'
-                            row = [
-                                str(name),
-                                '在线' if is_online else '离线',
-                                str(rt) if rt is not None else '-',
-                                str(cores) if cores is not None else '-',
-                                mem if mem is not None else '-',
-                                disk if disk is not None else '-',
-                                model,
-                                freq_str
+                            row2 += [
+                                info.get('kernel_version') or '-',
+                                info.get('load_avg') or '-',
+                                str(info.get('net_rx_mbps')) if info.get('net_rx_mbps') is not None else '-',
+                                str(info.get('net_tx_mbps')) if info.get('net_tx_mbps') is not None else '-'
                             ]
-                            if getattr(args, 'detail', False):
-                                row += [info.get('kernel_version') or '-',
-                                        info.get('load_avg') or '-',
-                                        str(info.get('net_rx_mbps')) if info.get('net_rx_mbps') is not None else '-',
-                                        str(info.get('net_tx_mbps')) if info.get('net_tx_mbps') is not None else '-']
-                            print(" ".join([str(v)[:widths[i]].ljust(widths[i]) for i, v in enumerate(row)]))
-                        print("-" * sep_len)
-                    else:
-                        for name, info in status_map.items():
-                            is_online = bool(info.get('online'))
-                            status_icon = "✅" if is_online else "❌"
-                            print(f"{status_icon} {name}: {'在线' if is_online else '离线'}")
-                            rt = info.get('response_time')
-                            cores = info.get('cpu_cores')
-                            cpu = info.get('cpu_usage')
-                            mem = info.get('memory_usage')
-                            disk = info.get('disk_usage')
-                            model = info.get('cpu_model') or '-'
-                            freq = info.get('cpu_freq_mhz')
-                            base = f"    响应: {rt if rt is not None else '-'} ms | 核心: {cores if cores is not None else '-'} | CPU: {cpu if cpu is not None else '-'} | 内存: {mem if mem is not None else '-'} | 磁盘: {disk if disk is not None else '-'} | 型号: {model} | 频率: {freq if freq is not None else '-'} MHz"
-                            if getattr(args, 'detail', False):
-                                base += f" | 内核: {info.get('kernel_version') or '-'} | 负载: {info.get('load_avg') or '-'} | 网速: RX {info.get('net_rx_mbps') if info.get('net_rx_mbps') is not None else '-'} Mb/s, TX {info.get('net_tx_mbps') if info.get('net_tx_mbps') is not None else '-'} Mb/s"
-                            print(base)
+
+                        print(" ".join([str(v)[:widths2[i]].ljust(widths2[i]) for i, v in enumerate(row2)]))
+
+                    print("-" * sep_len2)
+
+
+
+
+
 
                     if interval > 0:
                         if not run_forever:
@@ -1061,6 +1144,80 @@ def cluster_command(args):
                         break
             except KeyboardInterrupt:
                 pass
+            # # 修正：支持 --watch 实时刷新
+            # interval = max(1, min(5, getattr(args, 'watch', 0) or 0))
+            # iterations = getattr(args, 'count', 0) or 0
+            # run_forever = interval > 0 and iterations == 0
+            # loop_count = iterations if iterations > 0 else 1
+            # try:
+            #     while True:
+            #         status_map = cluster_mgr.check_all_nodes_parallel(detail=getattr(args, 'detail', False))
+            #         if not status_map:
+            #             print("📭 集群中暂无节点")
+            #             return
+
+            #         online_count = sum(1 for info in status_map.values() if info.get('online'))
+            #         print(f"📊 节点状态: {online_count}/{len(status_map)} 在线")
+
+            #         # 默认以表格形式输出（-t 效果）
+            #         headers = ['Node_name','Online','Resp(ms)','CPU_usage','Mem_usage','Disk_usage','CPU型号','频率(MHz)']
+            #         if getattr(args, 'detail', False):
+            #             headers += ['Kernel','LoadAvg','Net RX','Net TX']  # detail增加Kernel列
+            #         widths = [12,8,10,8,22,22,28,12]
+            #         if getattr(args, 'detail', False):
+            #             widths += [18,16,10,10]  # 为Kernel与扩展列分配宽度
+            #         sep_len = sum(widths) + len(widths) - 1
+            #         print("-" * sep_len)
+            #         print(" ".join([h.ljust(w) for h, w in zip(headers, widths)]))
+            #         print("-" * sep_len)
+            #         for name, info in status_map.items():
+            #             is_online = bool(info.get('online'))
+            #             rt = info.get('response_time')
+            #             cores = info.get('cpu_cores')
+            #             cpu = info.get('cpu_usage')
+            #             mem = info.get('memory_usage')
+            #             disk = info.get('disk_usage')
+            #             model = info.get('cpu_model') or '-'
+            #             freq = info.get('cpu_freq_mhz')
+            #             freq_str = str(freq) if freq is not None else '-'
+            #             row = [
+            #                 str(name),
+            #                 '在线' if is_online else '离线',
+            #                 str(rt) if rt is not None else '-',
+            #                 str(cores) if cores is not None else '-',
+            #                 mem if mem is not None else '-',
+            #                 disk if disk is not None else '-',
+            #                 model,
+            #                 freq_str
+            #             ]
+            #             if getattr(args, 'detail', False):
+            #                 row += [info.get('kernel_version') or '-',
+            #                         info.get('load_avg') or '-',
+            #                         str(info.get('net_rx_mbps')) if info.get('net_rx_mbps') is not None else '-',
+            #                         str(info.get('net_tx_mbps')) if info.get('net_tx_mbps') is not None else '-']
+            #             print(" ".join([str(v)[:widths[i]].ljust(widths[i]) for i, v in enumerate(row)]))
+            #         print("-" * sep_len)
+
+            #         if interval > 0:
+            #             if not run_forever:
+            #                 loop_count -= 1
+            #                 if loop_count <= 0:
+            #                     break
+            #             # 修正：支持Windows下ESC立即终止watch
+            #             slept = 0.0
+            #             step = 0.1
+            #             while slept < interval:
+            #                 if _HAS_MSVCRT and msvcrt.kbhit():
+            #                     ch = msvcrt.getch()
+            #                     if ch in (b'\x1b',):  # ESC键
+            #                         print("🔴 监控已终止（ESC）")
+            #                         return
+            #                 time.sleep(step)
+            #                 slept += step
+            #         else:
+            #             break
+            # except KeyboardInterrupt:
+            #     pass
                 
         elif args.cluster_command == 'run':
             # 修正：支持直接传 run 参数；支持 -n/--nodes 和 -p 自动选择
@@ -1147,15 +1304,21 @@ def cluster_command(args):
             if node_list:
                 selected_nodes = [n.strip() for n in str(node_list).split(',') if n.strip()]
             elif pick_n > 0:
-                # 修正：支持等待节点就绪并选择最快N台
+                # 修正：支持等待节点就绪并选择最快N台；非原生模式需确认已安装 fansetools
                 deadline = time.time() + max(0, wait_sec)
                 while True:
                     status_map = cluster_mgr.check_all_nodes_parallel()
-                    candidates = [
-                        (name, info.get('response_time'))
-                        for name, info in status_map.items()
-                        if info.get('online') and isinstance(info.get('response_time'), (int, float))
-                    ]
+                    candidates = []
+                    for name, info in status_map.items():
+                        if not info.get('online'):
+                            continue
+                        rt = info.get('response_time')
+                        if not isinstance(rt, (int, float)):
+                            continue
+                        if not native_mode:
+                            if info.get('fansetools_ok') is not True:
+                                continue
+                        candidates.append((name, rt))
                     candidates.sort(key=lambda x: x[1])
                     selected_nodes = [name for name, _ in candidates[:pick_n]]
                     if selected_nodes:
@@ -1605,7 +1768,7 @@ FANSe3 集群管理工具
     check_parser.add_argument('-t', '--table', action='store_true', help='以表格形式显示（实时检测）')
     # 修正：新增实时监控刷新参数
     check_parser.add_argument('-w', '--watch', type=int, default=0, help='持续监控，间隔秒数（1-5）')
-    check_parser.add_argument('-c', '--count', type=int, default=0, help='刷新次数（0为无限直到Ctrl+C）')
+    check_parser.add_argument('-c', '--count', type=int, default=1, help='刷新次数（0为无限直到Ctrl+C）')
     # 修正：新增扩展指标
     check_parser.add_argument('--detail', action='store_true', help='显示负载均值与网络带宽信息')
     

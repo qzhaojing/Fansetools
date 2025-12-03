@@ -21,13 +21,13 @@ from typing import List, Generator
 # from tqdm import tqdm
 
 
-@dataclass
+@dataclass(slots=True)
 class FANSeRecord:
     """
     存储FANSe3单条记录的类
     使用slots减少内存开销
     """
-    #__slots__ = ['header', 'seq', 'alignment', 'strands', 'ref_names', 'mismatches', 'positions', 'multi_count']
+    # 修正：启用 dataclass(slots=True) 以降低每条记录的对象开销，减少内存占用并提升大批处理时的缓存友好性
     
     header: str               # Read名称
     seq: str                  # Read序列

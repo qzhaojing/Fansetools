@@ -49,6 +49,7 @@ setup(
         'packaging>=20.0',
         'requests>=2.20.0',
         # 'cutadapt',  # 如需 cutadapt 功能，请取消注释
+        'paramiko', 
     ],
 
     extras_require={
