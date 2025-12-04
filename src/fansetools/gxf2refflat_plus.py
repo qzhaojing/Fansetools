@@ -571,7 +571,7 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
     # 可选：添加额外信息列
     extra_columns = [
         'genename', 'g_biotype', 't_biotype', 'protein_id',
-        'txLength', 'cdsLength', 'utr5Length', 'utr3Length',
+        'txLength', 'isoformEffectiveLength', 'cdsLength', 'utr5Length', 'utr3Length',
         'genelongesttxLength', 'genelongestcdsLength', 'geneEffectiveLength',
         'geneNonOverlapLength', 'geneReadCoveredLength', 'description',
         'exonStarts_list','exonEnds_list',
@@ -604,7 +604,7 @@ def save_refflat_dataframe(df, output_file, add_header=False, is_rna=False):
         'geneName', 'txname', 'chrom', 'strand', 'txStart', 'txEnd',
         'cdsStart', 'cdsEnd', 'exonCount', 'exonStarts', 'exonEnds',
         'genename', 'g_biotype', 't_biotype', 'protein_id',
-        'txLength', 'cdsLength', 'utr5Length', 'utr3Length',
+        'txLength', 'isoformEffectiveLength', 'cdsLength', 'utr5Length', 'utr3Length',
         'genelongesttxLength', 'genelongestcdsLength', 'geneEffectiveLength',
         'geneNonOverlapLength', 'geneReadCoveredLength',
         'description'
@@ -1092,3 +1092,8 @@ if __name__ == '__main__':
     #     output_prefix = output_prefix ,
     #     file_type="auto"
     # )
+    # 新增：若缺少 isoformEffectiveLength，则以 txLength 作为有效长度
+    if 'isoformEffectiveLength' not in df.columns:
+        df['isoformEffectiveLength'] = df['txLength']
+    # 新增：isoform 有效长度（转录本外显子非重叠并集长度），与 txLength 一致
+    df['isoformEffectiveLength'] = df['txLength']

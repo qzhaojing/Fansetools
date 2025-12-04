@@ -16,6 +16,7 @@ fansetools count 组件 - 用于处理fanse3文件的read计数
 import argparse
 from collections import Counter, defaultdict, deque
 from itertools import chain  # 修正：用于生成器级展开multi2all，避免构建巨大的中间列表
+from fansetools.quant import add_quant_columns, build_length_maps  # 新增：引入统一的定量计算函数
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import glob
 import multiprocessing as mp
@@ -40,6 +41,13 @@ from fansetools.gxf2refflat_plus import (
     load_annotation_to_dataframe,
 )
 from fansetools.parser import FANSeRecord, fanse_parser, fanse_parser_high_performance
+# 修正：新增定量模块引入，用于在唯一文件中追加 TPM/RPKM 列
+try:
+    from fansetools.quant import add_quant_columns, build_length_maps
+except Exception:
+    # 若独立模块不可用，保持兼容运行（不追加定量列）
+    add_quant_columns = None
+    build_length_maps = None
 from fansetools.utils.path_utils import PathProcessor
 try:
     from cryptography.utils import CryptographyDeprecationWarning
@@ -58,7 +66,7 @@ class ParallelFanseCounter:
         if self.verbose:
             print(f"初始化并行处理器: {self.max_workers} 个进程")
 
-    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode=None, verbose=False, batch_size=None):
+    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none'):
         """并行处理多个文件（仅显示正在运行的任务）"""
         if verbose:
             print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
@@ -75,10 +83,13 @@ class ParallelFanseCounter:
                 'gxf_file': gxf_file,
                 'level': level,
                 'paired_end': paired_end,
-                'length_mode': length_mode,
+                'length_mode_gene': length_mode_gene,
+                'length_mode_isoform': length_mode_isoform,
                 'file_stem': file_stem,
                 'verbose': verbose,
-                'batch_size': batch_size
+                'batch_size': batch_size,
+                # 修正：传递定量方法到工作进程
+                'quant': quant
             }
             tasks.append(task)
 
@@ -162,8 +173,11 @@ class ParallelFanseCounter:
                 verbose=task.get('verbose', False),
                 export_format=task.get('format', 'rsem'),
                 export_count_type=task.get('count_type','Final_EM'),
-                length_mode=task.get('length_mode', 'geneEffectiveLength'),
-                batch_size=task.get('batch_size', None)
+                length_mode_gene=task.get('length_mode_gene', 'genelongesttxLength'),
+                length_mode_isoform=task.get('length_mode_isoform', 'txLength'),
+                batch_size=task.get('batch_size', None),
+                # 修正：并行路径中追加定量参数
+                quant=task.get('quant', 'none')
             )
 
             # 运行计数处理
@@ -275,9 +289,12 @@ def count_main_parallel(args):
             level=args.level,
             paired_end=args.paired_end,
             annotation_df=annotation_df,
-            length_mode=getattr(args, 'len', 'geneEffectiveLength'),
+            length_mode_gene=getattr(args, 'len_gene', getattr(args, 'len', 'genelongesttxLength')),
+            length_mode_isoform=getattr(args, 'len_isoform', 'txLength'),
             verbose=getattr(args, 'verbose', False),
-            batch_size=getattr(args, 'batch_size', None)
+            batch_size=getattr(args, 'batch_size', None),
+            # 修正：并行路径中传递定量方法选择
+            quant=getattr(args, 'quant', 'none')
         )
 
         duration = time.time() - start_time
@@ -400,8 +417,10 @@ def count_main_serial(args, progress=None, task_id=None):
                     export_count_type=getattr(args, 'count_type', 'Final_EM'),
                     progress=progress,  # Pass progress object
                     task_id=task_id,     # Pass task_id
-                    length_mode=getattr(args, 'len', 'geneEffectiveLength'),
-                    batch_size=getattr(args, 'batch_size', None)
+                    length_mode_gene=getattr(args, 'len_gene', getattr(args, 'len', 'genelongesttxLength')),
+                    length_mode_isoform=getattr(args, 'len_isoform', 'txLength'),
+                    batch_size=getattr(args, 'batch_size', None),
+                    quant=getattr(args, 'quant', 'none')
                 )
                 count_files = counter.run()
                 if getattr(args, 'verbose', False):
@@ -445,8 +464,11 @@ class FanseCounter:
                  export_count_type='Final_EM',
                  progress=None,  # New: rich progress object
                  task_id=None,   # New: rich task ID
-                 length_mode='geneEffectiveLength',  # 新增：长度指标选择
-                 batch_size=None):  # 新增：批处理大小参数，允许用户通过CLI控制
+                 length_mode='genelongesttxLength',  # 修正：默认改为基因层最长转录本长度
+                 length_mode_gene=None,              # 新增：基因层长度模式（优先于 length_mode）
+                 length_mode_isoform='txLength',     # 新增：转录本层长度模式
+                 batch_size=None,  # 新增：批处理大小参数，允许用户通过CLI控制
+                 quant='none'):    # 新增：定量方法选择（none/tpm/rpkm/both），用于在唯一文件中追加TPM/RPKM
 
         # 添加计数类型前缀
         self.isoform_prefix = 'isoform_'
@@ -467,9 +489,14 @@ class FanseCounter:
         self.export_count_type = export_count_type
         self.progress = progress  # Store progress object
         self.task_id = task_id    # Store task ID
-        self.length_mode = length_mode  # 选择用于TPM/EM分配的长度指标
+        # 修正：分别存储 gene 与 isoform 层的长度选择；保持 length_mode 兼容
+        self.length_mode_gene = length_mode_gene if length_mode_gene else (length_mode or 'genelongesttxLength')
+        self.length_mode_isoform = length_mode_isoform or 'txLength'
+        self.length_mode = self.length_mode_gene
         # 新增：批处理大小（用于解析阶段批量更新计数），None表示使用默认策略
         self.batch_size = batch_size
+        # 新增：定量方法（none/tpm/rpkm/both）
+        self.quant = quant if quant in ('none','tpm','rpkm','both') else 'none'
 
         # # 存储计数结果
         # self.counts_data = {}
@@ -565,9 +592,9 @@ class FanseCounter:
 
         total_count = 0
         # 修正：移除重复的 batch_size 赋值，统一使用实例属性 self.batch_size
-        # 默认策略：若未指定，采用 800_000 作为保守高效的批大小；
+        # 调整默认批大小至 2_000_000，减少函数调用与哈希开销，提高吞吐
         # 可通过 CLI --batch-size 覆盖以适配不同机器与数据规模
-        batch_size = int(self.batch_size) if self.batch_size else 800_000
+        batch_size = int(self.batch_size) if self.batch_size else 2_000_000
         if self.verbose:
             print(f"Using batch size: {batch_size}")
         # 修正：根据批大小动态设置进度更新步长，减少频繁刷新带来的开销
@@ -629,7 +656,7 @@ class FanseCounter:
                 if use_tqdm:
                     pbar = tqdm(total=estimated_records, unit='reads', mininterval=5, unit_scale=True, position=position, leave=False)
 
-                update_interval = 10_000
+                # 保持与批大小一致的刷新步长，避免过于频繁刷新导致渲染开销
                 update_counter = 0
 
                 for i, record in enumerate(fanse_parser_selected(str(fanse_file))):
@@ -1025,35 +1052,37 @@ class FanseCounter:
     def _build_length_dict(self, prefix, annotation_df=None):
         """构建用于TPM/EM分配的长度字典
         - prefix 为 'isoform_' 或 'gene_'
-        - 根据 self.length_mode 选择具体长度列
+        - 根据分别设置的长度模式选择具体列
         - 兼容缺失列，自动回退到合适的列
         """
         df = annotation_df if annotation_df is not None else self.annotation_df
         if df is None or df.empty:
             return {}
 
-        mode = (self.length_mode or 'geneEffectiveLength')
-
         if prefix == self.isoform_prefix:
+            # 修正：支持 isoform 层长度选择（txLength/cdsLength/isoformEffectiveLength）
             id_col = 'txname' if 'txname' in df.columns else None
-            length_col = 'txLength'
-            if id_col and length_col in df.columns:
-                return dict(zip(df[id_col], df[length_col]))
-            return {}
+            if not id_col:
+                return {}
+            mode_iso = self.length_mode_isoform or 'txLength'
+            candidates = [mode_iso, 'txLength', 'isoformEffectiveLength', 'cdsLength']
+            selected = None
+            for col in candidates:
+                if col in df.columns:
+                    selected = col
+                    break
+            if not selected:
+                return {}
+            return dict(zip(df[id_col], df[selected]))
 
         # gene level
         id_col = 'geneName' if 'geneName' in df.columns else None
         if not id_col:
             return {}
 
-        # 可选列集合
-        candidates = [
-            mode,
-            'geneEffectiveLength',
-            'geneNonOverlapLength',
-            'geneReadCoveredLength',
-            'genelongesttxLength',
-        ]
+        # 修正：支持 gene 层长度选择（geneEffectiveLength/genelongesttxLength/txLength/genelongestcdsLength）
+        mode_gene = self.length_mode_gene or 'genelongesttxLength'
+        candidates = [mode_gene, 'geneEffectiveLength', 'geneNonOverlapLength', 'geneReadCoveredLength', 'genelongesttxLength', 'genelongestcdsLength', 'txLength']
         # 选择第一个存在的列
         selected = None
         for col in candidates:
@@ -1064,7 +1093,7 @@ class FanseCounter:
             # 回退：使用每个基因最长转录本长度（从 txLength 聚合）
             if 'txLength' in df.columns:
                 if self.verbose:
-                    print(f"[len] 未找到列 {mode} ，回退为按 txLength 聚合的基因最长转录本长度")
+                    print(f"[len] 未找到列 {mode_gene} ，回退为按 txLength 聚合的基因最长转录本长度")
                 return df.groupby(id_col)['txLength'].max().to_dict()
             return {}
 
@@ -1073,6 +1102,8 @@ class FanseCounter:
             if self.verbose:
                 print(f"[len] 选择 txLength，按基因聚合为最长转录本长度用于归一化")
             return df.groupby(id_col)['txLength'].max().to_dict()
+        if selected == 'genelongestcdsLength':
+            return df.groupby(id_col)['genelongestcdsLength'].max().to_dict()
         if self.verbose:
             print(f"[len] 使用列 {selected} 作为 {prefix} 层面的长度指标")
         return df.groupby(id_col)[selected].max().to_dict()
@@ -1464,6 +1495,32 @@ class FanseCounter:
                 col for col in combined_df.columns if col.endswith('_count')]
             combined_df[count_columns] = combined_df[count_columns].fillna(0)
 
+            # 若启用定量计算：为目标列追加 TPM/RPKM 列
+            try:
+                if self.quant and self.quant != 'none' and add_quant_columns is not None and build_length_maps is not None:
+                    # 选择长度映射（转录本层）
+                    df_anno = self.annotation_df if self.annotation_df is not None else pd.DataFrame()
+                    # 修正：唯一文件的主键列为 'Transcript'，不可使用注释中的 'txname'
+                    id_col = 'Transcript'
+                    # 修正：传递 isoform 层长度选择模式
+                    length_map, eff_length_map = build_length_maps(df_anno, level='isoform', mode=self.length_mode_isoform)
+                    target_cols = ['Final_EM','Final_EQ','Final_MA','firstID','unique_to_isoform']
+                    present_cols = [c for c in target_cols if c in combined_df.columns]
+                    if present_cols and length_map is not None:
+                        combined_df = add_quant_columns(
+                            combined_df,
+                            id_col=id_col,
+                            count_cols=present_cols,
+                            length_map=length_map,
+                            eff_length_map=eff_length_map,
+                            methods=self.quant
+                        )
+                elif self.quant and self.quant != 'none' and self.verbose:
+                    print("定量模块不可用，跳过TPM/RPKM追加")
+            except Exception as e:
+                if self.verbose:
+                    print(f"添加isoform定量列失败: {e}")
+
             # 保存文件
             combined_filename = self.output_dir / \
                 f'{base_name}.counts_isoform_level_unique.csv'
@@ -1479,12 +1536,20 @@ class FanseCounter:
             if multi_key in self.counts_data and self.counts_data[multi_key]:
                 # 注释映射：为多转录本组合提供 geneName/symbol/description 输出
                 length_map = {}
+                eff_length_map = {}
                 gene_name_map = {}
                 symbol_map = {}
                 desc_map = {}
                 if self.annotation_df is not None:
-                    if 'txname' in self.annotation_df.columns and 'txLength' in self.annotation_df.columns:
-                        length_map = dict(zip(self.annotation_df['txname'], self.annotation_df['txLength']))
+                    # 修正：优先通过注释构建 isoform 层长度与有效长度映射，保证TPM分配的稳健性
+                    try:
+                        _len_map, _eff_map = build_length_maps(self.annotation_df, level='isoform', mode=self.length_mode_isoform)
+                        length_map = _len_map or {}
+                        eff_length_map = _eff_map or length_map
+                    except Exception:
+                        if 'txname' in self.annotation_df.columns and 'txLength' in self.annotation_df.columns:
+                            length_map = dict(zip(self.annotation_df['txname'], self.annotation_df['txLength']))
+                            eff_length_map = length_map
                     if 'txname' in self.annotation_df.columns and 'geneName' in self.annotation_df.columns:
                         # 修正：对 geneName 应用 sys.intern，减少重复字符串开销
                         import sys
@@ -1494,8 +1559,11 @@ class FanseCounter:
                     if 'txname' in self.annotation_df.columns and 'description' in self.annotation_df.columns:
                         desc_map = dict(zip(self.annotation_df['txname'], self.annotation_df['description']))
 
-                # 修正：使用 isoform 层唯一计数键 unique_to_isoform 计算 TPM，避免取空
-                tpm_values = self._calculate_tpm(self.counts_data.get(f'{self.isoform_prefix}unique_to_isoform', Counter()), length_map)
+                # 修正：使用 isoform 层唯一计数键 unique_to_isoform + 有效长度映射计算 TPM
+                tpm_values = self._calculate_tpm(
+                    self.counts_data.get(f'{self.isoform_prefix}unique_to_isoform', Counter()),
+                    eff_length_map
+                )
 
                 # 数值格式化：未检测到的空值标记为 0
                 def _fmt_val(v):
@@ -1672,18 +1740,13 @@ class FanseCounter:
                 for gene in all_genes:
                     gene_row = {'Gene': gene}
 
-                    # 收集该基因在所有计数类型中的值
+                    # 修正：错误的条件导致计数列未写入；改为无条件追加各计数类型的值
                     for count_type, counter in self.gene_level_counts_unique_genes.items():
-                        if counter:  # 确保计数器非空
-                            # 提取基础计数类型名称（去掉 gene_ 前缀）
-                            if not "unique_gene_to_gene_and_isoform" and "unique_to_gene_but_not_isoform":
-                                base_count_type = count_type.replace(
-                                    self.gene_prefix, '')
-                                count_value = counter.get(gene, 0)
-                                if base_count_type.endswith('_ratio'):
-                                    gene_row[f'{base_count_type}'] = count_value
-                                else:
-                                    gene_row[f'{base_count_type}'] = count_value
+                        if not counter:
+                            continue
+                        base_count_type = count_type.replace(self.gene_prefix, '')
+                        count_value = counter.get(gene, 0)
+                        gene_row[base_count_type] = count_value
 
                     single_gene_data.append(gene_row)
 
@@ -1741,6 +1804,30 @@ class FanseCounter:
                     ]
                     single_gene_df = single_gene_df[ordered_cols]
 
+                    # 若启用定量计算：为目标列追加 TPM/RPKM 列
+                    try:
+                        if self.quant and self.quant != 'none' and add_quant_columns is not None and build_length_maps is not None:
+                            df_anno = self.annotation_df if self.annotation_df is not None else pd.DataFrame()
+                            id_col = 'Gene'
+                            # 修正：传递 gene 层长度选择模式
+                            length_map, eff_length_map = build_length_maps(df_anno, level='gene', mode=self.length_mode_gene)
+                            target_cols = ['Final_EM','Final_EQ','Final_MA','firstID','unique_to_isoform','unique_to_gene_and_isoform','unique_to_gene_but_not_isoform','unique_to_gene']
+                            present_cols = [c for c in target_cols if c in single_gene_df.columns]
+                            if present_cols and length_map is not None:
+                                single_gene_df = add_quant_columns(
+                                    single_gene_df,
+                                    id_col=id_col,
+                                    count_cols=present_cols,
+                                    length_map=length_map,
+                                    eff_length_map=eff_length_map,
+                                    methods=self.quant
+                                )
+                        elif self.quant and self.quant != 'none' and self.verbose:
+                            print("定量模块不可用，跳过TPM/RPKM追加")
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"添加gene定量列失败: {e}")
+
                     gene_filename = self.output_dir / \
                         f'{base_name}.counts_gene_level_unique.csv'
                     def _fmt_int_or_float(col):
@@ -1771,19 +1858,27 @@ class FanseCounter:
 
                 # 预先缓存长度与TPM视图，减少循环中的字典/数据框访问
                 gene_unique_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}unique_to_gene', Counter())
-                # 构建 gene -> 有效长度 映射
-                length_map_col = None
-                if 'geneEffectiveLength' in self.annotation_df.columns:
-                    length_map_col = 'geneEffectiveLength'
-                elif 'genelongesttxLength' in self.annotation_df.columns:
-                    length_map_col = 'genelongesttxLength'
-                elif 'txLength' in self.annotation_df.columns:
-                    length_map_col = 'txLength'
+                # 构建 gene -> 有效长度 映射（修正：采用 build_length_maps 并对无效值回退）
                 gene_lengths_map = {}
-                if length_map_col and 'geneName' in self.annotation_df.columns:
-                    gene_lengths_map = dict(self.annotation_df.groupby('geneName')[length_map_col].max())
-                # 预先计算 TPMS（基于unique）
-                gene_tpm_map = self._calculate_tpm(gene_unique_counter, gene_lengths_map)
+                gene_eff_lengths_map = {}
+                try:
+                    _len_map, _eff_map = build_length_maps(self.annotation_df, level='gene', mode=self.length_mode_gene)
+                    gene_lengths_map = _len_map or {}
+                    gene_eff_lengths_map = _eff_map or gene_lengths_map
+                except Exception:
+                    # 回退：从可用列直接聚合长度，并用于有效长度
+                    length_map_col = None
+                    if 'geneEffectiveLength' in self.annotation_df.columns:
+                        length_map_col = 'geneEffectiveLength'
+                    elif 'genelongesttxLength' in self.annotation_df.columns:
+                        length_map_col = 'genelongesttxLength'
+                    elif 'txLength' in self.annotation_df.columns:
+                        length_map_col = 'txLength'
+                    if length_map_col and 'geneName' in self.annotation_df.columns:
+                        gene_lengths_map = dict(self.annotation_df.groupby('geneName')[length_map_col].max())
+                        gene_eff_lengths_map = gene_lengths_map
+                # 预先计算 TPMS（基于unique + 有效长度）
+                gene_tpm_map = self._calculate_tpm(gene_unique_counter, gene_eff_lengths_map)
                 # 本地引用计数器，减少属性查找与哈希查找次数
                 gene_multi_counter = self.gene_level_counts_multi_genes.get(f'{self.gene_prefix}multi_to_gene', Counter())
                 gene_m2a_counter = self.gene_level_counts_unique_genes.get(f'{self.gene_prefix}multi2all', Counter())
@@ -1927,7 +2022,8 @@ class FanseCounter:
         df_anno = self.annotation_df
         name_col = 'txname' if 'txname' in df_anno.columns else 'transcript_id'
         len_col = 'txLength' if 'txLength' in df_anno.columns else 'length'
-        eff_len_col = 'txEffectiveLength' if 'txEffectiveLength' in df_anno.columns else len_col
+        # 修正：isoform 有效长度列命名为 isoformEffectiveLength，若不存在则回退到总长度列
+        eff_len_col = 'isoformEffectiveLength' if 'isoformEffectiveLength' in df_anno.columns else len_col
         length_map = {}
         eff_length_map = {}
         if name_col in df_anno.columns and len_col in df_anno.columns:
@@ -1937,7 +2033,9 @@ class FanseCounter:
         rows = []
         for tid, count in counter.items():
             length = length_map.get(tid, 0)
-            eff_len = eff_length_map.get(tid, length)
+            eff_len_raw = eff_length_map.get(tid, length)
+            # 修正：当有效长度缺失或<=0时，回退到总长度，避免输出0长度
+            eff_len = eff_len_raw if (eff_len_raw is not None and not pd.isna(eff_len_raw) and float(eff_len_raw) > 0) else length
             rows.append((tid, length, eff_len, round(float(count), 1)))
         out_df = pd.DataFrame(rows, columns=['transcript_id', 'length', 'effective_length', 'expected_count'])
         rsem_path = self.output_dir / (f'{base_name}.rsem.isoforms.{ctype}.results' if count_type is not None else f'{base_name}.rsem.isoforms.results')
@@ -1961,8 +2059,8 @@ class FanseCounter:
             length_map = dict(zip(df_anno[name_col], df_anno[len_col]))
         if name_col in df_anno.columns and eff_len_col in df_anno.columns:
             eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
-        # 计算TPM基于Final_EM
-        tpm_map = self._calculate_tpm(counter, length_map)
+        # 计算TPM基于Final_EM（修正：优先使用有效长度映射，避免0长度导致TPM为0）
+        tpm_map = self._calculate_tpm(counter, eff_length_map or length_map)
         rows = []
         for tid, count in counter.items():
             _len_val = length_map.get(tid, 0)
@@ -2816,12 +2914,20 @@ def add_count_subparser(subparsers):
     parser.add_argument('-c', '--count-type', choices=['raw','unique','firstID','Final_EM','Final_EQ','Final_MA','all'], default='Final_EM',
                         help="定量文件中用作计数与TPM计算的计数类型；选择'all'时为每种计数类型分别导出定量文件")
 
-    # 长度指标选择：标准 + 高级
+    # 长度指标选择：兼容旧参数 + 新增分别指定 isoform/gene
     parser.add_argument('--len', dest='len',
                         choices=['geneEffectiveLength', 'genelongesttxLength', 'txLength',
                                  'geneNonOverlapLength', 'geneReadCoveredLength', 'other'],
-                        default='geneEffectiveLength',
-                        help='TPM/EM 分配所用的长度指标：默认 geneEffectiveLength；可选 genelongesttxLength/txLength/geneNonOverlapLength/geneReadCoveredLength/other')
+                        default='genelongesttxLength',
+                        help='兼容旧参数：仅用于 gene 层；默认 genelongesttxLength')
+    parser.add_argument('--len-isoform', dest='len_isoform',
+                        choices=['txLength', 'cdsLength', 'isoformEffectiveLength'],
+                        default='txLength',
+                        help='isoform 层的长度选择：txLength/cdsLength/isoformEffectiveLength')
+    parser.add_argument('--len-gene', dest='len_gene',
+                        choices=['geneEffectiveLength', 'genelongesttxLength', 'txLength', 'genelongestcdsLength'],
+                        default='genelongesttxLength',
+                        help='gene 层的长度选择：geneEffectiveLength/genelongesttxLength/txLength/genelongestcdsLength')
 
     parser.add_argument('-p', '--processes',  type=int, default=1,
                         help='并行任务数 (默认=1: CPU核心数, 1=串行)')
@@ -2832,7 +2938,11 @@ def add_count_subparser(subparsers):
 
     # 新增：解析批处理大小，用于优化解析阶段性能与内存占用的权衡
     parser.add_argument('--batch-size', dest='batch_size', type=int, default=None,
-                        help='解析阶段的批处理大小（默认: 800000）。数值越大，函数调用与哈希查找开销越少，但占用内存更高；请根据机器内存与文件规模调整。')
+                        help='解析阶段的批处理大小（默认: 2000000）。数值越大，函数调用与哈希查找开销越少，但占用内存更高；请根据机器内存与文件规模调整。')
+
+    # 新增：定量方法选择，用于在唯一结果文件中追加表达量列
+    parser.add_argument('-q','--quant', choices=['none','tpm','rpkm','both'], default='none',
+                        help='在唯一文件中追加表达量列：none(不追加)/tpm/RPKM/both')
 
     # 根据是否并行选择执行函数
     def count_main_wrapper(args):
@@ -2976,3 +3086,4 @@ if __name__ == '__main__':
             # 清理临时目录
             shutil.rmtree(temp_dir, ignore_errors=True)
             print(f"\n清理测试目录: {temp_dir}")
+    # （修正位置）-q/--quant 参数已移动到 add_count_subparser 内部统一解析

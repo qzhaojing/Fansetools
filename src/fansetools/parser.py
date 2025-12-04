@@ -170,7 +170,7 @@ def fanse_parser_high_performance(file_path: str) -> Generator[FANSeRecord, None
     
     with _open_fanse_text(file_path) as f:
         batch = []  # 批量处理减少yield开销
-        batch_size = 5000
+        batch_size = 50_000  # 调整批大小以降低生成器切换频率，提升吞吐
         
         while True:
             line1 = f.readline()
