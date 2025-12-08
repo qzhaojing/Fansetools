@@ -4,7 +4,8 @@ covert multi styles between them
 Support Fanse/unmapped/fasta/fastq to FASTA/FASTQ.
 '''
 import os
-# import argparse
+import argparse
+from .utils.rich_help import CustomHelpFormatter
 from tqdm import tqdm
 from typing import Optional, Generator, NamedTuple
 # from collections import namedtuple
@@ -171,8 +172,11 @@ def fastx_command(args):
 
 def add_fastx_subparser(subparsers):
     """Add fastx subcommand to the main parser"""
-    parser = subparsers.add_parser('fastx',
-                                   help='Convert between Fanse/unmapped/fasta/fastq to FASTA/FASTQ')
+    parser = subparsers.add_parser(
+        'fastx',
+        help='Convert between Fanse/unmapped/fasta/fastq to FASTA/FASTQ',
+        formatter_class=CustomHelpFormatter
+    )
 
     # 输入文件参数
     parser.add_argument('-i', '--input', required=True,

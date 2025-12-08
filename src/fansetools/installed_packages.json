@@ -12,5 +12,12 @@
     "platform": "windows",
     "installed_at": "1764324779.098236",
     "entry_path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\snpeff\\snpEff\\examples\\examples.sh"
+  },
+  "SuperDecode_win": {
+    "path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\SuperDecode.exe",
+    "is_jar": false,
+    "platform": "windows",
+    "installed_at": "1765023519.0358434",
+    "entry_path": "g:\\verysync_zhaojing\\python_pakages\\fanse2sam\\fansetools\\src\\fansetools\\bin\\windows\\SuperDecode.exe"
   }
 }

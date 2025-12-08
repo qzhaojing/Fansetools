@@ -1,10 +1,17 @@
 import json
 import os
 import argparse
+from .utils.rich_help import CustomHelpFormatter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import paramiko
+import base64  # 新增：用于 PowerShell 脚本编码
+import gzip
+import shutil
+import tempfile
+import subprocess
 from dataclasses import dataclass
+
 # 修正：Windows下支持ESC键检测用于中断watch
 try:
     import msvcrt  # Windows 控制台按键检测
@@ -1299,6 +1306,36 @@ def cluster_command(args):
                 prefix = ['fanse', 'run']
                 return " ".join(prefix + safe_tokens)
 
+            # 修正：新增本地输出校验工具，确保作业仅在远端进程退出且输出文件非空后判定完成
+            def _extract_output_path(tokens: List[str]) -> Optional[str]:
+                # 修正：从参数集合中解析 -o 输出路径（本地/UNC均可），用于后置校验
+                try:
+                    oi = tokens.index('-o')
+                    if oi + 1 < len(tokens):
+                        return tokens[oi + 1].strip('"')
+                except ValueError:
+                    return None
+                return None
+
+            def _validate_output_nonempty(out_path: str, wait_sec: int = 30, poll_interval: float = 0.5) -> bool:
+                # 修正：轮询校验输出文件是否存在且大小>0；用于UNC网络盘写入的最终一致性等待
+                deadline = time.time() + max(0, wait_sec)
+                p = out_path.strip('"')
+                while True:
+                    try:
+                        if os.path.isfile(p):
+                            try:
+                                if os.path.getsize(p) > 0:
+                                    return True
+                            except Exception:
+                                pass
+                        # 若为目录或尚未创建文件，则继续等待直到超时
+                    except Exception:
+                        pass
+                    if time.time() >= deadline:
+                        return False
+                    time.sleep(poll_interval)
+
             # 选择节点集合：指定 -n 或者按响应时间选择 -p 台
             selected_nodes: List[str] = []
             if node_list:
@@ -1535,38 +1572,150 @@ def cluster_command(args):
                                 # 修正：为 fanse run 自动添加 -y（双保险）
                                 if not native_mode and '-y' not in jt:
                                     jt.append('-y')
-                                
-                                remote_cmd = _build_remote_cmd(jt, n)
-                                # print(f"➡️ [{n}] {remote_cmd}") # 减少刷屏，仅出错或debug显示
-                                
-                                # 修正：输出管理：前缀与日志文件
+
+                                ok = True
+                                temp_decompressed_file = None
+                                remote_cmd = ""
                                 job_input = None
+                                
+                                # 修正：Native模式下GZ文件自动解压（本地Python解压，更可靠）
                                 try:
-                                    ii = jt.index('-i')
-                                    if ii + 1 < len(jt):
-                                        job_input = jt[ii + 1].strip('"')
-                                except Exception:
-                                    pass
-                                log_file = None
-                                if log_dir and job_input:
-                                    try:
-                                        base = os.path.basename(job_input)
-                                        ts = int(time.time())
-                                        log_file = os.path.join(log_dir, f"{n}_{base}_{ts}.log")
-                                    except Exception:
+                                    if native_mode:
+                                        input_idx = -1
+                                        try:
+                                            if '-i' in jt:
+                                                input_idx = jt.index('-i')
+                                            elif '-D' in jt:
+                                                input_idx = jt.index('-D')
+                                        except ValueError:
+                                            pass
+                                        
+                                        if input_idx != -1 and input_idx + 1 < len(jt):
+                                            raw_input = jt[input_idx + 1].strip('"')
+                                            job_input = raw_input # 记录原始输入
+                                            
+                                            if raw_input.lower().endswith('.gz') and os.path.exists(raw_input):
+                                                if not quiet:
+                                                    print(f"[{n}] ⏳ 正在解压 GZ 文件: {os.path.basename(raw_input)} ...")
+                                                
+                                                input_path = Path(raw_input)
+                                                # 尝试在同目录创建临时文件（确保远端节点可通过UNC路径访问）
+                                                temp_dir = input_path.parent
+                                                base_name = input_path.stem
+                                                ts = int(time.time() * 1000)
+                                                temp_name = f"{base_name}_{ts}_{n}.fastq"
+                                                temp_decompressed_file = temp_dir / temp_name
+                                                
+                                                # 解压逻辑：优先 pigz，失败回退到 gzip
+                                                decompression_success = False
+                                                
+                                                # 1. 尝试 pigz
+                                                pigz_path = shutil.which('pigz')
+                                                if not pigz_path:
+                                                    # 尝试查找 bin 目录下的 pigz
+                                                    try:
+                                                        bin_pigz = Path(__file__).parent / "bin" / "windows" / "pigz.exe"
+                                                        if bin_pigz.exists():
+                                                            pigz_path = str(bin_pigz)
+                                                    except:
+                                                        pass
+
+                                                if pigz_path:
+                                                    try:
+                                                        with open(temp_decompressed_file, 'wb') as f_out:
+                                                            subprocess.run([pigz_path, '-d', '-c', str(input_path)], 
+                                                                         stdout=f_out, 
+                                                                         check=True)
+                                                            f_out.flush()
+                                                            os.fsync(f_out.fileno())
+                                                        decompression_success = True
+                                                    except Exception as e:
+                                                        print(f"[{n}] ⚠️ pigz 解压失败，尝试使用 Python gzip: {e}")
+                                                        # 如果失败，删除可能不完整的文件
+                                                        if temp_decompressed_file.exists():
+                                                            try:
+                                                                os.remove(temp_decompressed_file)
+                                                            except:
+                                                                pass
+                                                
+                                                # 2. 回退到 Python gzip
+                                                if not decompression_success:
+                                                    try:
+                                                        with gzip.open(input_path, 'rb') as f_in:
+                                                            with open(temp_decompressed_file, 'wb') as f_out:
+                                                                shutil.copyfileobj(f_in, f_out)
+                                                                f_out.flush()
+                                                                os.fsync(f_out.fileno())
+                                                        decompression_success = True
+                                                    except Exception as e:
+                                                        print(f"[{n}] ❌ Python gzip 解压也失败: {e}")
+                                                
+                                                if decompression_success:
+                                                    jt[input_idx + 1] = f'"{temp_decompressed_file}"'
+                                                    if not quiet:
+                                                        print(f"[{n}] ✅ 解压完成: {temp_name}")
+                                                else:
+                                                    ok = False
+                                except Exception as e:
+                                    print(f"[{n}] ❌ 准备作业失败(解压): {e}")
+                                    ok = False
+
+                                try: # 使用 try...finally 确保清理
+                                    if ok:
+                                        remote_cmd = _build_remote_cmd(jt, n)
+                                        print(f"[{n}] 🚀 执行: {remote_cmd}")
+                                        
+                                        # 修正：输出管理：前缀与日志文件
+                                        if not job_input:
+                                            try:
+                                                ii = jt.index('-i')
+                                                if ii + 1 < len(jt):
+                                                    job_input = jt[ii + 1].strip('"')
+                                            except Exception:
+                                                pass
                                         log_file = None
-                                
-                                ok = cluster_mgr.monitor_node_execution(n, remote_cmd, quiet=quiet, log_file=log_file, prefix=f"[{n}]", idle_timeout=idle_timeout or None, hard_timeout=hard_timeout or None, heartbeat_sec=heartbeat_sec, stop_event=stop_event)
-                                
-                                with lock:
-                                    if pbar:
-                                        pbar.update(1)
-                                    else:
-                                        print(f"✅ [{n}] 完成 1 项（剩余 {job_queue.qsize()}）")
-                                    if not ok:
-                                        progress_failed += 1
-                                        print(f"❌ 节点 {n} 执行失败: {remote_cmd}")
-                                
+                                        if log_dir and job_input:
+                                            try:
+                                                base = os.path.basename(job_input)
+                                                ts = int(time.time())
+                                                log_file = os.path.join(log_dir, f"{n}_{base}_{ts}.log")
+                                            except Exception:
+                                                log_file = None
+                                        
+                                        ok = cluster_mgr.monitor_node_execution(n, remote_cmd, quiet=quiet, log_file=log_file, prefix=f"[{n}]", idle_timeout=idle_timeout or None, hard_timeout=hard_timeout or None, heartbeat_sec=heartbeat_sec, stop_event=stop_event)
+                                        
+                                        if ok:
+                                            out_path = _extract_output_path(jt)
+                                            if out_path:
+                                                wait_after = idle_timeout if (isinstance(idle_timeout, int) and idle_timeout > 0) else 30
+                                                valid = _validate_output_nonempty(out_path, wait_sec=wait_after)
+                                                if not valid:
+                                                    ok = False
+                                                    if not quiet:
+                                                        print(f"[{n}] ⚠️ 输出文件不存在或大小为0，判定作业失败: {out_path}")
+
+                                    with lock:
+                                        if pbar:
+                                            pbar.update(1)
+                                        else:
+                                            print(f"✅ [{n}] 完成 1 项（剩余 {job_queue.qsize()}）")
+                                        if not ok:
+                                            progress_failed += 1
+                                            if remote_cmd:
+                                                print(f"❌ 节点 {n} 执行失败: {remote_cmd}")
+                                            else:
+                                                print(f"❌ 节点 {n} 作业预处理失败")
+                                finally:
+                                    # 清理临时解压文件 (确保在任何情况下都尝试清理)
+                                    if temp_decompressed_file and os.path.exists(temp_decompressed_file):
+                                        try:
+                                            os.remove(temp_decompressed_file)
+                                            if not quiet:
+                                                pass # print(f"[{n}] 🧹 已清理临时文件")
+                                        except Exception as e:
+                                            print(f"[{n}] ⚠️ 无法清理临时文件 {temp_decompressed_file}: {e}")
+
+
                                 job_queue.task_done()
                                 
                                 if stop_event.is_set():
@@ -1668,7 +1817,7 @@ FANSe3 集群管理工具
 2. 检查状态: fanse cluster check
 3. 使用集群: fanse run --cluster 或 fanse run -n <节点名称>
         ''',
-        formatter_class=argparse.RawTextHelpFormatter
+        formatter_class=CustomHelpFormatter
     )
     
     cluster_subparsers = cluster_parser.add_subparsers(

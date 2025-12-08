@@ -3,6 +3,7 @@ import json
 import urllib.request
 from pathlib import Path
 from ..install import create_launcher, get_platform
+from ..utils.rich_help import CustomHelpFormatter
 
 
 FLOWS_DIR = Path(__file__).parent
@@ -68,16 +69,17 @@ def add_flow_subparser(subparsers):
     flow_parser = subparsers.add_parser(
         'flow',
         help='流程管理',
-        description='安装/列出流程（轻量脚本包装为可执行）'
+        description='安装/列出流程（轻量脚本包装为可执行）',
+        formatter_class=CustomHelpFormatter
     )
     flow_sub = flow_parser.add_subparsers(dest='flow_cmd')
 
-    flow_install = flow_sub.add_parser('install', help='安装流程')
+    flow_install = flow_sub.add_parser('install', help='安装流程', formatter_class=CustomHelpFormatter)
     flow_install.add_argument('name', help='流程名称')
     flow_install.add_argument('script_or_url', help='脚本路径或URL')
     flow_install.add_argument('--alias', help='流程别名（默认同name）')
     flow_install.set_defaults(func=lambda a: install_flow(a.name, a.script_or_url, a.alias))
 
-    flow_list = flow_sub.add_parser('list', help='列出流程')
+    flow_list = flow_sub.add_parser('list', help='列出流程', formatter_class=CustomHelpFormatter)
     flow_list.set_defaults(func=lambda a: [print(f"{f['alias']}: {f['entry']}") for f in list_flows()])
     return flow_parser

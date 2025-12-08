@@ -7,24 +7,14 @@ import argparse
 import subprocess
 import platform
 from pathlib import Path
+from rich_argparse import RichHelpFormatter
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
 from .utils.version_check import DualVersionChecker, get_installation_method, update_fansetools
-
-
-class CustomHelpFormatter(argparse.RawTextHelpFormatter):
-    """自定义帮助格式化器，提供更简洁的帮助信息"""
-    
-    def _format_action(self, action):
-        # 简化子命令的显示格式
-        if isinstance(action, argparse._SubParsersAction):
-            # 只显示子命令名称和简短描述
-            parts = []
-            for choice, subparser in action.choices.items():
-                # 获取子命令的简短描述
-                help_text = subparser.description.split('\n')[0] if subparser.description else ""
-                parts.append(f"  {choice:<12} {help_text}")
-            
-            return "\n".join(parts) + "\n"
-        return super()._format_action(action)
+from .utils.rich_help import CustomHelpFormatter, print_colored_text
 
 
 def find_and_execute_binary(command_name, remaining_args):
@@ -70,8 +60,31 @@ def find_and_execute_binary(command_name, remaining_args):
         return False
     
     # 执行二进制文件
+    cmd = [str(executable_path)] + remaining_args
+    
+    # 检查是否请求帮助
+    is_help = '-h' in remaining_args or '--help' in remaining_args
+    
+    if is_help:
+        try:
+            print(f"调用 {command_name} 原生帮助:\n")
+            # 尝试捕获 stdout 和 stderr
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            output = result.stdout + result.stderr
+            # 使用 Rich 格式化输出
+            print_colored_text(output)
+            return True
+        except Exception as e:
+            print(f"获取帮助失败: {e}")
+            # 如果捕获失败，尝试直接运行
+            pass
+
     try:
-        cmd = [str(executable_path)] + remaining_args
+        # 显示带颜色的执行命令
+        console = Console()
+        cmd_str = ' '.join(cmd)
+        console.print(f"[bold green]执行命令:[/bold green] [yellow]{cmd_str}[/yellow]")
+        
         result = subprocess.run(cmd)
         return True  # 表示成功找到并执行了二进制文件
     except Exception as e:
@@ -117,10 +130,13 @@ def show_brief_help_with_binaries(subparsers_choices=None):
     """显示包含二进制工具的简洁帮助信息"""
     from . import __version__
     
+    console = Console()
+    
     # 获取可用的二进制工具
     available_binaries = list_available_binaries()
     
     # 版本信息
+    version_text = Text(f"fansetools {__version__}", style="bold green")
     try:
         from .utils.version_check import DualVersionChecker
         from . import __github_repo__
@@ -134,39 +150,57 @@ def show_brief_help_with_binaries(subparsers_choices=None):
         version_info = checker.check_version()
         
         if version_info and version_info.get('pypi_latest'):
-            version_str = f"fansetools {__version__} → {version_info['pypi_latest']} (最新)"
-        else:
-            version_str = f"fansetools {__version__}"
+            version_text.append(f" → {version_info['pypi_latest']} (最新)", style="bold yellow")
     except:
-        version_str = f"fansetools {__version__}"
+        pass
     
-    print(version_str + " - FANSe3文件处理工具集")
-    print("=" * 50)
-    print("使用方法: fanse <command> [选项]")
-    print()
+    console.print(Panel(
+        Text.assemble(version_text, " - FANSe3文件处理工具集", style="bold white"),
+        title="FANSe Tools",
+        border_style="blue",
+        box=box.ROUNDED
+    ))
     
+    console.print("使用方法: [bold cyan]fanse <command> [选项][/bold cyan]\n")
+    
+    # 创建命令表格
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Command", style="bold cyan")
+    table.add_column("Description")
+
     # 显示Python子命令
     if subparsers_choices:
-        print("可用命令:")
-        max_cmd_len = max(len(cmd) for cmd in subparsers_choices.keys())
+        console.print("[bold]可用命令:[/bold]")
         for cmd, subparser in subparsers_choices.items():
             desc = subparser.description.split('\n')[0] if subparser.description else ""
-            print(f"  {cmd:<{max_cmd_len}}  {desc}")
+            table.add_row(cmd, desc)
     
     # 显示二进制工具
     if available_binaries:
         if subparsers_choices:
-            print()
-        print("内置工具:")
-        max_bin_len = max(len(bin) for bin in available_binaries) if available_binaries else 0
+            table.add_row("", "") # 空行
+            
+        console.print(table)
+        table = Table(show_header=False, box=None, padding=(0, 2)) # 新表格
+        table.add_column("Command", style="bold magenta")
+        table.add_column("Description")
+        
+        console.print("\n[bold]内置工具:[/bold]")
         for binary in available_binaries:
-            print(f"  {binary:<{max_bin_len}}  ")
-        print('感谢以上工具的作者。')
+            table.add_row(binary, "外部二进制工具")
+        
+    console.print(table)
+
+    if available_binaries:
+        console.print("[dim]感谢以上工具的作者。[/dim]\n")
     
-    print()
-    print("使用 'fanse <command> -h' 查看具体命令的详细帮助")
-    print("使用 'fanse -v' 查看版本，'fanse --version-info' 查看更新信息")
-    print("使用 'fanse update' 检查并更新到最新版本")
+    # 底部提示
+    footer = Table(show_header=False, box=None, padding=(0, 1))
+    footer.add_row("[bold]fanse <command> -h[/bold]", "查看具体命令的详细帮助")
+    footer.add_row("[bold]fanse -v[/bold]", "查看版本，[bold]fanse --version-info[/bold] 查看更新信息")
+    footer.add_row("[bold]fanse update[/bold]", "检查并更新到最新版本")
+    
+    console.print(Panel(footer, title="帮助", border_style="green", box=box.ROUNDED))
 
 
 def show_detailed_version_info():
@@ -351,8 +385,8 @@ def create_parser():
     # 子命令：flow（由模块提供）
     add_flow_subparser(subparsers)
     # 子命令：runtime 与 java（由模块提供）
-    add_runtime_subparser(subparsers)
-    add_java_subparser(subparsers)
+    # add_runtime_subparser(subparsers)
+    # add_java_subparser(subparsers)
     
     return parser, subparsers.choices
 

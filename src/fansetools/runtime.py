@@ -3,6 +3,7 @@ import platform
 import urllib.request
 import zipfile
 from pathlib import Path
+from .utils.rich_help import CustomHelpFormatter
 
 
 def get_runtime_base():
@@ -68,10 +69,11 @@ def add_runtime_subparser(subparsers):
     runtime_parser = subparsers.add_parser(
         'runtime',
         help='运行时管理',
-        description='安装运行时（如 Java JRE）'
+        description='安装运行时（如 Java JRE）',
+        formatter_class=CustomHelpFormatter
     )
     runtime_sub = runtime_parser.add_subparsers(dest='rt_cmd')
-    rt_java = runtime_sub.add_parser('install', help='安装 Java JRE')
+    rt_java = runtime_sub.add_parser('install', help='安装 Java JRE', formatter_class=CustomHelpFormatter)
     rt_java.set_defaults(func=lambda a: install_java())
     return runtime_parser
 
@@ -80,7 +82,8 @@ def add_java_subparser(subparsers):
     java_parser = subparsers.add_parser(
         'java',
         help='安装 Java 运行时',
-        description='安装或更新本地 Java JRE 到 runtime/java'
+        description='安装或更新本地 Java JRE 到 runtime/java',
+        formatter_class=CustomHelpFormatter
     )
     java_parser.set_defaults(func=lambda a: install_java())
     return java_parser

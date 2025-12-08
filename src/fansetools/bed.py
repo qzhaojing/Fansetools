@@ -14,6 +14,7 @@ FANSe3 to BED format converter for fansetools
 
 import os
 import argparse
+from .utils.rich_help import CustomHelpFormatter
 from tqdm import tqdm
 from glob import glob
 
@@ -90,7 +91,11 @@ def fanse2bed(args):
 
 def add_bed_subparser(subparsers):
     """Add bed subcommand to the main parser"""
-    parser = subparsers.add_parser('bed', help='Convert FANSe3 results to BED format')
+    parser = subparsers.add_parser(
+        'bed', 
+        help='Convert FANSe3 results to BED format',
+        formatter_class=CustomHelpFormatter
+    )
     parser.add_argument('-i', '--input', required=True, 
                        help='Input FANSe3 file or directory')
     parser.add_argument('-o', '--output', 

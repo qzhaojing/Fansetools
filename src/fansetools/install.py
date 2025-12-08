@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 import posixpath
+from .utils.rich_help import CustomHelpFormatter
 
 # 预定义的软件包列表
 REPO_URL = "https://github.com/qzhaojing/Fansetools/wiki"
@@ -736,7 +737,8 @@ def add_install_subparser(subparsers):
     install_parser = subparsers.add_parser(
         'install',
         help='安装软件包',
-        description='安装预定义软件包或从URL安装软件包'
+        description='安装预定义软件包或从URL安装软件包',
+        formatter_class=CustomHelpFormatter
     )
     install_parser.add_argument(
         'packages',

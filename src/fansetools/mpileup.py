@@ -9,6 +9,7 @@ mpileup.py - FANSe3转mpileup格式模块,暂时无indel处理功能
 """
 
 import argparse
+from .utils.rich_help import CustomHelpFormatter
 from typing import Dict, List, Tuple
 from collections import defaultdict
 from .parser import fanse_parser
@@ -22,7 +23,8 @@ def add_mpileup_subparser(subparsers):
     parser = subparsers.add_parser(
         'mpileup',
         help='将FANSe3结果转换为mpileup格式',
-        description='将FANSe3比对结果转换为samtools兼容的mpileup格式'
+        description='将FANSe3比对结果转换为samtools兼容的mpileup格式',
+        formatter_class=CustomHelpFormatter
     )
     parser.add_argument('input_file', help='输入FANSe3文件路径')
     parser.add_argument('reference', help='参考基因组FASTA文件路径')

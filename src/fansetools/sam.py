@@ -46,6 +46,7 @@ import sys
 from tqdm import tqdm
 from typing import Generator, Optional, Dict, Tuple, Iterator, Set, List
 from .parser import FANSeRecord, fanse_parser
+from .utils.rich_help import CustomHelpFormatter
 
 # 预编译转换表（全局变量）
 _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
@@ -1105,7 +1106,8 @@ def add_sam_subparser(subparsers):
     sam_parser = subparsers.add_parser(
         'sam',
         help='转换为 SAM 格式',
-        description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式，支持区域过滤'
+        description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式，支持区域过滤',
+        formatter_class=CustomHelpFormatter
     )
     
     sam_parser.add_argument(

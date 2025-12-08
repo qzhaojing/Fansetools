@@ -8,6 +8,7 @@ sam sort
 import sys
 import os
 import argparse
+from .utils.rich_help import CustomHelpFormatter
 from collections import defaultdict
 import tempfile
 import heapq
@@ -202,7 +203,8 @@ def add_sort_subparser(subparsers):
     sort_parser = subparsers.add_parser(
         'sort',
         help='SAM文件排序',
-        description='对SAM文件进行排序，支持按坐标或名称排序'
+        description='对SAM文件进行排序，支持按坐标或名称排序',
+        formatter_class=CustomHelpFormatter
     )
     
     sort_parser.add_argument(

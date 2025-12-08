@@ -14,6 +14,7 @@ fansetools count 组件 - 用于处理fanse3文件的read计数
 """
 
 import argparse
+from .utils.rich_help import CustomHelpFormatter
 from collections import Counter, defaultdict, deque
 from itertools import chain  # 修正：用于生成器级展开multi2all，避免构建巨大的中间列表
 from fansetools.quant import add_quant_columns, build_length_maps  # 新增：引入统一的定量计算函数
@@ -41,6 +42,12 @@ from fansetools.gxf2refflat_plus import (
     load_annotation_to_dataframe,
 )
 from fansetools.parser import FANSeRecord, fanse_parser, fanse_parser_high_performance
+# 新增：Rust 加速解析适配层（存在时优先使用）
+try:
+    from fansetools.fastcount_py import rust_fastcount_available, parse_and_count_rust
+except Exception:
+    rust_fastcount_available = lambda: False
+    parse_and_count_rust = None
 # 修正：新增定量模块引入，用于在唯一文件中追加 TPM/RPKM 列
 try:
     from fansetools.quant import add_quant_columns, build_length_maps
@@ -66,7 +73,7 @@ class ParallelFanseCounter:
         if self.verbose:
             print(f"初始化并行处理器: {self.max_workers} 个进程")
 
-    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none'):
+    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none', engine='auto'):
         """并行处理多个文件（仅显示正在运行的任务）"""
         if verbose:
             print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
@@ -82,14 +89,15 @@ class ParallelFanseCounter:
                 'output_dir': str(output_dir),
                 'gxf_file': gxf_file,
                 'level': level,
-                'paired_end': paired_end,
                 'length_mode_gene': length_mode_gene,
                 'length_mode_isoform': length_mode_isoform,
                 'file_stem': file_stem,
                 'verbose': verbose,
                 'batch_size': batch_size,
                 # 修正：传递定量方法到工作进程
-                'quant': quant
+                'quant': quant,
+                # 新增：解析引擎
+                'engine': engine
             }
             tasks.append(task)
 
@@ -168,7 +176,6 @@ class ParallelFanseCounter:
                 output_dir=task['output_dir'],
                 gxf_file=task['gxf_file'],
                 level=task['level'],
-                paired_end=task['paired_end'],
                 annotation_df=annotation_df,
                 verbose=task.get('verbose', False),
                 export_format=task.get('format', 'rsem'),
@@ -177,7 +184,8 @@ class ParallelFanseCounter:
                 length_mode_isoform=task.get('length_mode_isoform', 'txLength'),
                 batch_size=task.get('batch_size', None),
                 # 修正：并行路径中追加定量参数
-                quant=task.get('quant', 'none')
+                quant=task.get('quant', 'none'),
+                engine=task.get('engine', 'auto')
             )
 
             # 运行计数处理
@@ -287,14 +295,15 @@ def count_main_parallel(args):
             output_base_dir=output_dir,
             gxf_file=args.gxf,
             level=args.level,
-            paired_end=args.paired_end,
+            # paired_end=args.paired_end,
             annotation_df=annotation_df,
             length_mode_gene=getattr(args, 'len_gene', getattr(args, 'len', 'genelongesttxLength')),
             length_mode_isoform=getattr(args, 'len_isoform', 'txLength'),
             verbose=getattr(args, 'verbose', False),
             batch_size=getattr(args, 'batch_size', None),
             # 修正：并行路径中传递定量方法选择
-            quant=getattr(args, 'quant', 'none')
+            quant=getattr(args, 'quant', 'none'),
+            engine=getattr(args, 'engine', 'auto')
         )
 
         duration = time.time() - start_time
@@ -420,7 +429,8 @@ def count_main_serial(args, progress=None, task_id=None):
                     length_mode_gene=getattr(args, 'len_gene', getattr(args, 'len', 'genelongesttxLength')),
                     length_mode_isoform=getattr(args, 'len_isoform', 'txLength'),
                     batch_size=getattr(args, 'batch_size', None),
-                    quant=getattr(args, 'quant', 'none')
+                    quant=getattr(args, 'quant', 'none'),
+                    engine=getattr(args, 'engine', 'auto')
                 )
                 count_files = counter.run()
                 if getattr(args, 'verbose', False):
@@ -456,7 +466,7 @@ class FanseCounter:
                  # minreads=0,
                  rpkm=0,
                  gxf_file=None,
-                 paired_end=None,
+                #  paired_end=None,
                  output_filename=None,
                  annotation_df=None,
                  verbose=False,
@@ -468,7 +478,9 @@ class FanseCounter:
                  length_mode_gene=None,              # 新增：基因层长度模式（优先于 length_mode）
                  length_mode_isoform='txLength',     # 新增：转录本层长度模式
                  batch_size=None,  # 新增：批处理大小参数，允许用户通过CLI控制
-                 quant='none'):    # 新增：定量方法选择（none/tpm/rpkm/both），用于在唯一文件中追加TPM/RPKM
+                 quant='none',     # 新增：定量方法选择（none/tpm/rpkm/both），用于在唯一文件中追加TPM/RPKM
+                 engine='auto'     # 新增：解析引擎选择（auto/python/rust），auto优先使用Rust
+                 ):
 
         # 添加计数类型前缀
         self.isoform_prefix = 'isoform_'
@@ -481,7 +493,7 @@ class FanseCounter:
         # self.minreads = minreads
         # self.rpkm = rpkm
         self.gxf_file = gxf_file
-        self.paired_end = paired_end
+        self.paired_end = None
         self.output_filename = output_filename  # 新增：支持自定义输出文件名
         self.annotation_df = annotation_df  # 新增：注释数据框
         self.verbose = verbose
@@ -497,6 +509,8 @@ class FanseCounter:
         self.batch_size = batch_size
         # 新增：定量方法（none/tpm/rpkm/both）
         self.quant = quant if quant in ('none','tpm','rpkm','both') else 'none'
+        # 新增：解析引擎选择
+        self.engine = engine if engine in ('auto','python','rust') else 'auto'
 
         # # 存储计数结果
         # self.counts_data = {}
@@ -559,11 +573,8 @@ class FanseCounter:
 # %% parser
     def parse_fanse_file_optimized_final(self, position=0):
         """综合优化版本"""
-        # 选择优化版本
-        if self.input_file.stat().st_size > 1024 * 1024 * 1024:  # 大于1024 MB
-            fanse_parser_selected = fanse_parser_high_performance
-        else:
-            fanse_parser_selected = fanse_parser
+        # 选择解析器：默认强制使用高性能 Python 解析器；如启用 Rust 则优先走 Rust 路径
+        fanse_parser_selected = fanse_parser_high_performance
 
         if self.verbose:
             print(f'Parsing {self.input_file.name}')
@@ -637,6 +648,24 @@ class FanseCounter:
                 self.progress.update(self.task_id, description=f"[cyan]Processing {fanse_file.name}[/cyan]")
             if not fanse_file.exists():
                 continue
+
+            # 优先尝试 Rust 引擎（若启用且可用），一次性解析并返回计数；失败则回退Python
+            if self.engine in ('rust','auto') and rust_fastcount_available() and parse_and_count_rust:
+                try:
+                    if self.verbose:
+                        print("Using Rust fastcount engine")
+                    res = parse_and_count_rust([str(fanse_file)])
+                    # 将 Rust 返回的字典写入预初始化的计数器
+                    raw.update(res.get('raw', {}))
+                    firstID.update(res.get('firstID', {}))
+                    unique.update(res.get('unique_to_isoform', {}))
+                    multi.update(res.get('multi_to_isoform', {}))
+                    multi2all.update(res.get('multi2all', {}))
+                    total_count += sum(res.get('raw', {}).values())
+                    continue  # 当前文件已完成，处理下一个候选文件
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Rust engine error, fallback to Python: {e}")
 
             try:
                 batch = []
@@ -2852,7 +2881,7 @@ def add_count_subparser(subparsers):
     parser = subparsers.add_parser(
         'count',
         help='运行FANSe to count，输出readcount',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=CustomHelpFormatter,
         epilog="""
         使用示例:
             默认isoform level
@@ -2943,6 +2972,9 @@ def add_count_subparser(subparsers):
     # 新增：定量方法选择，用于在唯一结果文件中追加表达量列
     parser.add_argument('-q','--quant', choices=['none','tpm','rpkm','both'], default='none',
                         help='在唯一文件中追加表达量列：none(不追加)/tpm/RPKM/both')
+    # 新增：解析引擎选择（auto/python/rust）
+    parser.add_argument('--engine', choices=['auto','python','rust'], default='auto',
+                        help='解析引擎：auto(优先使用Rust，失败回退Python)/python(仅Python解析)/rust(强制Rust，失败回退Python)')
 
     # 根据是否并行选择执行函数
     def count_main_wrapper(args):

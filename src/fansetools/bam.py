@@ -4,6 +4,7 @@ import sys
 import subprocess
 from pathlib import Path
 from .bin_utils import bin_manager
+from .utils.rich_help import CustomHelpFormatter
 
 def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True):
     """
@@ -272,7 +273,8 @@ def add_bam_subparser(subparsers):
 	bam_parser = subparsers.add_parser(
 		'bam',
 		help='直接转换FANSe3文件为BAM格式',
-		description='将FANSe3文件直接转换为BAM格式（自动排序和索引）'
+		description='将FANSe3文件直接转换为BAM格式（自动排序和索引）',
+		formatter_class=CustomHelpFormatter
 	)
 	
 	bam_parser.add_argument(

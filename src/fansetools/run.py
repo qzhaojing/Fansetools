@@ -5,6 +5,7 @@ import time
 import logging
 # import multiprocessing
 import argparse
+from .utils.rich_help import CustomHelpFormatter
 import gzip
 import shutil
 import tempfile
@@ -1935,7 +1936,7 @@ def add_run_subparser(subparsers):
 
   如多目录，最好文本文件记录好命令再运行。
   ''',
-        formatter_class=argparse.RawTextHelpFormatter
+        formatter_class=CustomHelpFormatter
     )
 
     #parser = subparsers.add_parser('run', help='批量运行FANSe3')
