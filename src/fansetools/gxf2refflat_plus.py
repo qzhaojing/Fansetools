@@ -14,10 +14,6 @@ import os
 import re
 import pandas as pd
 from collections import defaultdict
-from rich.console import Console
-from .utils.path_utils import PathProcessor
-
-console = Console(force_terminal=True)
 
 
 #%% common ops
@@ -123,12 +119,12 @@ def calculate_gene_length_metrics(transcripts_df, coverage_intervals=None):
     gene_metrics = {}
 
     for gene_id, gene_df in transcripts_df.groupby('geneName'):
-        # 1. genelongesttxLength: Length of the longest transcript (by txLength)
+        # 1. genelonesttxlength: Length of the longest transcript (by txLength)
         longest_tx = gene_df.loc[gene_df['txLength'].idxmax()] if not gene_df.empty else None
-        genelongesttxLength = longest_tx['txLength'] if longest_tx is not None else 0
+        genelonesttxlength = longest_tx['txLength'] if longest_tx is not None else 0
         
-        # 2. genelongestcdsLength: Length of the longest CDS among all transcripts
-        genelongestcdsLength = gene_df['cdsLength'].max() if not gene_df['cdsLength'].empty else 0
+        # 2. genelongestcdslength: Length of the longest CDS among all transcripts
+        genelongestcdslength = gene_df['cdsLength'].max() if not gene_df['cdsLength'].empty else 0
         
         # 3. geneEffectiveLength: Union length of all exons from all transcripts
         # 不是很对，暂时可以先这样吧，后续在优化。这里应该是所有exons非重叠长度之和
@@ -525,7 +521,7 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
     df = pd.DataFrame(transcripts_data)
     
     if df.empty:
-        console.print("[yellow]Warning: No transcripts found in file[/yellow]")
+        print("Warning: No transcripts found in file")
         return df
     
     # Calculate transcript-level length metrics
@@ -609,7 +605,7 @@ def load_annotation_to_dataframe(input_file, file_type='auto'):
 def save_refflat_dataframe(df, output_file, add_header=False, is_rna=False):
     """Save DataFrame to refFlat format file."""
     if df.empty:
-        console.print("[yellow]Warning: Empty DataFrame, nothing to save[/yellow]")
+        print("Warning: Empty DataFrame, nothing to save")
         return
     
     # Select only the string columns for output
@@ -632,7 +628,7 @@ def save_refflat_dataframe(df, output_file, add_header=False, is_rna=False):
         df[output_columns].to_csv(f, sep='\t', index=False, header=False)
         # df.to_csv(f, sep='\t', index=False, header=False)
     coord_type = "RNA" if is_rna else "genomic"
-    console.print(f"[green]Saved {len(df)} transcripts to {output_file} ({coord_type} coordinates)[/green]")
+    print(f"Saved {len(df)} transcripts to {output_file} ({coord_type} coordinates)")
     
     
 def convert_gxf_to_refflat(input_file, output_prefix, file_type='auto', add_header=False):
@@ -658,16 +654,16 @@ def convert_gxf_to_refflat(input_file, output_prefix, file_type='auto', add_head
     if detected_file_type == 'refflat':
         # If input is already refflat, load it directly
         genomic_df = load_refflat_to_dataframe(input_file)
-        console.print(f"Input file is already in refflat format. Skipping GXF parsing.")
+        print(f"Input file is already in refflat format. Skipping GXF parsing.")
     elif detected_file_type in ['gtf', 'gff3']:
         # Load genomic coordinates from GXF
         genomic_df = load_annotation_to_dataframe(input_file, detected_file_type)
     else:
-        console.print(f"[bold red]Error: Unsupported file type '{detected_file_type}' for input file '{input_file}'[/bold red]")
+        print(f"Error: Unsupported file type '{detected_file_type}' for input file '{input_file}'")
         return None, None
     
     if genomic_df.empty:
-        console.print("[bold red]Error: No data to process[/bold red]")
+        print("Error: No data to process")
         return None, None
     
     # Create RNA coordinates
@@ -680,10 +676,10 @@ def convert_gxf_to_refflat(input_file, output_prefix, file_type='auto', add_head
     save_refflat_dataframe(genomic_df, genomic_file, add_header, is_rna=False)
     save_refflat_dataframe(rna_df, rna_file, add_header, is_rna=True)
     
-    console.print(f"[green]Generated two refFlat files:[/green]")
-    console.print(f"1. Genomic coordinates: {genomic_file}")
-    console.print(f"2. RNA coordinates: {rna_file}")
-    console.print(f"[dim]RNA coordinates use 0-based positions relative to transcript start[/dim]")
+    print(f"Generated two refFlat files:")
+    print(f"1. Genomic coordinates: {genomic_file}")
+    print(f"2. RNA coordinates: {rna_file}")
+    print(f"RNA coordinates use 0-based positions relative to transcript start")
     
     return genomic_df, rna_df
 
@@ -831,7 +827,7 @@ def convert_gxf_to_refflat_with_tracks(input_file, output_prefix, file_type='aut
         return None, None
     
     # 生成外显子轨道文件
-    console.print("[dim]生成外显子可视化轨道文件...[/dim]")
+    print("生成外显子可视化轨道文件...")
     
     # 1. 基因组坐标的外显子BED轨道
     exon_bed_file = f"{output_prefix}.exons_genomic.bed"
@@ -845,10 +841,10 @@ def convert_gxf_to_refflat_with_tracks(input_file, output_prefix, file_type='aut
     ucsc_bed_file = f"{output_prefix}.ucsc_style.bed"
     generate_ucsc_style_track(genomic_df, ucsc_bed_file)
     
-    console.print("[green]生成的外显子轨道文件:[/green]")
-    console.print(f"1. 基因组外显子BED: {exon_bed_file}")
-    console.print(f"2. RNA外显子GTF: {exon_gtf_file}") 
-    console.print(f"3. UCSC基因预测BED: {ucsc_bed_file}")
+    print("生成的外显子轨道文件:")
+    print(f"1. 基因组外显子BED: {exon_bed_file}")
+    print(f"2. RNA外显子GTF: {exon_gtf_file}") 
+    print(f"3. UCSC基因预测BED: {ucsc_bed_file}")
     
     return genomic_df, rna_df
 
@@ -972,8 +968,8 @@ def generate_unified_rna_gtf(genomic_df, output_file):
     gtf_df.to_csv(output_file, sep='\t', header=False, index=False, )
                  # quoting=csv.QUOTE_NONE)
     
-    console.print(f"[green]生成统一RNA GTF文件: {output_file}[/green]")
-    console.print(f"包含 {len(gtf_df)} 条记录，涵盖 {len(genomic_df)} 个转录本")
+    print(f"生成统一RNA GTF文件: {output_file}")
+    print(f"包含 {len(gtf_df)} 条记录，涵盖 {len(genomic_df)} 个转录本")
     return gtf_df
 
 
@@ -1024,7 +1020,7 @@ def convert_gxf_to_unified_gtf(input_file, output_prefix, file_type='auto',
     genomic_df = load_annotation_to_dataframe(input_file, file_type)
     
     if genomic_df.empty:
-        console.print("[bold red]错误：没有找到可转换的数据[/bold red]")
+        print("错误：没有找到可转换的数据")
         return None
     
     # 2. 生成统一GTF文件
@@ -1040,13 +1036,13 @@ def convert_gxf_to_unified_gtf(input_file, output_prefix, file_type='auto',
     genomic_file = f"{output_prefix}.genomic.refflat"
     save_refflat_dataframe(genomic_df, genomic_file, add_header, is_rna=False)
     
-    console.print("[bold green]转换完成！[/bold green]")
-    console.print(f"主要输出: {output_file} (统一RNA GTF文件)")
-    console.print(f"备用输出: {genomic_file} (基因组坐标refFlat)")
-    console.print("\n[bold]IGV使用说明:[/bold]")
-    console.print("1. 加载RNA GTF文件作为注释轨道")
-    console.print("2. 选择任意转录本ID作为参考序列")
-    console.print("3. 外显子将自动显示不同颜色和编号")
+    print("转换完成！")
+    print(f"主要输出: {output_file} (统一RNA GTF文件)")
+    print(f"备用输出: {genomic_file} (基因组坐标refFlat)")
+    print("\nIGV使用说明:")
+    print("1. 加载RNA GTF文件作为注释轨道")
+    print("2. 选择任意转录本ID作为参考序列")
+    print("3. 外显子将自动显示不同颜色和编号")
     
     return gtf_df
 
@@ -1056,70 +1052,31 @@ def main():
     """Command line interface."""
     args = parse_arguments()
     
-    processor = PathProcessor()
-    
-    try:
-        # Support wildcards/directories for input
-        input_files = processor.parse_input_paths(args.gxf, ['.gtf', '.gff', '.gff3', '.refflat'])
-    except Exception as e:
-        console.print(f"[bold red]Error parsing inputs: {e}[/bold red]")
+    if not os.path.exists(args.gxf):
+        print(f"Error: Input file {args.gxf} does not exist.")
         sys.exit(1)
-
-    if not input_files:
-        console.print(f"[bold red]Input file not found: {args.gxf}[/bold red]")
-        sys.exit(1)
-        
-    # Determine output handling
-    is_batch = len(input_files) > 1
-    output_target = args.output_prefix
     
-    if is_batch:
-        # Ensure output_target is a directory
-        if not os.path.exists(output_target):
-            try:
-                os.makedirs(output_target, exist_ok=True)
-            except OSError:
-                 console.print(f"[bold red]Error: Output path '{output_target}' must be a directory when processing multiple files.[/bold red]")
-                 sys.exit(1)
-        elif not os.path.isdir(output_target):
-            console.print(f"[bold red]Error: Output path '{output_target}' must be a directory when processing multiple files.[/bold red]")
-            sys.exit(1)
-
-    for i, input_file in enumerate(input_files):
-        input_path = str(input_file)
-        
-        # Determine current output prefix
-        if is_batch:
-            fname = input_file.stem
-            current_output_prefix = os.path.join(output_target, fname)
-            console.print(f"[dim]Processing ({i+1}/{len(input_files)}): {input_file.name}[/dim]")
-        else:
-            if os.path.isdir(output_target):
-                 fname = input_file.stem
-                 current_output_prefix = os.path.join(output_target, fname)
-            else:
-                 current_output_prefix = output_target
-
-        # Auto-detect file type
-        file_type = detect_file_type(input_path)
-        if not is_batch:
-            console.print(f"Detected file type: {file_type.upper()}")
-        
-        try:
-            #生成两个refflat文件，再加上RNA.bed
-            genomic_df, rna_df = convert_gxf_to_refflat_with_tracks(
-                input_path, current_output_prefix, file_type, args.add_header
-            )
-            
-            if genomic_df is not None:
-                if not is_batch:
-                    console.print(f"[green]Conversion complete. Processed {len(genomic_df)} transcripts.[/green]")
-                    console.print(f"[bold]Gene-level length metrics available:[/bold]")
-                    console.print(f"  - genelonesttxlength: Longest transcript length per gene")
-                    console.print(f"  - genelongestcdslength: Longest CDS length per gene")
-                    console.print(f"  - geneEffectiveLength: Gene effective length for normalization")
-        except Exception as e:
-            console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
+    # Auto-detect file type
+    file_type = detect_file_type(args.gxf)
+    print(f"Detected file type: {file_type.upper()}")
+    
+    # Generate output files    #两个refflat文件，rna没有分割bed
+    # genomic_df, rna_df = convert_gxf_to_refflat(
+    #     args.gxf, args.output_prefix, file_type, args.add_header
+    # )
+    #生成两个refflat文件，再加上RNA.bed, 先这样子先
+    genomic_df, rna_df = convert_gxf_to_refflat_with_tracks(
+        args.gxf, args.output_prefix, file_type, args.add_header
+    )    
+    # genomic_df, rna_df =  convert_gxf_to_refflat_with_tracks(input_gff, output_prefix, file_type='auto', add_header=True)
+    
+    
+    if genomic_df is not None:
+        print(f"Conversion complete. Processed {len(genomic_df)} transcripts.")
+        print(f"Gene-level length metrics available:")
+        print(f"  - genelonesttxlength: Longest transcript length per gene")
+        print(f"  - genelongestcdslength: Longest CDS length per gene")
+        print(f"  - geneEffectiveLength: Gene effective length for normalization")
 
 # For module import
 def load_gxf_to_dataframe(input_file, file_type='auto'):

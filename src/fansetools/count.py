@@ -193,7 +193,10 @@ class ParallelFanseCounter:
             return f"成功处理 {task['file_stem']}"
 
         except Exception as e:
-            raise Exception(f"处理文件 {task['input_file']} 失败: {str(e)}")
+            # 捕获详细的堆栈信息
+            import traceback
+            tb = traceback.format_exc()
+            raise Exception(f"处理文件 {task['input_file']} 失败: {str(e)}\nTraceback: {tb}")
 
 
 def count_main_parallel(args):
@@ -323,11 +326,16 @@ def count_main_parallel(args):
             console.print(f" 失败: {failed_count} 个文件")
             console.print(f" 总耗时: {duration:.2f} 秒")
 
-        if failed_count > 0 and getattr(args, 'verbose', False):
+        if failed_count > 0:
             console.print("\n[bold red]失败详情:[/bold red]")
+            printed_errors = 0
             for input_file, success, result in results:
                 if not success:
                     console.print(f"  - {Path(input_file).name}: {result}")
+                    printed_errors += 1
+                    if printed_errors >= 10 and not getattr(args, 'verbose', False):
+                        console.print(f"  ... 以及其他 {failed_count - 10} 个错误 (使用 -v 查看全部)")
+                        break
 
         if getattr(args, 'verbose', False):
             console.print(f"\n [bold green]处理完成! 结果保存在: {output_dir}[/bold green]")
