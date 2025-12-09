@@ -63,6 +63,45 @@ except Exception:
 
 # %% ParallelFanseCounter
 
+# Global variable for worker process annotation cache
+_worker_annotation_df = None
+
+def process_single_file_task(task):
+    """处理单个文件（独立函数，避免pickling问题）"""
+    global _worker_annotation_df
+    
+    try:
+        # Load annotation data if needed and not cached
+        if task['gxf_file'] and _worker_annotation_df is None:
+            # Reconstruct minimal args for load_annotation_data
+            args = argparse.Namespace(gxf=task['gxf_file'], verbose=task.get('verbose', False))
+            # load_annotation_data is defined in this module
+            _worker_annotation_df = load_annotation_data(args)
+            
+        counter = FanseCounter(
+            input_file=task['input_file'],
+            output_dir=task['output_dir'],
+            gxf_file=task['gxf_file'],
+            level=task['level'],
+            annotation_df=_worker_annotation_df,
+            verbose=task.get('verbose', False),
+            export_format=task.get('format', 'rsem'),
+            export_count_type=task.get('count_type','Final_EM'),
+            length_mode_gene=task.get('length_mode_gene', 'genelongesttxLength'),
+            length_mode_isoform=task.get('length_mode_isoform', 'txLength'),
+            batch_size=task.get('batch_size', None),
+            quant=task.get('quant', 'none'),
+            engine=task.get('engine', 'auto')
+        )
+
+        result = counter.run()
+        return f"成功处理 {task['file_stem']}"
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        raise Exception(f"处理文件 {task['input_file']} 失败: {str(e)}\nTraceback: {tb}")
+
 class ParallelFanseCounter:
     """并行处理多个fanse3文件的计数器"""
 
@@ -73,7 +112,7 @@ class ParallelFanseCounter:
         if self.verbose:
             self.console.print(f"初始化并行处理器: {self.max_workers} 个进程")
 
-    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none', engine='auto'):
+    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none', engine='auto', export_format='rsem', export_count_type='Final_EM'):
         """并行处理多个文件（仅显示正在运行的任务）"""
         if verbose:
             self.console.print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
@@ -94,10 +133,10 @@ class ParallelFanseCounter:
                 'file_stem': file_stem,
                 'verbose': verbose,
                 'batch_size': batch_size,
-                # 修正：传递定量方法到工作进程
                 'quant': quant,
-                # 新增：解析引擎
-                'engine': engine
+                'engine': engine,
+                'format': export_format,
+                'count_type': export_count_type
             }
             tasks.append(task)
 
@@ -135,7 +174,8 @@ class ParallelFanseCounter:
                 if pending:
                     t = pending.popleft()
                     current_task_by_slot[slot_idx] = t
-                    f = executor.submit(self._process_single_file, t, annotation_df)
+                    # 使用独立函数 process_single_file_task 替代实例方法，避免 pickle 问题
+                    f = executor.submit(process_single_file_task, t)
                     future_to_slot[f] = slot_idx
                     prog_list[slot_idx].update(task_id_list[slot_idx], description=f"[cyan]{t['file_stem']}", total=None, completed=0)
                     return True
@@ -307,7 +347,9 @@ def count_main_parallel(args):
             batch_size=getattr(args, 'batch_size', None),
             # 修正：并行路径中传递定量方法选择
             quant=getattr(args, 'quant', 'none'),
-            engine=getattr(args, 'engine', 'auto')
+            engine=getattr(args, 'engine', 'auto'),
+            export_format=getattr(args, 'format', 'salmon'),
+            export_count_type=getattr(args, 'count_type', 'Final_EM')
         )
 
         duration = time.time() - start_time

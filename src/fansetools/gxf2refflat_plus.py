@@ -119,12 +119,12 @@ def calculate_gene_length_metrics(transcripts_df, coverage_intervals=None):
     gene_metrics = {}
 
     for gene_id, gene_df in transcripts_df.groupby('geneName'):
-        # 1. genelonesttxlength: Length of the longest transcript (by txLength)
+        # 1. genelongesttxLength: Length of the longest transcript (by txLength)
         longest_tx = gene_df.loc[gene_df['txLength'].idxmax()] if not gene_df.empty else None
-        genelonesttxlength = longest_tx['txLength'] if longest_tx is not None else 0
+        genelongesttxLength = longest_tx['txLength'] if longest_tx is not None else 0
         
-        # 2. genelongestcdslength: Length of the longest CDS among all transcripts
-        genelongestcdslength = gene_df['cdsLength'].max() if not gene_df['cdsLength'].empty else 0
+        # 2. genelongestcdsLength: Length of the longest CDS among all transcripts
+        genelongestcdsLength = gene_df['cdsLength'].max() if not gene_df['cdsLength'].empty else 0
         
         # 3. geneEffectiveLength: Union length of all exons from all transcripts
         # 不是很对，暂时可以先这样吧，后续在优化。这里应该是所有exons非重叠长度之和
