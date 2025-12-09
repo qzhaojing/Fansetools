@@ -6,6 +6,7 @@ import logging
 # import multiprocessing
 import argparse
 from .utils.rich_help import CustomHelpFormatter
+from .utils.path_utils import PathProcessor
 import gzip
 import shutil
 import tempfile
@@ -297,6 +298,9 @@ class FanseRunner:
         # self._init_logger()
         self._init_logger(log_path)
         self.debug = debug  # 存储为实例属性
+        
+        # 路径处理器
+        self.path_processor = PathProcessor(self.logger)
 
         # 处理工作目录
         self.temp_files: List[Path] = []  # 添加临时文件跟踪
@@ -531,33 +535,7 @@ class FanseRunner:
 
     def _normalize_path(self, path: Union[str, Path]) -> Path:
         """规范化路径处理，完全支持UNC和所有Windows路径（添加引号处理）"""
-        # 如果是字符串，先去除两端的引号和空格
-        if isinstance(path, str):
-            path = path.strip().strip('"').strip("'")
-
-        # 特别处理UNC路径（Windows网络路径）
-        if isinstance(path, str) and path.startswith('\\\\'):
-            return Path(path)  # 直接返回，不进行任何修改
-
-        path = Path(path)
-
-        # 处理网络路径（UNC）的特殊情况
-        #path_str = str(path)
-        # if path_str.startswith(('\\\\', '//')):
-        #     手动构建UNC路径
-        #    unc_path = path_str.replace('/', '\\')
-        #    return Path(unc_path)
-
-        try:
-            # 优先尝试解析路径
-            return path.resolve()
-        except:
-            try:
-                # 回退到绝对路径
-                return path.absolute()
-            except:
-                # 最后尝试处理原始路径
-                return path
+        return self.path_processor._normalize_path(path)
 # =============================================================================
 # set the FANSe3 folder position
 # =============================================================================
@@ -620,106 +598,12 @@ class FanseRunner:
     def parse_input(self, input_str: str) -> List[Path]:
         """解析输入路径字符串，支持多种格式（修正Windows路径处理）"""
         self.logger.debug(f"原始输入字符串: {repr(input_str)}")  # 添加调试信息
-
-        input_items = [item.strip()
-                       for item in input_str.split(',') if item.strip()]
-        input_paths = []
-
-        for item in input_items:
-            # 移除可能包裹在路径两端的引号（单引号或双引号）
-            item = item.strip('\'"')
-            self.logger.debug(f"处理项: {repr(item)}")  # 添加调试信息
-
-            try:
-                # 处理通配符
-                if '*' in item or '?' in item:
-                    matched_paths = glob.glob(item)
-                    if not matched_paths:
-                        self.logger.warning(f"未找到匹配的文件: {item}")
-                        continue
-                    for mp in matched_paths:
-                        p = self._normalize_path(mp)
-                        if p.exists():
-                            if p.is_file():
-                                input_paths.append(p)
-                            elif p.is_dir():
-                                self._add_fastq_files(p, input_paths)
-                        else:
-                            self.logger.warning(
-                                f"路径不存在: {mp}，\n请输入 'dir {mp}' 检查文件是否存在，或路径是否可访问")
-
-                # 特别处理Windows UNC路径（以\\开头的网络路径）
-                elif item.startswith('\\\\'):
-                    # 直接使用原始路径，不进行额外的处理
-                    p = Path(item)
-                    self.logger.debug(f"UNC路径处理: {p}")
-
-                    if p.exists():
-                        if p.is_file():
-                            input_paths.append(p)
-                        elif p.is_dir():
-                            self._add_fastq_files(p, input_paths)
-                    else:
-                        self.logger.warning(
-                            f"UNC路径不存在: {item}，\n请输入 'dir {item}' 检查文件是否存在，或路径是否可访问")
-                    continue
-
-                else:  # 没有通配符，只是单纯文件或者文件夹列表
-                    p = self._normalize_path(item)
-
-                    if p.exists():
-                        if p.is_file():
-                            input_paths.append(p)
-                        elif p.is_dir():
-                            self._add_fastq_files(p, input_paths)
-                    else:
-                        self.logger.warning(
-                            f"路径不存在: {item}，\n请输入 'dir {item}' 检查文件是否存在，或路径是否可访问")
-            except Exception as e:
-                self.logger.error(f"解析输入路径失败: {item} - {str(e)}")
-
-        self.logger.debug(f"最终解析的路径: {[str(p) for p in input_paths]}")
-        return input_paths
-
-        def _add_fastq_files(self, directory: Path, file_list: list):
-            """将目录下的fastq文件添加到文件列表"""
-            # 支持的fastq文件扩展名
-            fastq_exts = ['.fastq', '.fq', '.fastq.gz', '.fq.gz', '.fqc']
-            for ext in fastq_exts:
-                for file in directory.glob(f'*{ext}'):
-                    if file.is_file():
-                        file_list.append(file)
-                # 考虑可能有大写扩展名
-                for file in directory.glob(f'*{ext.upper()}'):
-                    if file.is_file() and file not in file_list:
-                        file_list.append(file)
-
-    # 在 FanseRunner 类中添加 _add_fastq_files 方法
-    def _add_fastq_files(self, directory: Path, file_list: list):
-        """将目录下的fastq文件添加到文件列表"""
-        # 支持的fastq文件扩展名
-        fastq_exts = ['.fastq', '.fq', '.fastq.gz', '.fq.gz', '.fqc']
-
-        self.logger.info(f"扫描目录中的FASTQ文件: {directory}")
-
-        for ext in fastq_exts:
-            # 查找小写扩展名文件
-            for file in directory.glob(f'*{ext}'):
-                if file.is_file():
-                    if file not in file_list:
-                        file_list.append(file)
-                        self.logger.debug(f"找到FASTQ文件: {file}")
-
-            # 查找大写扩展名文件
-            for file in directory.glob(f'*{ext.upper()}'):
-                if file.is_file() and file not in file_list:
-                    file_list.append(file)
-                    self.logger.debug(f"找到FASTQ文件: {file}")
-
-        # 如果没有找到文件，记录警告
-        if not any(file for file in file_list if file.parent == directory):
-            self.logger.warning(f"在目录中未找到FASTQ文件: {directory}")
-            self.logger.warning(f"支持的扩展名: {', '.join(fastq_exts)}")
+        
+        # 使用统一的 PathProcessor 处理
+        paths = self.path_processor.parse_input_paths(input_str, self.path_processor.FASTQ_EXTENSIONS)
+        
+        self.logger.debug(f"最终解析的路径: {[str(p) for p in paths]}")
+        return paths
 
 # %% gzip and pigz
 

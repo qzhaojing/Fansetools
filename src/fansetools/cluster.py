@@ -23,7 +23,7 @@ import time
 import re
 import queue  # 新增：用于动态任务队列
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-import glob  # 修正：本地扩展 -i 通配符
+from .utils.path_utils import PathProcessor
 
 @dataclass
 class ClusterNode:
@@ -1463,48 +1463,14 @@ def cluster_command(args):
                             o_val = tokens[o_idx + 1]
                     except ValueError:
                         o_val = None
-                    first_node = selected_nodes[0]
-                    # 根据远端系统类型选择展开命令
-                    node_obj = cluster_mgr.nodes.get(first_node)
-                    ssh = cluster_mgr._create_ssh_connection(node_obj)
-                    if not ssh:
-                        print(f"❌ 无法连接用于解析输入的节点: {first_node}")
-                        return 1
-                    try:
-                        is_win = cluster_mgr._is_windows_system(ssh)
-                        if is_win:
-                            # 修正：使用PowerShell并设置UTF-8输出编码，避免中文路径乱码
-                            # -File 仅文件；-ErrorAction 静默错误；输出 FullName
-                            cmd = (
-                                'powershell -NoProfile -Command '
-                                f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-                                f"Get-ChildItem -Path \"{pattern}\" -File -ErrorAction SilentlyContinue | ForEach-Object {{ $_.FullName }}"
-                            )
-                        else:
-                            cmd = f'ls -1 {pattern}'
-                        success, out, _ = cluster_mgr._execute_remote_command(ssh, cmd)
-                        files = [line.strip() for line in (out or '').splitlines() if line.strip()]
-                    finally:
-                        ssh.close()
+                    # 使用统一的 PathProcessor 解析输入
+                    processor = PathProcessor()
+                    # 使用 PathProcessor 解析路径，支持通配符和目录，统一使用 FASTQ 扩展名
+                    files = [str(p) for p in processor.parse_input_paths(pattern, processor.FASTQ_EXTENSIONS)]
+                    
                     if not files:
-                        # 修正：远端未匹配到文件时，回退到本地展开（适配UNC与中文路径）
-                        # 优先目录展开，其次通配符展开
-                        try:
-                            p_clean = pattern.strip('"')
-                            if os.path.isdir(p_clean):
-                                try:
-                                    names = os.listdir(p_clean)
-                                    files = [os.path.normpath(os.path.join(p_clean, nm)) for nm in names if os.path.isfile(os.path.join(p_clean, nm))]
-                                except Exception:
-                                    files = []
-                            if not files:
-                                local_files = glob.glob(p_clean)
-                                files = [os.path.normpath(f) for f in local_files if os.path.isfile(f)]
-                        except Exception:
-                            files = []
-                        if not files:
-                            print(f"📭 未解析到匹配的输入文件: {pattern}")
-                            return 1
+                        print(f"📭 未解析到匹配的输入文件: {pattern}")
+                        return 1
                     # 以每个文件生成一条作业，将 -i 参数替换为具体文件
                     base = tokens[:i_idx] + tokens[i_idx+2:]
                     for f in files:

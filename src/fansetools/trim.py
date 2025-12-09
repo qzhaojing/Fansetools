@@ -9,7 +9,9 @@ import argparse
 from pathlib import Path
 from rich.console import Console
 from .utils.rich_help import CustomHelpFormatter, print_colored_text
+from .utils.path_utils import PathProcessor
 from .cli import find_and_execute_binary
+import copy
 
 def get_binary_path(name):
     """
@@ -139,7 +141,7 @@ def run_fastp(args, fastp_path):
         cmd.extend(cleaned_args)
         
     # 显示带颜色的执行命令
-    console = Console()
+    console = Console(force_terminal=True)
     cmd_str = ' '.join(cmd)
     console.print(f"[bold green]执行命令:[/bold green] [yellow]{cmd_str}[/yellow]")
     
@@ -218,7 +220,7 @@ def run_cutadapt(args, cutadapt_path):
     cmd.extend(input_files)
     
     # 显示带颜色的执行命令
-    console = Console()
+    console = Console(force_terminal=True)
     cmd_str = ' '.join(cmd)
     console.print(f"[bold green]执行命令:[/bold green] [yellow]{cmd_str}[/yellow]")
     
@@ -278,55 +280,48 @@ def print_help():
      [green]fanse trim --cutadapt -i input.fq.gz -a AGATCGGAAGAG --nextseq-trim=20[/green]
 """
     from rich.console import Console
-    console = Console()
+    console = Console(force_terminal=True)
     console.print(help_text)
 
 def handle_trim_command_wrapper(args):
     """
     包装器：处理参数解析，决定调用哪个工具
+    支持批量处理和通配符输入
     """
+    console = Console(force_terminal=True)
     # 0. 特殊处理：如果用户请求 --help 并且带有 --fastp 或 --cutadapt
-    # Argparse 已经在 add_trim_subparser 中处理了 -h/--help，如果是这种情况，func 不会被调用
-    # 但如果 add_help=False，我们需要自己处理
-    
-    # 检查 args 中是否有 help
     if args.help:
-        # 检查是否请求原生帮助
         if args.fastp:
             fastp_path = get_binary_path("fastp")
             if fastp_path:
-                print(f"调用 fastp 原生帮助 ({fastp_path}):\n")
+                console.print(f"调用 fastp 原生帮助 ({fastp_path}):\n")
                 try:
-                    # 尝试捕获 stdout 和 stderr
-                    # 在 Windows 上 findstr 可能需要 shell=True，但这里直接运行
                     res = subprocess.run([fastp_path, "--help"], capture_output=True, text=True)
                     output = res.stdout + res.stderr
                     print_colored_text(output)
                 except Exception as e:
-                    print(f"无法获取 fastp 帮助: {e}")
+                    console.print(f"[bold red]无法获取 fastp 帮助: {e}[/bold red]")
             else:
-                print("未找到 fastp。")
+                console.print("[yellow]未找到 fastp。[/yellow]")
             return 0
         
         if args.cutadapt:
             cutadapt_path = get_binary_path("cutadapt")
-            # cutadapt 可能是系统命令
             if not cutadapt_path and shutil.which("cutadapt"):
                 cutadapt_path = "cutadapt"
             
             if cutadapt_path:
-                print(f"调用 cutadapt 原生帮助 ({cutadapt_path}):\n")
+                console.print(f"调用 cutadapt 原生帮助 ({cutadapt_path}):\n")
                 try:
                     res = subprocess.run([cutadapt_path, "--help"], capture_output=True, text=True)
                     output = res.stdout + res.stderr
                     print_colored_text(output)
                 except Exception as e:
-                    print(f"无法获取 cutadapt 帮助: {e}")
+                    console.print(f"[bold red]无法获取 cutadapt 帮助: {e}[/bold red]")
             else:
-                print("未找到 cutadapt。")
+                console.print("[yellow]未找到 cutadapt。[/yellow]")
             return 0
         
-        # 默认显示我们的增强帮助
         print_help()
         return 0
 
@@ -342,56 +337,148 @@ def handle_trim_command_wrapper(args):
         if fastp_path:
             tool_to_use = "fastp"
         else:
-            print("错误: 指定了 --fastp 但未找到 fastp 可执行文件。")
+            console.print("[bold red]错误: 指定了 --fastp 但未找到 fastp 可执行文件。[/bold red]")
             return 1
     elif args.cutadapt:
         if cutadapt_path:
             tool_to_use = "cutadapt"
         else:
-            print("错误: 指定了 --cutadapt 但未找到 cutadapt。")
+            console.print("[bold red]错误: 指定了 --cutadapt 但未找到 cutadapt。[/bold red]")
             return 1
     else:
-        # 默认优先级: fastp > cutadapt
         if fastp_path:
             tool_to_use = "fastp"
         elif cutadapt_path:
             tool_to_use = "cutadapt"
         else:
-            print("错误: 未找到 fastp 或 cutadapt。请安装其中之一。")
+            console.print("[bold red]错误: 未找到 fastp 或 cutadapt。请安装其中之一。[/bold red]")
             return 1
             
-    # 2. 验证输入文件 (如果没有提供 -i/-1/-2，尝试从 remaining_args 获取?)
-    # 为了支持 "fanse trim input.fq.gz"，我们需要检查 remaining_args
-    # 但 argparse 的 remaining_args 可能包含文件名
-    if not (args.input or args.r1):
-        # 尝试从 remaining_args 解析位置参数
-        # 假设剩下的参数中，不以 - 开头的是文件
-        files = [x for x in args.remaining_args if not x.startswith('-')]
-        if len(files) == 1:
-            args.input = files[0]
-            print(f"检测到输入文件: {args.input}")
-            # 从 remaining_args 中移除该文件，避免重复传递
-            args.remaining_args.remove(files[0])
-        elif len(files) == 2:
-            args.r1 = files[0]
-            args.r2 = files[1]
-            print(f"检测到双端输入文件: {args.r1}, {args.r2}")
-            args.remaining_args.remove(files[0])
-            args.remaining_args.remove(files[1])
+    # 2. 解析输入文件 (支持通配符和目录)
+    processor = PathProcessor()
+    tasks = [] # List of (r1, r2) tuples. r2 is None for single end.
+    
+    # 2.1 显式参数 (-i 或 -1/-2)
+    if args.input:
+        files = processor.parse_input_paths(args.input, processor.FASTQ_EXTENSIONS)
+        for f in files:
+            tasks.append((str(f), None))
+    elif args.r1 and args.r2:
+        r1_files = processor.parse_input_paths(args.r1, processor.FASTQ_EXTENSIONS)
+        r2_files = processor.parse_input_paths(args.r2, processor.FASTQ_EXTENSIONS)
+        
+        if len(r1_files) != len(r2_files):
+            console.print(f"[bold red]错误: R1文件数量 ({len(r1_files)}) 与 R2文件数量 ({len(r2_files)}) 不匹配。[/bold red]")
+            return 1
             
-    if not (args.input or (args.r1 and args.r2)):
-        # 如果还是没有输入文件，且不是仅查看版本等操作
-        print("错误: 请指定输入文件 (-i 或 -1/-2)。")
+        # 假设按名称排序后是配对的
+        r1_files.sort()
+        r2_files.sort()
+        for f1, f2 in zip(r1_files, r2_files):
+            tasks.append((str(f1), str(f2)))
+            
+    # 2.2 位置参数 (尝试从 remaining_args 解析)
+    # 如果显式参数未提供，或者提供了显式参数但 remaining_args 还有文件?
+    # 通常如果提供了 -i，就不应该再看位置参数里的文件了，避免混淆。
+    # 但为了兼容 "fanse trim -i file1 file2 file3"，我们应该检查。
+    # 这里简化逻辑：如果没有显式参数，才检查位置参数。
+    if not tasks:
+        pos_files = [x for x in args.remaining_args if not x.startswith('-')]
+        # 从 remaining_args 中移除这些文件，剩下的作为参数传递
+        for f in pos_files:
+            args.remaining_args.remove(f)
+            
+        if len(pos_files) == 1:
+            # 单个模式：fanse trim *.fq
+            files = processor.parse_input_paths(pos_files[0], processor.FASTQ_EXTENSIONS)
+            for f in files:
+                tasks.append((str(f), None))
+        elif len(pos_files) == 2:
+            # 两个模式：fanse trim *_1.fq *_2.fq  (可能是双端批量)
+            # 或者 fanse trim file1.fq file2.fq (可能是双端单个)
+            files1 = processor.parse_input_paths(pos_files[0], processor.FASTQ_EXTENSIONS)
+            files2 = processor.parse_input_paths(pos_files[1], processor.FASTQ_EXTENSIONS)
+            
+            # 如果两个都只扩展出1个文件，那就是一对双端
+            if len(files1) == 1 and len(files2) == 1:
+                tasks.append((str(files1[0]), str(files2[0])))
+            # 如果扩展出多个且数量相等，认为是批量双端
+            elif len(files1) > 0 and len(files1) == len(files2):
+                files1.sort()
+                files2.sort()
+                for f1, f2 in zip(files1, files2):
+                    tasks.append((str(f1), str(f2)))
+            else:
+                # 可能是两个不相关的单端列表？
+                # 这种情况比较模糊，保守起见，当作两组单端文件处理？
+                # 不，通常命令行两个位置参数要么是一对，要么是两个模式。
+                # 如果不匹配，报错更安全。
+                if len(files1) != len(files2):
+                     console.print(f"[bold red]错误: 位置参数解析出的文件数量不匹配: {len(files1)} vs {len(files2)}[/bold red]")
+                     return 1
+    
+    if not tasks:
+        console.print("[bold red]错误: 未找到有效的输入文件。请检查路径或通配符。[/bold red]")
         print_help()
         return 1
-
-    # 3. 执行工具
-    if tool_to_use == "fastp":
-        return run_fastp(args, fastp_path)
-    elif tool_to_use == "cutadapt":
-        return run_cutadapt(args, cutadapt_path)
         
-    return 1
+    console.print(f"检测到 {len(tasks)} 个处理任务。")
+    
+    # 3. 执行任务循环
+    success_count = 0
+    # console = Console(force_terminal=True) # 已在开头初始化
+    
+    for i, (r1, r2) in enumerate(tasks):
+        console.print(f"\n[bold blue]任务 {i+1}/{len(tasks)}:[/bold blue] 处理 {Path(r1).name} {'+ ' + Path(r2).name if r2 else ''}")
+        
+        # 创建任务特定的 args
+        task_args = copy.copy(args)
+        
+        # 设置输入
+        if r2:
+            task_args.r1 = r1
+            task_args.r2 = r2
+            task_args.input = None # 确保不混淆
+        else:
+            task_args.input = r1
+            task_args.r1 = None
+            task_args.r2 = None
+            
+        # 处理输出路径
+        # 如果是批量任务(>1)，或者没有指定输出，我们强制 auto-generate (将 output 设为 None)
+        # 除非 output 指定的是一个存在的目录
+        if len(tasks) > 1:
+            if args.output and Path(args.output).is_dir():
+                # 如果指定了输出目录，我们需要手动构建输出文件名并赋值给 task_args.output
+                # 这是一个增强功能
+                pass # 目前 auto_generate_output_name 默认在源目录。
+                # 如果要支持 -o output_dir，需要修改 auto_generate_output_name 或者在这里处理
+                # 暂时保持简单：批量模式下忽略 -o 文件名，除非它是目录?
+                # 现有逻辑 run_fastp 如果 task_args.output 有值就会用。
+                # 如果我们不清除 task_args.output，所有任务都会写入同一个文件 -> 覆盖！
+                # 所以必须清除，或者智能重命名。
+                
+                # 简单策略：如果是批量任务，强制清除 output/paired_output，使用自动命名
+                task_args.output = None
+                task_args.paired_output = None
+            else:
+                task_args.output = None
+                task_args.paired_output = None
+        
+        # 执行
+        ret = 1
+        if tool_to_use == "fastp":
+            ret = run_fastp(task_args, fastp_path)
+        elif tool_to_use == "cutadapt":
+            ret = run_cutadapt(task_args, cutadapt_path)
+            
+        if ret == 0:
+            success_count += 1
+        else:
+            console.print(f"[bold red]任务失败，返回码: {ret}[/bold red]")
+            
+    console.print(f"\n[bold green]完成。成功: {success_count}/{len(tasks)}[/bold green]")
+    return 0 if success_count == len(tasks) else 1
 
 def add_trim_subparser(subparsers):
     parser = subparsers.add_parser(

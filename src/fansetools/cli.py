@@ -81,12 +81,21 @@ def find_and_execute_binary(command_name, remaining_args):
 
     try:
         # 显示带颜色的执行命令
-        console = Console()
+        console = Console(force_terminal=True)
         cmd_str = ' '.join(cmd)
         console.print(f"[bold green]执行命令:[/bold green] [yellow]{cmd_str}[/yellow]")
         
-        result = subprocess.run(cmd)
-        return True  # 表示成功找到并执行了二进制文件
+        # 确保输出缓冲区被刷新，防止输出顺序混乱
+        sys.stdout.flush()
+        if hasattr(sys.stderr, 'flush'):
+            sys.stderr.flush()
+            
+        # 使用 os.execv 替换当前进程，这是确保交互式工具（如samtools tview）
+        # 能够完全接管终端控制权的最好方法
+        # 注意：这会导致 Python 脚本在此处结束，不会返回
+        os.execv(str(executable_path), cmd)
+        
+        return True  # 理论上不会执行到这里
     except Exception as e:
         print(f"执行错误: {e}")
         return False
@@ -129,12 +138,23 @@ def list_available_binaries():
 def show_brief_help_with_binaries(subparsers_choices=None):
     """显示包含二进制工具的简洁帮助信息"""
     from . import __version__
+    import json
     
-    console = Console()
+    console = Console(force_terminal=True)
     
     # 获取可用的二进制工具
     available_binaries = list_available_binaries()
     
+    # 加载内置工具描述
+    builtin_tools_desc = {}
+    try:
+        json_path = Path(__file__).parent / "utils" / "built_in_tools.json"
+        if json_path.exists():
+            with open(json_path, 'r', encoding='utf-8') as f:
+                builtin_tools_desc = json.load(f)
+    except Exception:
+        pass
+
     # 版本信息
     version_text = Text(f"fansetools {__version__}", style="bold green")
     try:
@@ -163,35 +183,87 @@ def show_brief_help_with_binaries(subparsers_choices=None):
     
     console.print("使用方法: [bold cyan]fanse <command> [选项][/bold cyan]\n")
     
-    # 创建命令表格
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column("Command", style="bold cyan")
-    table.add_column("Description")
+    # 定义命令分组
+    command_groups = {
+        "基础模块": ["parser","trim", "run", "count"],
+        "转换模块": ["bam", "sam", "bed", "mpileup", "fastx", "sort"],
+        "后备模块": ["install", "update", "test", "list", "installed", "uninstall", "java", "flow"],
+        "集群模块": ["cluster"],
+    }
 
-    # 显示Python子命令
-    if subparsers_choices:
-        console.print("[bold]可用命令:[/bold]")
-        for cmd, subparser in subparsers_choices.items():
-            desc = subparser.description.split('\n')[0] if subparser.description else ""
-            table.add_row(cmd, desc)
+    # 命令简明描述映射
+    command_descriptions = {
+        "parser": "解析FANSe3文件并输出结构化数据",
+        "run": "运行FANSe3比对流程: fanse run -i input.fq.gz -r reference.fasta -o output.fanse3",
+        "list": "列出可安装的预定义包",
+        "install": "安装额外的软件包",
+        "update": "检查并更新fansetools",
+        "installed": "列出已安装的包",
+        "uninstall": "卸载软件包",
+        "java": "Java运行时管理",
+        "count": "FANSe3结果定量计数(Gene/Isoform): fanse count -i input.fanse3",
+        "mpileup": "生成mpileup格式文件",
+        "bam": "转换FANSe3为BAM格式: fanse bam -i input.fanse3 -r reference.fasta -o output.bam",
+        "sam": "转换FANSe3为SAM格式: fanse sam -i input.fanse3 -r reference.fasta -o output.sam",
+        "bed": "转换FANSe3为BED格式: fanse bed -i input.fanse3 -o output.bed",
+        "fastx": "FASTQ/FASTA序列处理与转换",
+        "sort": "SAM/BAM文件排序",
+        "cluster": "集群并行计算管理: fanse cluster run -i *.fanse3 -r reference.fasta -o output_dir",
+        "trim": "测序数据接头修剪与质控: fanse trim -i input.fq.gz -o output.fq.gz",
+        "test": "运行自我测试套件",
+        "flow": "运行预定义分析流程"
+    }
     
-    # 显示二进制工具
-    if available_binaries:
-        if subparsers_choices:
-            table.add_row("", "") # 空行
+    if subparsers_choices:
+        # 收集所有已知的命令
+        known_commands = set()
+        for cmds in command_groups.values():
+            known_commands.update(cmds)
             
-        console.print(table)
-        table = Table(show_header=False, box=None, padding=(0, 2)) # 新表格
-        table.add_column("Command", style="bold magenta")
+        # 显示分组命令
+        for group_name, cmds in command_groups.items():
+            # 筛选该组中实际存在的命令
+            group_cmds = [cmd for cmd in cmds if cmd in subparsers_choices]
+            if not group_cmds:
+                continue
+                
+            table = Table(show_header=False, box=None, padding=(0, 2), title=f"[bold]{group_name}[/bold]", title_justify="left")
+            table.add_column("Command", style="bold cyan", width=15)
+            table.add_column("Description")
+            
+            for cmd in group_cmds:
+                subparser = subparsers_choices[cmd]
+                # 优先使用映射的描述，否则尝试使用description
+                desc = command_descriptions.get(cmd, subparser.description.split('\n')[0] if subparser.description else "")
+                table.add_row(cmd, desc)
+            
+            console.print(table)
+            console.print() # 空行
+
+        # 显示未分组的命令
+        other_cmds = [cmd for cmd in subparsers_choices.keys() if cmd not in known_commands]
+        if other_cmds:
+            table = Table(show_header=False, box=None, padding=(0, 2), title="[bold]其他功能[/bold]", title_justify="left")
+            table.add_column("Command", style="bold cyan", width=15)
+            table.add_column("Description")
+            for cmd in other_cmds:
+                subparser = subparsers_choices[cmd]
+                desc = command_descriptions.get(cmd, subparser.description.split('\n')[0] if subparser.description else "")
+                table.add_row(cmd, desc)
+            console.print(table)
+            console.print()
+    
+    # 显示内置工具
+    if available_binaries:
+        table = Table(show_header=False, box=None, padding=(0, 2), title="[bold]内置工具[/bold]", title_justify="left")
+        table.add_column("Command", style="bold magenta", width=15)
         table.add_column("Description")
         
-        console.print("\n[bold]内置工具:[/bold]")
         for binary in available_binaries:
-            table.add_row(binary, "外部二进制工具")
+            desc = builtin_tools_desc.get(binary, "外部二进制工具")
+            table.add_row(binary, desc)
         
-    console.print(table)
-
-    if available_binaries:
+        console.print(table)
         console.print("[dim]感谢以上工具的作者。[/dim]\n")
     
     # 底部提示
@@ -279,6 +351,7 @@ def create_parser():
     from .flows.flow import add_flow_subparser
     from .runtime import add_runtime_subparser, add_java_subparser
     from .cluster import add_cluster_subparser, cluster_command
+    from .test_cmd import add_test_subparser
     
     # 创建主解析器
     parser = argparse.ArgumentParser(
@@ -388,6 +461,9 @@ def create_parser():
     # add_runtime_subparser(subparsers)
     # add_java_subparser(subparsers)
     
+    # 子命令：test (自检)
+    add_test_subparser(subparsers)
+    
     return parser, subparsers.choices
 
 
@@ -470,8 +546,10 @@ def main():
         show_brief_help_with_binaries(subparsers_choices)
         return
     
-    # 特殊处理：如果第一个参数是子命令但后面没有其他参数，显示该子命令的帮助
-    if len(remaining_args) == 1 and remaining_args[0] in subparsers_choices:
+    # 特殊处理：如果第一个参数是子命令但后面没有其他参数，且不是无需参数的命令
+    # 允许直接运行的命令: list, installed, update, test, cluster
+    direct_run_commands = {'list', 'installed', 'update', 'test', 'cluster', 'java'}
+    if len(remaining_args) == 1 and remaining_args[0] in subparsers_choices and remaining_args[0] not in direct_run_commands:
         subparsers_choices[remaining_args[0]].print_help()
         return
     

@@ -10,7 +10,7 @@ class PathProcessor:
     """统一的路径处理器 - 基于run.py的路径处理逻辑重构"""
     
     # 支持的fastq文件扩展名
-    FASTQ_EXTENSIONS = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
+    FASTQ_EXTENSIONS = ['.fastq', '.fq', '.fastq.gz', '.fq.gz', '.fqc']
     # 支持的fanse文件扩展名  
     FANSE_EXTENSIONS = ['.fanse3', '.fanse3.gz', '.fanse3.zip']
     
@@ -19,6 +19,9 @@ class PathProcessor:
     
     def _normalize_path(self, path: Union[str, Path]) -> Path:
         """规范化路径处理，支持UNC和所有Windows路径"""
+        if isinstance(path, str):
+            path = path.strip().strip('"').strip("'")
+            
         path = Path(path)
         
         # 处理网络路径（UNC）的特殊情况
@@ -100,13 +103,10 @@ class PathProcessor:
         if valid_extensions is None:
             return True
             
-        # 检查所有可能的扩展名组合（支持.gz等压缩扩展名）
-        suffixes = path.suffixes
-        for i in range(len(suffixes)):
-            test_extension = ''.join(suffixes[i:])
-            if test_extension.lower() in [ext.lower() for ext in valid_extensions]:
-                return True
-        return False
+        # 使用 endswith 检查，支持任意复杂的后缀（如 .counts_gene_level_unique.csv）
+        # 这种方式比 pathlib.suffixes 更灵活，且保持向下兼容
+        name_lower = path.name.lower()
+        return any(name_lower.endswith(ext.lower()) for ext in valid_extensions)
     
     def _add_directory_files(self, directory: Path, file_list: List[Path], valid_extensions: List[str]):
         """将目录下的有效文件添加到文件列表"""

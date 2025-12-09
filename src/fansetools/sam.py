@@ -47,6 +47,9 @@ from tqdm import tqdm
 from typing import Generator, Optional, Dict, Tuple, Iterator, Set, List
 from .parser import FANSeRecord, fanse_parser
 from .utils.rich_help import CustomHelpFormatter
+from .utils.path_utils import PathProcessor
+from rich.console import Console
+import pathlib
 
 # 预编译转换表（全局变量）
 _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
@@ -876,7 +879,7 @@ def generate_sam_header_from_fasta(fasta_path: str) -> str:
     ref_info = parse_fasta(fasta_path)
     return generate_sam_header_from_ref_info(ref_info)
 
-def parse_region_string(region_str: str, ref_info: Dict[str, int]) -> Dict[str, List[Tuple[int, int]]]:
+def parse_region_string(region_str: str, ref_info: Dict[str, int], console=None) -> Dict[str, List[Tuple[int, int]]]:
     """
     解析区域字符串，返回区域字典
     
@@ -887,10 +890,14 @@ def parse_region_string(region_str: str, ref_info: Dict[str, int]) -> Dict[str, 
             - 单染色体: "chr1"
             - 基因/转录本: 暂不支持，需要额外注释文件
         ref_info: 参考序列信息字典
+        console: rich Console 对象
         
     返回:
         字典{序列名: [(start, end), ...]}
     """
+    if console is None:
+        console = Console(stderr=True)
+
     regions = {}
     
     # 分割多个区域
@@ -907,7 +914,7 @@ def parse_region_string(region_str: str, ref_info: Dict[str, int]) -> Dict[str, 
             
             # 验证染色体是否存在
             if chr_name not in ref_info:
-                print(f"警告: 参考序列 '{chr_name}' 不在FASTA文件中，跳过该区域")
+                console.print(f"[bold yellow]警告: 参考序列 '{chr_name}' 不在FASTA文件中，跳过该区域[/bold yellow]")
                 continue
                 
             chr_length = ref_info[chr_name]
@@ -926,11 +933,11 @@ def parse_region_string(region_str: str, ref_info: Dict[str, int]) -> Dict[str, 
                     if end > chr_length:
                         end = chr_length
                     if start >= end:
-                        print(f"警告: 无效区间 {region_part}，跳过")
+                        console.print(f"[bold yellow]警告: 无效区间 {region_part}，跳过[/bold yellow]")
                         continue
                         
                 except ValueError:
-                    print(f"警告: 无法解析区间 {region_part}，跳过")
+                    console.print(f"[bold yellow]警告: 无法解析区间 {region_part}，跳过[/bold yellow]")
                     continue
             else:
                 # 单点格式: chr1:1000
@@ -939,18 +946,18 @@ def parse_region_string(region_str: str, ref_info: Dict[str, int]) -> Dict[str, 
                     if pos < 0:
                         pos = 0
                     if pos >= chr_length:
-                        print(f"警告: 位置 {pos+1} 超出染色体 {chr_name} 长度，跳过")
+                        console.print(f"[bold yellow]警告: 位置 {pos+1} 超出染色体 {chr_name} 长度，跳过[/bold yellow]")
                         continue
                     start = pos
                     end = pos + 1  # 单点转换为1bp区间
                 except ValueError:
-                    print(f"警告: 无法解析位置 {region_part}，跳过")
+                    console.print(f"[bold yellow]警告: 无法解析位置 {region_part}，跳过[/bold yellow]")
                     continue
         else:
             # 单染色体格式: chr1
             chr_name = region_part.strip()
             if chr_name not in ref_info:
-                print(f"警告: 参考序列 '{chr_name}' 不在FASTA文件中，跳过")
+                console.print(f"[bold yellow]警告: 参考序列 '{chr_name}' 不在FASTA文件中，跳过[/bold yellow]")
                 continue
                 
             chr_length = ref_info[chr_name]
@@ -987,7 +994,7 @@ def is_record_in_region(record: FANSeRecord, regions: Dict[str, List[Tuple[int, 
                     
     return False
 
-def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: Optional[str] = None):
+def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: Optional[str] = None, console=None):
     """
     将FANSe3文件转换为SAM格式，支持区域过滤
 
@@ -996,18 +1003,22 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
         fasta_path: 参考基因组FASTA文件路径
         output_sam: 输出SAM文件路径(如果为None则打印到标准输出)
         region: 区域过滤字符串
+        console: rich Console 对象，用于日志输出
     """
+    if console is None:
+        console = Console(stderr=True)
+
     # 解析参考序列信息
     ref_info = parse_fasta(fasta_path)
     
     # 解析区域过滤条件
     regions = {}
     if region:
-        regions = parse_region_string(region, ref_info)
+        regions = parse_region_string(region, ref_info, console)
         if regions:
-            print(f"区域过滤: 将只输出 {len(regions)} 个染色体的指定区域")
+            console.print(f"区域过滤: 将只输出 {len(regions)} 个染色体的指定区域")
         else:
-            print("警告: 未解析到有效区域，将输出所有记录")
+            console.print("警告: 未解析到有效区域，将输出所有记录")
     
     # 生成SAM头部
     header = generate_sam_header_from_ref_info(ref_info)
@@ -1016,7 +1027,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
         with open(output_sam, 'w') as out_f:
             # 写入SAM头
             out_f.write(header)
-            print('Write SAM header down.')
+            console.print('Write SAM header down.')
             
             # 处理记录
             batch_size = 10000
@@ -1052,7 +1063,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
                     out_f.write('\n'.join(batch_lines) + '\n')
             
             # 输出统计信息
-            print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
+            console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
                     
     else:
         # 标准输出模式
@@ -1081,7 +1092,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
                 sys.stdout.buffer.write(('\n'.join(batch_lines) + '\n').encode())
                 
             # 错误输出统计信息
-            sys.stderr.write(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条\n")
+            console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
             
         except AttributeError:
             # 回退方案
@@ -1094,12 +1105,59 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
 
 def run_sam_command(args):
     """Handle sam subcommand"""
-# def run_fanse2sam(args):
-    fanse2sam(args.fanse_file, 
-              args.fasta_path, 
-              args.output_sam,
-              region=args.region,
-              )
+    console = Console(force_terminal=True, stderr=True)
+    processor = PathProcessor()
+
+    # 解析输入文件
+    try:
+        input_files = processor.parse_input_paths(args.fanse_file, ['.fanse3', '.fanse', '.fanse3.gz', '.fanse.gz'])
+    except Exception as e:
+        console.print(f"[bold red]Error parsing inputs: {e}[/bold red]")
+        return
+
+    if not input_files:
+        console.print(f"[bold red]Input file not found: {args.fanse_file}[/bold red]")
+        return
+
+    # 确定输出目录（如果批量处理）
+    output_dir = None
+    if args.output_sam and len(input_files) > 1:
+        if not os.path.exists(args.output_sam):
+            try:
+                os.makedirs(args.output_sam, exist_ok=True)
+            except OSError:
+                console.print(f"[bold red]Error: Output path '{args.output_sam}' must be a directory when processing multiple files.[/bold red]")
+                return
+        elif not os.path.isdir(args.output_sam):
+            console.print(f"[bold red]Error: Output path '{args.output_sam}' must be a directory when processing multiple files.[/bold red]")
+            return
+        output_dir = args.output_sam
+
+    # 批量处理
+    for i, input_file in enumerate(input_files):
+        input_path = str(input_file)
+        
+        # 确定输出路径
+        if output_dir:
+            fname = input_file.stem
+            output_path = os.path.join(output_dir, fname + '.sam')
+        elif args.output_sam:
+            output_path = args.output_sam
+        else:
+            output_path = None # stdout
+
+        if len(input_files) > 1:
+            console.print(f"[dim]Processing ({i+1}/{len(input_files)}): {input_file.name}[/dim]")
+
+        try:
+            fanse2sam(input_path, 
+                      args.fasta_path, 
+                      output_path,
+                      region=args.region,
+                      console=console
+                      )
+        except Exception as e:
+            console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
 
 
 def add_sam_subparser(subparsers):

@@ -1,0 +1,16 @@
+{
+  "ComplimentDNA": "DNA序列互补链转换工具",
+  "LaDecodeMultiPlex": "多重测序解码工具",
+  "OneLine2FASTQcmd": "单行序列转FASTQ工具",
+  "SuperDecode": "超级解码工具",
+  "ace2sam": "ACE格式转SAM格式工具",
+  "bcftools": "变异位点(VCF/BCF)处理工具",
+  "blat": "BLAST-like序列比对工具",
+  "csvtk": "CSV/TSV文件处理工具箱",
+  "fastp": "快速全面的FASTQ预处理工具",
+  "flash": "双端测序reads拼接工具",
+  "minimap2": "长序列比对工具",
+  "pigz": "并行gzip压缩/解压工具",
+  "samtools": "SAM/BAM/CRAM格式处理工具",
+  "seqkit": "FASTA/Q序列处理工具箱"
+}

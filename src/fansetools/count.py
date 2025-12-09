@@ -19,7 +19,6 @@ from collections import Counter, defaultdict, deque
 from itertools import chain  # 修正：用于生成器级展开multi2all，避免构建巨大的中间列表
 from fansetools.quant import add_quant_columns, build_length_maps  # 新增：引入统一的定量计算函数
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import glob
 import multiprocessing as mp
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
 from rich.console import Console, Group
@@ -70,13 +69,14 @@ class ParallelFanseCounter:
     def __init__(self, max_workers=None, verbose=False):
         self.max_workers = max_workers or min(mp.cpu_count(), 8)
         self.verbose = verbose
+        self.console = Console(force_terminal=True)
         if self.verbose:
-            print(f"初始化并行处理器: {self.max_workers} 个进程")
+            self.console.print(f"初始化并行处理器: {self.max_workers} 个进程")
 
     def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none', engine='auto'):
         """并行处理多个文件（仅显示正在运行的任务）"""
         if verbose:
-            print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
+            self.console.print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
 
         tasks = []
         for input_file in file_list:
@@ -198,6 +198,7 @@ class ParallelFanseCounter:
 
 def count_main_parallel(args):
     """支持并行的主函数"""
+    console = Console(force_terminal=True)
     if getattr(args, 'verbose', False):
         print_mini_fansetools()
     processor = PathProcessor()
@@ -207,31 +208,31 @@ def count_main_parallel(args):
         input_files = processor.parse_input_paths(
             args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz', '.fanse3.zip'])
         if not input_files:
-            print("错误: 未找到有效的输入文件")
+            console.print("[bold red]错误: 未找到有效的输入文件[/bold red]")
             return
 
         if getattr(args, 'verbose', False):
-            print(f"找到 {len(input_files)} 个输入文件")
+            console.print(f"找到 {len(input_files)} 个输入文件")
 
         # 2. 加载注释文件（主进程加载，然后传递给工作进程）
         annotation_df = None
         if args.gxf:
             annotation_df = load_annotation_data(args)
             if annotation_df is None:
-                print("错误: 无法加载注释数据")
+                console.print("[bold red]错误: 无法加载注释数据[/bold red]")
                 return
             if getattr(args, 'verbose', False):
-                print(f"已加载注释数据: {len(annotation_df)} 个转录本")
+                console.print(f"已加载注释数据: {len(annotation_df)} 个转录本")
         else:
             if getattr(args, 'verbose', False):
-                print("未提供注释文件，将只生成isoform水平计数")
+                console.print("[yellow]未提供注释文件，将只生成isoform水平计数[/yellow]")
 
         # 3. 设置输出目录
         output_dir = Path(
             args.output) if args.output else Path.cwd() / "fansetools_results"
         output_dir.mkdir(parents=True, exist_ok=True)
         if getattr(args, 'verbose', False):
-            print(f"输出目录: {output_dir}")
+            console.print(f"输出目录: {output_dir}")
 
         # 4. 断点续传检查
         files_to_process = []
@@ -260,18 +261,18 @@ def count_main_parallel(args):
 
             if args.resume and all_files_exist:
                 if getattr(args, 'verbose', False):
-                    print(f"  跳过: {input_file.name} - 输出文件已存在")
+                    console.print(f"  [dim]跳过: {input_file.name} - 输出文件已存在[/dim]")
                 skipped_files += 1
             else:
                 files_to_process.append(input_file)
 
         if not files_to_process:
             if getattr(args, 'verbose', False):
-                print("所有文件均已处理完成")
+                console.print("[green]所有文件均已处理完成[/green]")
             return
 
         if getattr(args, 'resume', False) and getattr(args, 'verbose', False):
-            print(
+            console.print(
                 f"断点续传: 跳过 {skipped_files} 个文件，剩余 {len(files_to_process)} 个文件待处理")
 
         # 5. 并行处理
@@ -280,14 +281,14 @@ def count_main_parallel(args):
 
         if max_workers == 1:
             if getattr(args, 'verbose', False):
-                print("使用串行处理模式")
+                console.print("使用串行处理模式")
             return count_main_serial(args)  # 回退到串行处理
 
         parallel_counter = ParallelFanseCounter(max_workers=max_workers, verbose=getattr(args, 'verbose', False))
 
         # if getattr(args, 'verbose', False):
-        print("启动多任务并行处理 ==>> 共 {} 个文件".format(len(files_to_process)))
-        print("=" * 60)
+        console.print(f"启动多任务并行处理 ==>> 共 {len(files_to_process)} 个文件")
+        console.print("=" * 60)
 
         start_time = time.time()
         results = parallel_counter.process_files_parallel(
@@ -310,37 +311,39 @@ def count_main_parallel(args):
 
         # 6. 输出结果摘要
         if getattr(args, 'verbose', False):
-            print("\n" + "=" * 60)
-            print(" 处理结果摘要")
-            print("=" * 60)
+            console.print("\n" + "=" * 60)
+            console.print(" 处理结果摘要")
+            console.print("=" * 60)
 
         success_count = sum(1 for _, success, _ in results if success)
         failed_count = len(results) - success_count
 
         if getattr(args, 'verbose', False):
-            print(f" 成功: {success_count} 个文件")
-            print(f" 失败: {failed_count} 个文件")
-            print(f" 总耗时: {duration:.2f} 秒")
+            console.print(f" 成功: {success_count} 个文件")
+            console.print(f" 失败: {failed_count} 个文件")
+            console.print(f" 总耗时: {duration:.2f} 秒")
 
         if failed_count > 0 and getattr(args, 'verbose', False):
-            print("\n失败详情:")
+            console.print("\n[bold red]失败详情:[/bold red]")
             for input_file, success, result in results:
                 if not success:
-                    print(f"  - {Path(input_file).name}: {result}")
+                    console.print(f"  - {Path(input_file).name}: {result}")
 
         if getattr(args, 'verbose', False):
-            print(f"\n 处理完成! 结果保存在: {output_dir}")
+            console.print(f"\n [bold green]处理完成! 结果保存在: {output_dir}[/bold green]")
 
     except Exception as e:
-        print(f"错误: {str(e)}")
+        console = Console(force_terminal=True)
+        console.print(f"[bold red]错误: {str(e)}[/bold red]")
         import traceback
         traceback.print_exc()
 
 
 def count_main_serial(args, progress=None, task_id=None):
     """串行处理版本（原有的count_main函数）"""
+    console = Console(force_terminal=True)
     if getattr(args, 'verbose', False):
-        print("使用单任务处理模式...")
+        console.print("使用单任务处理模式...")
     processor = PathProcessor()
 
     try:
@@ -348,7 +351,7 @@ def count_main_serial(args, progress=None, task_id=None):
         input_files = processor.parse_input_paths(
             args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz', '.fanse3.zip'])
         if not input_files:
-            print("错误: 未找到有效的输入文件")
+            console.print("[bold red]错误: 未找到有效的输入文件[/bold red]")
             return
 
         # 加载注释文件
@@ -356,11 +359,11 @@ def count_main_serial(args, progress=None, task_id=None):
         if args.gxf:
             annotation_df = load_annotation_data(args)
             if annotation_df is None:
-                print("错误: 无法加载注释数据")
+                console.print("[bold red]错误: 无法加载注释数据[/bold red]")
                 return
         else:
             if getattr(args, 'verbose', False):
-                print("未提供注释文件，将只生成isoform水平计数")
+                console.print("[yellow]未提供注释文件，将只生成isoform水平计数[/yellow]")
 
         # 生成输出映射
         output_map = processor.generate_output_mapping(
@@ -391,26 +394,30 @@ def count_main_serial(args, progress=None, task_id=None):
                                       for f in output_files_to_check)
                 if all_files_exist:
                     if getattr(args, 'verbose', False):
-                        print(f"  跳过: {input_file.name} - 输出文件已存在")
+                        console.print(f"  [dim]跳过: {input_file.name} - 输出文件已存在[/dim]")
                     skipped_files += 1
                 else:
                     files_to_process[input_file] = output_file
 
             output_map = files_to_process
             if getattr(args, 'verbose', False):
-                print(f"断点续传: 跳过 {skipped_files} 个文件，剩余 {len(output_map)} 个文件待处理")
+                console.print(f"断点续传: 跳过 {skipped_files} 个文件，剩余 {len(output_map)} 个文件待处理")
 
             if not output_map:
                 if getattr(args, 'verbose', False):
-                    print("所有文件均已处理完成")
+                    console.print("[green]所有文件均已处理完成[/green]")
                 return
 
         # 串行处理每个文件
         for i, (input_file, output_file) in enumerate(output_map.items(), 1):
+            # 确保输出目录存在
+            if not output_file.parent.exists():
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+
             if getattr(args, 'verbose', False):
-                print(
+                console.print(
                     f"\n[{i + skipped_files}/{len(input_files)}] 处理: {input_file.name}")
-                print(f"  输出: {output_file}")
+                console.print(f"  输出: {output_file}")
 
             try:
                 counter = FanseCounter(
@@ -434,17 +441,18 @@ def count_main_serial(args, progress=None, task_id=None):
                 )
                 count_files = counter.run()
                 if getattr(args, 'verbose', False):
-                    print(" 完成")
+                    console.print(" [green]完成[/green]")
             except Exception as e:
-                print(f" 处理失败: {str(e)}")
+                console.print(f" [bold red]处理失败: {str(e)}[/bold red]")
                 import traceback
                 traceback.print_exc()
 
         if getattr(args, 'verbose', False):
-            print(f"\n处理完成: 总共 {len(input_files)} 个文件")
+            console.print(f"\n[bold green]处理完成: 总共 {len(input_files)} 个文件[/bold green]")
 
     except Exception as e:
-        print(f"错误: {str(e)}")
+        console = Console(force_terminal=True)
+        console.print(f"[bold red]错误: {str(e)}[/bold red]")
 
 
 def count_main(args, progress=None, task_id=None):
@@ -511,6 +519,7 @@ class FanseCounter:
         self.quant = quant if quant in ('none','tpm','rpkm','both') else 'none'
         # 新增：解析引擎选择
         self.engine = engine if engine in ('auto','python','rust') else 'auto'
+        self.console = Console(force_terminal=True)
 
         # # 存储计数结果
         # self.counts_data = {}
@@ -562,11 +571,11 @@ class FanseCounter:
         """判断测序模式（单端/双端）"""
         if self.paired_end and os.path.isfile(self.paired_end):
             if self.verbose:
-                print('Pair-End mode detected.')
+                self.console.print('Pair-End mode detected.')
             return True
         else:
             if self.verbose:
-                print('Single-End mode detected.')
+                self.console.print('Single-End mode detected.')
             return False
 
 
@@ -577,9 +586,9 @@ class FanseCounter:
         fanse_parser_selected = fanse_parser_high_performance
 
         if self.verbose:
-            print(f'Parsing {self.input_file.name}')
+            self.console.print(f'Parsing {self.input_file.name}')
             # 修正：输出所选解析器与批处理大小，便于定位性能问题
-            print(f"Parser: {'high_performance' if fanse_parser_selected is fanse_parser_high_performance else 'standard'}")
+            self.console.print(f"Parser: {'high_performance' if fanse_parser_selected is fanse_parser_high_performance else 'standard'}")
         start_time = time.time()
 
         # 预初始化数据结构，针对isoform。默认所有reads都比对到isoform,后续再根据这个，multi_to_isoform判断是否属于gene
@@ -607,7 +616,7 @@ class FanseCounter:
         # 可通过 CLI --batch-size 覆盖以适配不同机器与数据规模
         batch_size = int(self.batch_size) if self.batch_size else 2_000_000
         if self.verbose:
-            print(f"Using batch size: {batch_size}")
+            self.console.print(f"Using batch size: {batch_size}")
         # 修正：根据批大小动态设置进度更新步长，减少频繁刷新带来的开销
         # 大批量时放宽刷新频率，小批量保持默认
         update_interval = max(10_000, batch_size // 4)
@@ -841,12 +850,12 @@ class FanseCounter:
                 return avg_size
             else:
                 if self.verbose:
-                    print("警告: 无法采样记录，使用默认值527")
+                    self.console.print("警告: 无法采样记录，使用默认值500")
                 return 500
 
         except Exception as e:
             if self.verbose:
-                print(f"采样失败: {e}，使用默认值527")
+                self.console.print(f"采样失败: {e}，使用默认值500")
             return 500
 
     def calculate_file_record_estimate(self, file_path, sample_size=100_000):
@@ -869,12 +878,12 @@ class FanseCounter:
         # 如果是小文件，直接解析计数
         if file_size < 100 * 1024 * 1024:
             if self.verbose:
-                print("小文件，直接计数...")
+                self.console.print("小文件，直接计数...")
             try:
                 record_count = sum(
                     1 for _ in fanse_parser(str(file_path)))
                 if self.verbose:
-                    print(f"直接计数完成: {record_count} 条记录")
+                    self.console.print(f"直接计数完成: {record_count} 条记录")
                 return record_count
             except:
                 pass
@@ -885,9 +894,9 @@ class FanseCounter:
             estimated_records = max(1, int(file_size / avg_size))
 
         if self.verbose:
-            print(f"文件大小: {file_size/1_000_000_000:.2f} GB ")
-            print(f"平均记录大小: {avg_size:.0f} 字节")
-            print(f"估计Fanse记录数: {estimated_records/1_000_000:.2f} M")
+            self.console.print(f"文件大小: {file_size/1_000_000_000:.2f} GB ")
+            self.console.print(f"平均记录大小: {avg_size:.0f} 字节")
+            self.console.print(f"估计Fanse记录数: {estimated_records/1_000_000:.2f} M")
 
         return estimated_records
 
@@ -909,20 +918,20 @@ class FanseCounter:
         if prefix is None:
             prefix = self.isoform_prefix  # 默认使用isoform前缀
         if self.verbose:
-            print(f"开始高级多映射分析 (前缀: {prefix})...")
+            self.console.print(f"开始高级多映射分析 (前缀: {prefix})...")
 
         # 检查是否有multi数据
         multi_key = f'{prefix}multi_to_isoform'
         if multi_key not in counts_data or not counts_data[multi_key]:
             if self.verbose:
-                print(f"没有{prefix}多映射数据，跳过高级分析")
+                self.console.print(f"没有{prefix}多映射数据，跳过高级分析")
             return
 
         # 获取长度信息（统一入口）
         if length_dict is None:
             length_dict = self._build_length_dict(prefix, annotation_df)
             if self.verbose:
-                print(f"加载了 {len(length_dict)} 个{prefix}ID的长度信息（模式: {self.length_mode}）")
+                self.console.print(f"加载了 {len(length_dict)} 个{prefix}ID的长度信息（模式: {self.length_mode}）")
 
         # 通过unique部分计算TPM：
         # 为gene水平添加特殊处理,用unique_to_gene的reads，而不用unique_to_isoform.重要。因为很多reads映射到多个isoform
@@ -941,7 +950,7 @@ class FanseCounter:
             tpm_values = self._calculate_tpm(unique_source, length_dict)
 
         if self.verbose:
-            print(f"计算了 {len(tpm_values)} 个具有unique reads {prefix}ID的TPM值")
+            self.console.print(f"计算了 {len(tpm_values)} 个具有unique reads {prefix}ID的TPM值")
 
         # 初始化计数器
         multi_equal_counter = Counter()
@@ -952,7 +961,7 @@ class FanseCounter:
         total_events = len(counts_data[multi_key])
 
         if self.verbose:
-            print(f"开始处理 {total_events} 个{prefix}多映射事件...")
+            self.console.print(f"开始处理 {total_events} 个{prefix}多映射事件...")
 
         for ids_key, event_count in counts_data[multi_key].items():
             try:
@@ -978,10 +987,10 @@ class FanseCounter:
                 if self.verbose:
                     processed_events += 1
                     if processed_events % 10000 == 0:
-                        print(f"已处理 {processed_events}/{total_events} 个{prefix}多映射事件")
+                        self.console.print(f"已处理 {processed_events}/{total_events} 个{prefix}多映射事件")
 
             except Exception as e:
-                print(f"处理{prefix}多映射事件 {ids_key} 时出错: {str(e)}")
+                self.console.print(f"[bold red]处理{prefix}多映射事件 {ids_key} 时出错: {str(e)}[/bold red]")
                 continue
 
         # 更新计数器
@@ -989,10 +998,10 @@ class FanseCounter:
         counts_data[f'{prefix}multi_EM'] = multi_em_counter
         counts_data[f'{prefix}multi_EM_cannot_allocate_tpm'] = multi_em_cannot_allocate_tpm_counter
         if self.verbose:
-            print(f"{prefix}高级多映射分析完成：")
-            print(f"  - {prefix}multi_equal: {len(multi_equal_counter)} 个ID")
-            print(f"  - {prefix}multi_EM: {len(multi_em_counter)} 个ID")
-            print(f"  - 无法分配TPM的事件: {len(multi_em_cannot_allocate_tpm_counter)} 个")
+            self.console.print(f"{prefix}高级多映射分析完成：")
+            self.console.print(f"  - {prefix}multi_equal: {len(multi_equal_counter)} 个ID")
+            self.console.print(f"  - {prefix}multi_EM: {len(multi_em_counter)} 个ID")
+            self.console.print(f"  - 无法分配TPM的事件: {len(multi_em_cannot_allocate_tpm_counter)} 个")
 
         # return None
 
@@ -1122,19 +1131,19 @@ class FanseCounter:
             # 回退：使用每个基因最长转录本长度（从 txLength 聚合）
             if 'txLength' in df.columns:
                 if self.verbose:
-                    print(f"[len] 未找到列 {mode_gene} ，回退为按 txLength 聚合的基因最长转录本长度")
+                    self.console.print(f"[len] 未找到列 {mode_gene} ，回退为按 txLength 聚合的基因最长转录本长度")
                 return df.groupby(id_col)['txLength'].max().to_dict()
             return {}
 
         # gene 层面长度字典：若 selected 是转录本列需聚合
         if selected == 'txLength':
             if self.verbose:
-                print(f"[len] 选择 txLength，按基因聚合为最长转录本长度用于归一化")
+                self.console.print(f"[len] 选择 txLength，按基因聚合为最长转录本长度用于归一化")
             return df.groupby(id_col)['txLength'].max().to_dict()
         if selected == 'genelongestcdsLength':
             return df.groupby(id_col)['genelongestcdsLength'].max().to_dict()
         if self.verbose:
-            print(f"[len] 使用列 {selected} 作为 {prefix} 层面的长度指标")
+            self.console.print(f"[len] 使用列 {selected} 作为 {prefix} 层面的长度指标")
         return df.groupby(id_col)[selected].max().to_dict()
 
     def generate_isoform_level_counts(self, counts_data, total_count):
@@ -1224,11 +1233,11 @@ class FanseCounter:
         """
         if self.annotation_df is None:
             if self.verbose:
-                print("Warning: Can not aggregate gene level counts without annotation data")
+                self.console.print("Warning: Can not aggregate gene level counts without annotation data")
             return {}, {}
 
         if self.verbose:
-            print("Aggregating gene level counts...")
+            self.console.print("Aggregating gene level counts...")
         start_time = time.time()
 
         # 创建转录本到基因的映射列表
@@ -1934,14 +1943,10 @@ class FanseCounter:
                     # 收集该组合在所有计数类型中的值
                     for count_type, counter in self.gene_level_counts_multi_genes.items():
                         if counter:  # 确保计数器非空
-                            if not "unique_to_gene_and_isoform" and "unique_to_gene_but_not_isoform":
-                                base_count_type = count_type.replace(
-                                    self.gene_prefix, '')
-                                count_value = counter.get(gene_combo, 0)
-                                if base_count_type.endswith('_ratio'):
-                                    combo_row[f'{base_count_type}'] = count_value
-                                else:
-                                    combo_row[f'{base_count_type}'] = count_value
+                            # 修复：移除恒为False的条件，确保多基因组合的各计数列写入
+                            base_count_type = count_type.replace(self.gene_prefix, '')
+                            count_value = counter.get(gene_combo, 0)
+                            combo_row[f'{base_count_type}'] = count_value
 
                     genes = genes_list
                     def _fmt_val(v):
@@ -2417,7 +2422,7 @@ class FanseCounter:
                     break
 
         if self.verbose:
-            print(f"使用的基因注释列: {selected_cols}")
+            self.console.print(f"使用的基因注释列: {selected_cols}")
 
         # 获取去重的基因注释
         gene_annotation = self.annotation_df[selected_cols].drop_duplicates(subset=['geneName'])
@@ -2488,10 +2493,10 @@ class FanseCounter:
                 isoform_files = self._generate_isoform_level_files(base_name)
                 count_files.update(isoform_files)
                 if self.verbose:
-                    print("isoform 水平计数文件生成完成")
+                    self.console.print("isoform 水平计数文件生成完成")
             except Exception as e:
                 if self.verbose:
-                    print(f"转录本水平计数文件生成失败: {e}")
+                    self.console.print(f"转录本水平计数文件生成失败: {e}")
 
         # 生成基因水平计数文件
         if self.annotation_df is not None and self.level in ['gene', 'both']:
@@ -2516,17 +2521,17 @@ class FanseCounter:
                             break
 
                 if self.verbose:
-                    print(f'has_gene_data: {has_gene_data}')
+                    self.console.print(f'has_gene_data: {has_gene_data}')
                 if has_gene_data:
                     gene_files = self._generate_gene_level_files(base_name)
                     count_files.update(gene_files)
                     if self.verbose:
-                        print("基因水平计数文件生成完成")
+                        self.console.print("基因水平计数文件生成完成")
                 else:
                     if self.verbose:
-                        print("没有基因水平计数数据，跳过基因水平文件生成")
+                        self.console.print("没有基因水平计数数据，跳过基因水平文件生成")
             except Exception as e:
-                print(f"基因水平计数文件生成失败: {e}")
+                self.console.print(f"基因水平计数文件生成失败: {e}")
 
         # 生成RSEM兼容输出(iso/gene按level) —— 使用通用写出函数
         if 'rsem' in fmt_set:
@@ -2625,12 +2630,12 @@ class FanseCounter:
     def run(self):
         """运行完整的计数流程"""
         if self.verbose:
-            print("=" * 60)
-            print("fansetools count - Starting processing")
-            print("=" * 60)
+            self.console.print("=" * 60)
+            self.console.print("fansetools count - Starting processing")
+            self.console.print("=" * 60)
 
         if self.level in ['gene', 'both'] and self.annotation_df is None:
-            print("注意：生成 gene level counts 需要提供 --gxf gff/gtf 文件")
+            self.console.print("注意：生成 gene level counts 需要提供 --gxf gff/gtf 文件")
             return {}
 
         # 1. 解析fanse3文件并直接获得计数
@@ -2649,15 +2654,15 @@ class FanseCounter:
             self.gene_level_counts_multi_genes = gene_level_counts_multi_genes
 
             if self.verbose and self.gene_level_counts_unique_genes:
-                print(
+                self.console.print(
                     f"Gene level aggregation completed: {len(self.gene_level_counts_unique_genes)} unique-gene count types")
             
             if self.verbose and self.gene_level_counts_multi_genes:
-                print(
+                self.console.print(
                     f"Gene level aggregation completed: {len(self.gene_level_counts_multi_genes)} multi-gene count types")
         else:
             if self.verbose:
-                print("No annotation provided, skipping gene level aggregation")
+                self.console.print("No annotation provided, skipping gene level aggregation")
             self.gene_level_counts_unique_genes = {}
             self.gene_level_counts_multi_genes = {}
 
@@ -2668,8 +2673,8 @@ class FanseCounter:
         self.generate_summary()
 
         if self.verbose:
-            print("fansetools count - Processing completed")
-            print("=" * 60)
+            self.console.print("fansetools count - Processing completed")
+            self.console.print("=" * 60)
 
         return count_files
 
@@ -2724,48 +2729,48 @@ class FanseCounter:
     def debug_gene_level_data(self):
         """调试基因水平数据"""
         if self.verbose:
-            print("=== 调试基因水平数据 ===")
+            self.console.print("=== 调试基因水平数据 ===")
 
         # 检查实例变量
         if self.verbose:
-            print(
+            self.console.print(
                 f"gene_level_counts_unique_genes 存在: {hasattr(self, 'gene_level_counts_unique_genes')}")
         if hasattr(self, 'gene_level_counts_unique_genes'):
             if self.verbose:
-                print(f"类型: {type(self.gene_level_counts_unique_genes)}")
+                self.console.print(f"类型: {type(self.gene_level_counts_unique_genes)}")
             if isinstance(self.gene_level_counts_unique_genes, dict):
                 if self.verbose:
-                    print(f"键数量: {len(self.gene_level_counts_unique_genes)}")
+                    self.console.print(f"键数量: {len(self.gene_level_counts_unique_genes)}")
                 for key, value in self.gene_level_counts_unique_genes.items():
                     if hasattr(value, '__len__'):
                         if self.verbose:
-                            print(f"  {key}: {len(value)} 个条目")
+                            self.console.print(f"  {key}: {len(value)} 个条目")
                     else:
                         if self.verbose:
-                            print(f"  {key}: {type(value)}")
+                            self.console.print(f"  {key}: {type(value)}")
             else:
                 if self.verbose:
-                    print(f"值: {self.gene_level_counts_unique_genes}")
+                    self.console.print(f"值: {self.gene_level_counts_unique_genes}")
 
         if self.verbose:
-            print(
+            self.console.print(
                 f"gene_level_counts_multi_genes 存在: {hasattr(self, 'gene_level_counts_multi_genes')}")
         if hasattr(self, 'gene_level_counts_multi_genes'):
             if self.verbose:
-                print(f"类型: {type(self.gene_level_counts_multi_genes)}")
+                self.console.print(f"类型: {type(self.gene_level_counts_multi_genes)}")
             if isinstance(self.gene_level_counts_multi_genes, dict):
                 if self.verbose:
-                    print(f"键数量: {len(self.gene_level_counts_multi_genes)}")
+                    self.console.print(f"键数量: {len(self.gene_level_counts_multi_genes)}")
                 for key, value in self.gene_level_counts_multi_genes.items():
                     if hasattr(value, '__len__'):
                         if self.verbose:
-                            print(f"  {key}: {len(value)} 个条目")
+                            self.console.print(f"  {key}: {len(value)} 个条目")
                     else:
                         if self.verbose:
-                            print(f"  {key}: {type(value)}")
+                            self.console.print(f"  {key}: {type(value)}")
             else:
                 if self.verbose:
-                    print(f"值: {self.gene_level_counts_multi_genes}")
+                    self.console.print(f"值: {self.gene_level_counts_multi_genes}")
 
 # %% some other function
 
@@ -2791,39 +2796,54 @@ def print_mini_fansetools():
      FANSeTools Count - Summary the RNA-seq Count in various levels and methods.
      ''']
 
+    console = Console(force_terminal=True)
     for line in mini_art:
-        print(line)
+        console.print(line, style="bold cyan")
 
 
 def load_annotation_data(args):
     """加载注释数据"""
+    console = Console(force_terminal=True)
     if not args.gxf:
-        print("错误: 需要提供 --gxf 参数")
+        console.print("[bold red]错误: 需要提供 --gxf 参数[/bold red]")
+        return None
+
+    # Use PathProcessor to clean/validate the path
+    processor = PathProcessor()
+    try:
+        gxf_files = processor.parse_input_paths(args.gxf, ['.gtf', '.gff', '.gff3', '.refflat'])
+        if not gxf_files:
+            console.print(f"[bold red]Error: Invalid GXF file path: {args.gxf}[/bold red]")
+            return None
+        # Use the first valid path (cleaned)
+        args.gxf = str(gxf_files[0])
+    except Exception as e:
+        console.print(f"[bold red]Error parsing GXF path: {e}[/bold red]")
         return None
 
     if getattr(args, 'verbose', False):
-        print(f"\nLoading annotation from {args.gxf}")
+        console.print(f"\nLoading annotation from {args.gxf}")
 
     # 检查是否存在同名的refflat文件
     refflat_file = os.path.splitext(args.gxf)[0] + ".genomic.refflat"
 
     if os.path.exists(refflat_file):
         if getattr(args, 'verbose', False):
-            print(f"Found existing refflat file: {refflat_file}")
+            console.print(f"Found existing refflat file: {refflat_file}")
         try:
             annotation_df = read_refflat_with_commented_header(refflat_file)
             if getattr(args, 'verbose', False):
-                print(
+                console.print(
                     f"Successfully loaded {len(annotation_df)} transcripts from existing refflat file")
             return annotation_df
         except Exception as e:
             if getattr(args, 'verbose', False):
-                print(f"Error loading refflat file: {e}")
-                print("Converting GXF file instead...")
+                console.print(f"[bold red]Error loading refflat file: {e}[/bold red]")
+                console.print("Converting GXF file instead...")
 
     if getattr(args, 'verbose', False):
-        print(f"No existing refflat file found at {refflat_file}")
-        print("Converting GXF file to refflat format...")
+        console.print(f"No existing refflat file found at {refflat_file}")
+        console.print("Converting GXF file to refflat format...")
 
     if args.annotation_output:
         # Generate both genomic and RNA coordinate files
@@ -2883,40 +2903,40 @@ def add_count_subparser(subparsers):
         help='运行FANSe to count，输出readcount',
         formatter_class=CustomHelpFormatter,
         epilog="""
-        使用示例:
-            默认isoform level
-          单个文件/单端测序文件处理:
+        [bold]使用示例:[/bold]
+            [dim]默认isoform level[/dim]
+          [bold cyan]单个文件/单端测序文件处理:[/bold cyan]
             fanse count -i sample.fanse3 -o results/ --gxf annotation.gtf
 
-          批量处理目录中所有fanse3文件:
+          [bold cyan]批量处理目录中所有fanse3文件:[/bold cyan]
             fanse count -i /data/*.fanse3 -o /output/ --gxf annotation.gtf
 
-          双端测序数据, 不支持通配符和文件夹等用此方法处理:
+          [bold cyan]双端测序数据:[/bold cyan] [dim](不支持通配符和文件夹等用此方法处理)[/dim]
             fanse count -1 R1.fanse3 -2 R2.fanse3 -o results/ --gxf annotation.gtf
 
-        **如需要基因水平计数，需要输入gtf/gff/refflat/简单g-t对应文件，--gxf都可以解析
-          基因水平计数:
+        [bold yellow]**如需要基因水平计数，需要输入gtf/gff/refflat/简单g-t对应文件，--gxf都可以解析[/bold yellow]
+          [bold cyan]基因水平计数:[/bold cyan]
             fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level gene
 
-          同时输出基因和转录本水平:
+          [bold cyan]同时输出基因和转录本水平:[/bold cyan]
             fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level both
 
-          处理中断后重新运行（自动跳过已处理的文件[输出文件夹中存在对应结果文件，需重新运行请删除]）
+          [bold cyan]处理中断后重新运行:[/bold cyan] [dim]（自动跳过已处理的文件）[/dim]
             fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --resume
 
-            # 指定4个并行进程，展示总体运行进度和简易进度条
+            [dim]# 指定4个并行进程，展示总体运行进度和简易进度条[/dim]
             fanse count -i "*.fanse3" -o results --gxf annotation.gtf --p 4
 
-          使用所有CPU核心并行处理:
+          [bold cyan]使用所有CPU核心并行处理:[/bold cyan]
             fanse count -i *.fanse3 -o results --gxf annotation.gtf -p 0
 
-        基因定量归一化长度指标说明 (--len):
-          - geneEffectiveLength: 所有转录本外显子并集的非重叠长度，用于更稳健的TPM归一化
-          - genelongesttxLength: 每个基因的最长转录本长度，常作为简化替代
-          - txLength: 基于转录本长度的回退选项（按基因取最大）
-          - geneNonOverlapLength: 与 geneEffectiveLength 一致，显式提供非重叠外显子长度
-          - geneReadCoveredLength: 依据reads覆盖区间的长度（无覆盖信息时退化为有效长度）
-          - other: 自定义列名（若不存在自动回退至有效长度）
+        [bold]基因定量归一化长度指标说明 (--len):[/bold]
+          - [green]geneEffectiveLength[/green]: 所有转录本外显子并集的非重叠长度，用于更稳健的TPM归一化
+          - [green]genelongesttxLength[/green]: 每个基因的最长转录本长度，常作为简化替代
+          - [green]txLength[/green]: 基于转录本长度的回退选项（按基因取最大）
+          - [green]geneNonOverlapLength[/green]: 与 geneEffectiveLength 一致，显式提供非重叠外显子长度
+          - [green]geneReadCoveredLength[/green]: 依据reads覆盖区间的长度（无覆盖信息时退化为有效长度）
+          - [green]other[/green]: 自定义列名（若不存在自动回退至有效长度）
                 """
     )
 

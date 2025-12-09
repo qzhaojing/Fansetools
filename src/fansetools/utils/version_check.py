@@ -284,10 +284,11 @@ class DualVersionChecker:
     def perform_update(self, interactive=True):
         """执行更新操作"""
         installation_method = get_installation_method()
+        print("检查更新中...")
         version_info = self.check_version()
         
         if not version_info or not version_info.get('any_update_available'):
-            print("当前已是最新版本，无需更新。")
+            print(f"当前已是最新版本：{self.current_version}，无需更新。")
             return True
         
         print("=" * 60)
@@ -317,7 +318,14 @@ class DualVersionChecker:
                 result = subprocess.run([
                     sys.executable, '-m', 'pip', 'install', '--upgrade', self.package_name
                 ], check=True, capture_output=True, text=True)
-                print("更新完成!")
+                new_ver = None
+                try:
+                    out = subprocess.run([sys.executable, '-c', 'import fansetools; print(getattr(fansetools, "__version__", "unknown"))'], capture_output=True, text=True)
+                    if out.returncode == 0:
+                        new_ver = out.stdout.strip()
+                except Exception:
+                    pass
+                print(f"更新完毕，最新版本 {new_ver or version_info.get('pypi_latest') or '未知'}")
                 return True
                 
             elif installation_method == 'conda':
@@ -325,7 +333,7 @@ class DualVersionChecker:
                 result = subprocess.run([
                     'conda', 'update', self.package_name
                 ], check=True, capture_output=True, text=True)
-                print("更新完成!")
+                print(f"更新完毕，最新版本 {version_info.get('pypi_latest') or '未知'}")
                 return True
                 
             elif installation_method == 'git':
@@ -336,7 +344,7 @@ class DualVersionChecker:
                 subprocess.run([
                     sys.executable, '-m', 'pip', 'install', '-e', '.'
                 ], check=True)
-                print("更新完成!")
+                print("更新完毕，已同步至仓库最新提交")
                 return True
                 
             else:

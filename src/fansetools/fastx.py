@@ -10,6 +10,9 @@ from tqdm import tqdm
 from typing import Optional, Generator, NamedTuple
 # from collections import namedtuple
 from .parser import fanse_parser, unmapped_parser, FANSeRecord, UnmappedRecord
+from .utils.path_utils import PathProcessor
+from rich.console import Console
+import pathlib
 
 
 class FastxRecord(NamedTuple):
@@ -145,29 +148,85 @@ def fastq2fasta(input_file: str, output_file: Optional[str] = None) -> str:
 
 def fastx_command(args):
     """Handle fastx subcommand"""
-    if not os.path.exists(args.input):
-        raise FileNotFoundError(f"Input file not found: {args.input}")
+    console = Console(force_terminal=True)
+    processor = PathProcessor()
 
-    if args.mode == 'fanse':
-        if args.fasta:
-            output = fanse2fasta(args.input, args.output)
-            print(f"FASTA conversion complete: {output}")
-        elif args.fastq:
-            output = fanse2fastq(args.input, args.output)
-            print(f"FASTQ conversion complete: {output}")
-    elif args.mode == 'unmapped':
-        if args.fasta:
-            output = unmap2fasta(args.input, args.output)
-            print(f"FASTA conversion complete: {output}")
-        elif args.fastq:
-            output = unmap2fastq(args.input, args.output)
-            print(f"FASTQ conversion complete: {output}")
-    elif args.mode == 'fasta2fastq':
-        output = fasta2fastq(args.input, args.output)
-        print(f"FASTA→FASTQ conversion complete: {output}")
-    elif args.mode == 'fastq2fasta':
-        output = fastq2fasta(args.input, args.output)
-        print(f"FASTQ→FASTA conversion complete: {output}")
+    # 解析输入文件（支持通配符）
+    try:
+        input_files = processor.parse_input_paths(args.input, valid_extensions=None)
+    except Exception as e:
+        console.print(f"[bold red]Error parsing inputs: {e}[/bold red]")
+        return
+
+    if not input_files:
+        console.print(f"[bold red]Input file not found: {args.input}[/bold red]")
+        return
+
+    # 如果指定了输出路径且有多个输入文件，确保输出路径是目录
+    output_dir = None
+    if args.output and len(input_files) > 1:
+        if not os.path.exists(args.output):
+            try:
+                os.makedirs(args.output, exist_ok=True)
+            except OSError:
+                console.print(f"[bold red]Error: Output path '{args.output}' must be a directory when processing multiple files.[/bold red]")
+                return
+        elif not os.path.isdir(args.output):
+            console.print(f"[bold red]Error: Output path '{args.output}' must be a directory when processing multiple files.[/bold red]")
+            return
+        output_dir = args.output
+
+    # 处理每个文件
+    for i, input_file in enumerate(input_files):
+        input_path = str(input_file)
+        
+        # 确定输出文件路径
+        if output_dir:
+            # 批量处理，输出到指定目录
+            fname = input_file.stem
+            if args.mode == 'fanse' or args.mode == 'unmapped':
+                ext = '.fasta' if args.fasta else '.fastq'
+            elif args.mode == 'fasta2fastq':
+                ext = '.fastq'
+            elif args.mode == 'fastq2fasta':
+                ext = '.fasta'
+            else:
+                ext = '.out' # fallback
+            
+            output_path = os.path.join(output_dir, fname + ext)
+        elif args.output:
+            # 单个文件，直接使用指定输出路径
+            output_path = args.output
+        else:
+            # 未指定输出，使用默认（同目录改后缀）
+            output_path = None
+
+        try:
+            if len(input_files) > 1:
+                console.print(f"[dim]Processing ({i+1}/{len(input_files)}): {input_file.name}[/dim]")
+
+            if args.mode == 'fanse':
+                if args.fasta:
+                    output = fanse2fasta(input_path, output_path)
+                    console.print(f"[green]FASTA conversion complete: {output}[/green]")
+                elif args.fastq:
+                    output = fanse2fastq(input_path, output_path)
+                    console.print(f"[green]FASTQ conversion complete: {output}[/green]")
+            elif args.mode == 'unmapped':
+                if args.fasta:
+                    output = unmap2fasta(input_path, output_path)
+                    console.print(f"[green]FASTA conversion complete: {output}[/green]")
+                elif args.fastq:
+                    output = unmap2fastq(input_path, output_path)
+                    console.print(f"[green]FASTQ conversion complete: {output}[/green]")
+            elif args.mode == 'fasta2fastq':
+                output = fasta2fastq(input_path, output_path)
+                console.print(f"[green]FASTA→FASTQ conversion complete: {output}[/green]")
+            elif args.mode == 'fastq2fasta':
+                output = fastq2fasta(input_path, output_path)
+                console.print(f"[green]FASTQ→FASTA conversion complete: {output}[/green]")
+        except Exception as e:
+            console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
 
 
 def add_fastx_subparser(subparsers):

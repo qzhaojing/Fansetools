@@ -8,7 +8,10 @@ sam sort
 import sys
 import os
 import argparse
+from pathlib import Path
+from rich.console import Console
 from .utils.rich_help import CustomHelpFormatter
+from .utils.path_utils import PathProcessor
 from collections import defaultdict
 import tempfile
 import heapq
@@ -188,29 +191,78 @@ def sort_sam(input_sam, output_sam, sort_by='coord'):
 
 def run_sort_command(args):
     """处理sort子命令"""
-    if not os.path.exists(args.input):
-        print(f"错误: 输入文件 {args.input} 不存在")
-        sys.exit(1)
+    console = Console(force_terminal=True)
+    processor = PathProcessor()
     
+    # 1. 解析输入文件
+    try:
+        input_files = processor.parse_input_paths(args.input, ['.sam'])
+    except Exception as e:
+        console.print(f"[bold red]错误: 解析输入文件失败 - {e}[/bold red]")
+        sys.exit(1)
+
+    if not input_files:
+        console.print(f"[bold red]错误: 未找到有效的输入文件: {args.input}[/bold red]")
+        sys.exit(1)
+
     sort_by = 'coord' if args.coord_sort else 'name'
     
-    print(f"开始排序 {args.input}...")
-    sort_sam(args.input, args.output, sort_by=sort_by)
-    print(f"排序完成! 输出文件: {args.output}")
+    # 2. 处理输出逻辑
+    output_path = Path(args.output)
+    
+    if len(input_files) > 1:
+        # 批量模式
+        if output_path.suffix: 
+             # 如果看起来像文件（有后缀），则报错，因为批量输出需要目录
+             console.print(f"[bold red]错误: 批量处理 {len(input_files)} 个文件时，输出路径必须是目录: {args.output}[/bold red]")
+             sys.exit(1)
+        
+        if not output_path.exists():
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+        console.print(f"检测到批量模式，将处理 {len(input_files)} 个文件，输出到: {output_path}")
+
+        for infile in input_files:
+            outfile_name = infile.stem + ".sorted.sam"
+            outfile = output_path / outfile_name
+            
+            console.print(f"正在排序 ({input_files.index(infile) + 1}/{len(input_files)}): [bold green]{infile.name}[/bold green] -> [bold green]{outfile.name}[/bold green]...")
+            try:
+                sort_sam(str(infile), str(outfile), sort_by=sort_by)
+                console.print(f"[bold green]完成[/bold green]")
+            except Exception as e:
+                console.print(f"[bold red]失败[/bold red] {infile.name}: {e}")
+                
+    else:
+        # 单文件模式
+        infile = input_files[0]
+        final_output = output_path
+        
+        # 如果输出路径是现存目录，则拼接文件名
+        if output_path.is_dir():
+             final_output = output_path / (infile.stem + ".sorted.sam")
+        
+        console.print(f"开始排序 [bold green]{infile}[/bold green] -> [bold green]{final_output}[/bold green]...")
+        try:
+            sort_sam(str(infile), str(final_output), sort_by=sort_by)
+            console.print(f"排序完成! 输出文件: [bold]{final_output}[/bold]")
+        except Exception as e:
+            console.print(f"[bold red]错误[/bold red]: {e}")
+            sys.exit(1)
 
 def add_sort_subparser(subparsers):
     """添加sort子命令解析器"""
     sort_parser = subparsers.add_parser(
         'sort',
         help='SAM文件排序',
-        description='对SAM文件进行排序，支持按坐标或名称排序',
+        description='对SAM文件进行排序，支持按坐标或名称排序。支持通配符批量处理。',
         formatter_class=CustomHelpFormatter
     )
     
     sort_parser.add_argument(
-        '-i', '--input', required=True, help='输入SAM文件路径')
+        '-i', '--input', required=True, help='输入SAM文件路径 (支持通配符 *.sam)')
     sort_parser.add_argument(
-        '-o', '--output', required=True, help='输出SAM文件路径')
+        '-o', '--output', required=True, help='输出SAM文件路径或目录')
     
     # 互斥参数：按坐标排序或按名称排序
     sort_group = sort_parser.add_mutually_exclusive_group(required=True)
