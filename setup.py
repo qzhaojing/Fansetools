@@ -50,6 +50,7 @@ setup(
         'requests>=2.20.0',
         # 'cutadapt',  # 如需 cutadapt 功能，请取消注释
         'paramiko', 
+        'rich_argparse', 
     ],
 
     extras_require={

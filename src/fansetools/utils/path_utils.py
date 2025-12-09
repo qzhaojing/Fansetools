@@ -58,6 +58,11 @@ class PathProcessor:
         for item in input_items:
             # 移除可能包裹在路径两端的引号
             item = item.strip('\'"')
+            
+            # Windows下统一路径分隔符，这对UNC路径的glob匹配至关重要
+            if os.name == 'nt':
+                item = item.replace('/', '\\')
+            
             try:
                 # 处理通配符
                 if '*' in item or '?' in item:

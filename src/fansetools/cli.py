@@ -187,7 +187,7 @@ def show_brief_help_with_binaries(subparsers_choices=None):
     command_groups = {
         "基础模块": ["parser","trim", "run", "count"],
         "转换模块": ["bam", "sam", "bed", "mpileup", "fastx", "sort"],
-        "后备模块": ["install", "update", "test", "list", "installed", "uninstall", "java", "flow"],
+        "后备模块": ["install", "update", "test", "path", "list", "installed", "uninstall", "java", "flow"],
         "集群模块": ["cluster"],
     }
 
@@ -211,6 +211,7 @@ def show_brief_help_with_binaries(subparsers_choices=None):
         "cluster": "集群并行计算管理: fanse cluster run -i *.fanse3 -r reference.fasta -o output_dir",
         "trim": "测序数据接头修剪与质控: fanse trim -i input.fq.gz -o output.fq.gz",
         "test": "运行自我测试套件",
+        "path": "测试路径解析与通配符匹配",
         "flow": "运行预定义分析流程"
     }
     
@@ -352,6 +353,7 @@ def create_parser():
     from .runtime import add_runtime_subparser, add_java_subparser
     from .cluster import add_cluster_subparser, cluster_command
     from .test_cmd import add_test_subparser
+    from .check_path import add_path_subparser
     
     # 创建主解析器
     parser = argparse.ArgumentParser(
@@ -463,6 +465,9 @@ def create_parser():
     
     # 子命令：test (自检)
     add_test_subparser(subparsers)
+    
+    # 子命令：path (路径测试)
+    add_path_subparser(subparsers)
     
     return parser, subparsers.choices
 
