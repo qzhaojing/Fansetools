@@ -1832,7 +1832,13 @@ class FanseCounter:
                     for count_type, counter in self.gene_level_counts_unique_genes.items():
                         if not counter:
                             continue
-                        base_count_type = count_type.replace(self.gene_prefix, '')
+                        
+                        # 修正：仅替换开头的prefix，避免错误替换中间的字符串（如 unique_to_gene_and_isoform -> unique_to_and_isoform）
+                        if count_type.startswith(self.gene_prefix):
+                            base_count_type = count_type[len(self.gene_prefix):]
+                        else:
+                            base_count_type = count_type
+
                         count_value = counter.get(gene, 0)
                         gene_row[base_count_type] = count_value
 
@@ -1994,7 +2000,12 @@ class FanseCounter:
                     for count_type, counter in self.gene_level_counts_multi_genes.items():
                         if counter:  # 确保计数器非空
                             # 修复：移除恒为False的条件，确保多基因组合的各计数列写入
-                            base_count_type = count_type.replace(self.gene_prefix, '')
+                            # 修正：仅替换开头的prefix
+                            if count_type.startswith(self.gene_prefix):
+                                base_count_type = count_type[len(self.gene_prefix):]
+                            else:
+                                base_count_type = count_type
+                                
                             count_value = counter.get(gene_combo, 0)
                             combo_row[f'{base_count_type}'] = count_value
 
