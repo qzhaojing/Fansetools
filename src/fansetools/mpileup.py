@@ -13,7 +13,6 @@ from .utils.rich_help import CustomHelpFormatter
 from typing import Dict, List, Tuple
 from collections import defaultdict
 from .parser import fanse_parser
-from Bio import SeqIO
 import sys
 
 def add_mpileup_subparser(subparsers):
@@ -64,7 +63,25 @@ def load_reference_sequences(ref_file: str) -> Dict[str, str]:
     """
     加载参考基因组序列
     """
-    return {rec.id: str(rec.seq).upper() for rec in SeqIO.parse(ref_file, "fasta")}
+    sequences = {}
+    current_id = None
+    current_seq = []
+    
+    with open(ref_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            if line.startswith('>'):
+                if current_id:
+                    sequences[current_id] = "".join(current_seq).upper()
+                current_id = line[1:].split()[0]
+                current_seq = []
+            else:
+                current_seq.append(line)
+        if current_id:
+            sequences[current_id] = "".join(current_seq).upper()
+            
+    return sequences
 
 def process_fanse_record(
     record: 'FANSeRecord', 

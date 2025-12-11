@@ -43,9 +43,12 @@ import math
 import os
 import gzip
 import sys
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Pool
 from tqdm import tqdm
 from typing import Generator, Optional, Dict, Tuple, Iterator, Set, List
-from .parser import FANSeRecord, fanse_parser,fanse_parser_high_performance
+from .parser import FANSeRecord, fanse_parser, fanse_parser_high_performance, fanse_line_reader, parse_records_from_lines
 from .utils.rich_help import CustomHelpFormatter
 from .utils.path_utils import PathProcessor
 from rich.console import Console
@@ -53,6 +56,31 @@ import pathlib
 
 # 预编译转换表（全局变量）
 _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
+
+def _worker_process_batch(records: List[FANSeRecord], regions: Optional[Dict] = None) -> List[str]:
+    """
+    Worker function for parallel processing of FANSe records.
+    (Kept for compatibility if needed, but new implementation uses _worker_process_lines)
+    """
+    results = []
+    for record in records:
+        if regions and not is_record_in_region(record, regions):
+            continue
+        results.extend(fanse_to_sam_type(record))
+    return results
+
+def _worker_process_lines(lines: List[str], regions: Optional[Dict] = None) -> List[str]:
+    """
+    Worker function that parses raw lines and converts to SAM format.
+    Reduces main process overhead and pickling costs.
+    """
+    results = []
+    # Parse records from raw lines inside the worker process
+    for record in parse_records_from_lines(lines):
+        if regions and not is_record_in_region(record, regions):
+            continue
+        results.extend(fanse_to_sam_type(record))
+    return results
 
 def reverse_complement(seq: str) -> str:
     """优化反向互补：使用str.translate"""
@@ -751,7 +779,7 @@ def is_record_in_region(record: FANSeRecord, regions: Dict[str, List[Tuple[int, 
                     
     return False
 
-def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: Optional[str] = None, console=None):
+def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: Optional[str] = None, console=None, threads: int = 4):
     """
     将FANSe3文件转换为SAM格式，支持区域过滤
 
@@ -761,6 +789,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
         output_sam: 输出SAM文件路径(如果为None则打印到标准输出)
         region: 区域过滤字符串
         console: rich Console 对象，用于日志输出
+        threads: 并行处理的线程数（仅在输出到文件时有效）
     """
     if console is None:
         console = Console(stderr=True)
@@ -786,41 +815,68 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             out_f.write(header)
             console.print('Write SAM header down.')
             
-            # 处理记录
-            batch_size = 100000
-            batch_count = 0
-            batch_lines = []
-            filtered_count = 0
-            total_count = 0
-            
-            file_read_size = os.path.getsize(fanse_file) / 450     #粗略估计平均 450字节一个fanse记录
-            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True) as pbar:
-                for record in fanse_parser_high_performance(fanse_file):
-                    total_count += 1
-                    
-                    # 区域过滤，没有过滤信息则直接跳过（regions为None）
-                    if regions and not is_record_in_region(record, regions):
-                        filtered_count += 1
-                        pbar.update(1)
-                        continue
-                    
-                    for sam_line in fanse_to_sam_type(record):
-                        batch_lines.append(sam_line)
-                        batch_count += 1
-                    
-                    if batch_count >= batch_size:
-                        out_f.write('\n'.join(batch_lines) + '\n')
-                        batch_lines = []
-                        batch_count = 0
-                    
-                    pbar.update(1)
+            if threads > 1:
+                console.print(f"启用并行处理: 使用 {threads} 个线程")
+                from functools import partial
                 
-                # 写入剩余批次
-                if batch_lines:
-                    out_f.write('\n'.join(batch_lines) + '\n')
+                # 调整批次大小，平衡内存和调度开销
+                # 原始行数据比较小，可以适当增大batch_size
+                batch_size = 20000 
+                file_read_size = os.path.getsize(fanse_file) / 450
+                
+                # 使用fanse_line_reader作为数据源
+                reader = fanse_line_reader(fanse_file, chunk_size=batch_size)
+                worker_func = partial(_worker_process_lines, regions=regions)
+                
+                with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True) as pbar:
+                    # 使用 multiprocessing.Pool.imap 替代 executor.map
+                    # imap 是惰性的，不会一次性读取所有数据，有效控制内存
+                    with Pool(processes=threads) as pool:
+                        for lines in pool.imap(worker_func, reader, chunksize=1):
+                            if lines:
+                                out_f.write('\n'.join(lines) + '\n')
+                            # 更新进度条 (lines包含多个record生成的sam行，难以精确计数record，只能估算)
+                            # 由于我们知道chunk_size是行数，除以2即为记录数
+                            pbar.update(batch_size // 2)
+                                
+                console.print(f"处理完成")
             
-            # 输出统计信息
-            console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
+            else:
+                # 处理记录
+                batch_size = 200_000
+                batch_count = 0
+                batch_lines = []
+                filtered_count = 0
+                total_count = 0
+                
+                file_read_size = os.path.getsize(fanse_file) / 450     #粗略估计平均 450字节一个fanse记录
+                with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True) as pbar:
+                    for record in fanse_parser_high_performance(fanse_file):
+                        total_count += 1
+                        
+                        # 区域过滤，没有过滤信息则直接跳过（regions为None）
+                        if regions and not is_record_in_region(record, regions):
+                            filtered_count += 1
+                            pbar.update(1)
+                            continue
+                        
+                        for sam_line in fanse_to_sam_type(record):
+                            batch_lines.append(sam_line)
+                            batch_count += 1
+                        
+                        if batch_count >= batch_size:
+                            out_f.write('\n'.join(batch_lines) + '\n')
+                            batch_lines = []
+                            batch_count = 0
+                        
+                        pbar.update(1)
+                    
+                    # 写入剩余批次
+                    if batch_lines:
+                        out_f.write('\n'.join(batch_lines) + '\n')
+                
+                # 输出统计信息
+                console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
                     
     else:
         # 标准输出模式
@@ -911,7 +967,8 @@ def run_sam_command(args):
                       args.fasta_path, 
                       output_path,
                       region=args.region,
-                      console=console
+                      console=console,
+                      threads=args.threads
                       )
         except Exception as e:
             console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
@@ -931,6 +988,8 @@ def add_sam_subparser(subparsers):
         '-r', '--fasta', dest='fasta_path', required=True, help='参考基因组 FASTA 文件路径')
     sam_parser.add_argument(
         '-o', '--output', dest='output_sam', help='输出文件路径（不指定输出位置，默认打印到终端）')
+    sam_parser.add_argument(
+        '-t', '--threads', type=int, default=1, help='并行处理线程数（默认: 1）')
     sam_parser.add_argument(
         '-R', '--region', 
         help='区域过滤（参考samtools格式）: chr1, chr1:1000, chr1:1000-2000, chr1,chr2:500-1000'

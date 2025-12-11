@@ -80,6 +80,108 @@ def _open_fanse_text(file_path: str):
         return io.TextIOWrapper(f, encoding='utf-8', errors='ignore')
     return open(file_path, 'r', encoding='utf-8', errors='ignore', buffering=1024 * 1024 * 16)
 
+def fanse_line_reader(file_path: str, chunk_size: int = 20000) -> Generator[List[str], None, None]:
+    """
+    按块读取FANSe3结果文件，返回原始行列表
+    
+    参数:
+        file_path: FANSe3结果文件路径
+        chunk_size: 每次读取的行数（必须是偶数，因为每个记录占2行）
+        
+    返回:
+        生成器，每次yield一个字符串列表
+    """
+    # 确保chunk_size是偶数
+    if chunk_size % 2 != 0:
+        chunk_size += 1
+        
+    with _open_fanse_text(file_path) as f:
+        chunk = []
+        count = 0
+        for line in f:
+            chunk.append(line)
+            count += 1
+            if count >= chunk_size:
+                yield chunk
+                chunk = []
+                count = 0
+        if chunk:
+            yield chunk
+
+def parse_records_from_lines(lines: List[str]) -> Generator[FANSeRecord, None, None]:
+    """
+    从原始行列表解析FANSeRecord对象
+    
+    参数:
+        lines: 包含FANSe3格式原始行的列表
+        
+    返回:
+        生成器，每次yield一个FANSeRecord对象
+    """
+    comma_split = re.compile(',').split
+    
+    # 每次处理2行
+    for i in range(0, len(lines), 2):
+        if i + 1 >= len(lines):
+            break
+            
+        line1 = lines[i].rstrip()
+        line2 = lines[i+1].rstrip()
+        
+        # 快速分割
+        fields1 = line1.split('\t')
+        if len(fields1) < 2:
+            continue
+            
+        fields2 = line2.split('\t')  
+        if len(fields2) < 5:
+            continue
+        
+        # 缓存所有需要的字段
+        header_val = fields1[0]
+        seq_val = fields1[1]
+        alignment_val = fields1[2] if len(fields1) > 2 else ''
+        
+        strand_field = fields2[0]
+        ref_field = fields2[1]
+        mismatch_val = int(fields2[2])
+        position_field = fields2[3]
+        multi_count = int(fields2[4])
+        
+        # 根据multi_count分支处理
+        if multi_count != 1:
+            strands = tuple(comma_split(strand_field))
+            ref_names = tuple(sys.intern(name) for name in comma_split(ref_field))
+            positions = [int(x) for x in comma_split(position_field)]
+            mismatches = [mismatch_val] * len(positions)
+        else:
+            strands = (strand_field,)
+            ref_names = (sys.intern(ref_field),)
+            positions = [int(position_field)]
+            mismatches = [mismatch_val]
+        
+        # 处理mismatches长度对齐
+        len_mismatches = len(mismatches)
+        len_positions = len(positions)            
+        if len_positions > len_mismatches:
+            mismatches += [mismatch_val] * (len_positions - len_mismatches)
+            
+        # 延迟处理alignment字段
+        alignment_processed = alignment_val.split(',') if alignment_val else ''
+        
+        record = FANSeRecord(
+            header=header_val,
+            seq=seq_val,
+            alignment=alignment_processed,
+            strands=strands, 
+            ref_names=ref_names,
+            mismatches=mismatches,
+            positions=positions,
+            multi_count=multi_count
+        )
+        
+        yield record
+
 def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     """
     解析FANSe3结果文件的主函数
