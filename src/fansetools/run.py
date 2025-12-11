@@ -6,6 +6,7 @@ import logging
 # import multiprocessing
 import argparse
 from .utils.rich_help import CustomHelpFormatter
+from .distribute import distribute_command
 from .utils.path_utils import PathProcessor
 import gzip
 import shutil
@@ -173,6 +174,9 @@ class SSHConnectionManager:
     def connect(self, ssh_config: Dict[str, str]) -> bool:
         """建立SSH连接"""
         try:
+            import warnings
+            from cryptography.utils import CryptographyDeprecationWarning
+            warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
             import paramiko
 
             self.logger.info(
@@ -1261,6 +1265,81 @@ class FanseRunner:
 
         return len(errors) == 0, errors
 
+    def _prepare_reference_in_memory(self, refseq: Path) -> Path:
+        """
+        Check if reference should be cached in memory and perform caching.
+        Returns the path to the cached reference or original reference.
+        """
+        # 1. Check if caching is feasible (size < 1GB)
+        try:
+            ref_size = refseq.stat().st_size
+            if ref_size > 1024 * 1024 * 1024:  # > 1GB
+                self.logger.info(f"参考序列过大 ({ref_size/1024/1024:.2f} MB > 1GB)，跳过内存缓存")
+                return refseq
+        except Exception as e:
+            self.logger.warning(f"无法获取参考序列大小: {e}，跳过内存缓存")
+            return refseq
+
+        # 2. Determine memory cache directory
+        import platform
+        if platform.system() == "Linux":
+            mem_base = Path("/dev/shm")
+        else:
+            # Windows or others: use temp dir (not true RAM disk unless configured, but faster than network)
+            # User specifically asked for Windows solution. 
+            # If no RAM disk, OS file caching usually handles this well, but we can copy to local temp
+            # to avoid network IO if the original ref is on NFS/SMB.
+            import tempfile
+            mem_base = Path(tempfile.gettempdir())
+
+        cache_dir = mem_base / "fanse_refs"
+        
+        # 3. Check available memory (need psutil)
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            # Require at least 2x ref size available to be safe
+            if vm.available < ref_size * 2:
+                self.logger.warning(f"系统可用内存不足 ({vm.available/1024/1024:.2f} MB)，跳过参考序列内存缓存")
+                return refseq
+        except ImportError:
+            self.logger.warning("未安装 psutil，无法检测内存，跳过内存缓存检查 (建议 pip install psutil)")
+            # If psutil missing, proceed with caution or skip? 
+            # User requirement: "如果检测到内存不够用，那么不采用这个方式"
+            # So if we can't check, maybe we should skip to be safe, or just try if small enough.
+            # Let's skip to be safe and avoid crashing.
+            return refseq
+        except Exception as e:
+            self.logger.warning(f"内存检查失败: {e}，跳过内存缓存")
+            return refseq
+
+        # 4. Prepare cache path
+        # Use hash of file path + mtime to ensure uniqueness and freshness
+        ref_hash = self._get_file_hash(refseq) # Reuse existing hash method if suitable or just name
+        # Actually _get_file_hash reads whole file, might be slow for 1GB. 
+        # Use path + mtime hash is faster for identification.
+        import hashlib
+        identifier = f"{refseq.absolute()}_{refseq.stat().st_mtime}"
+        name_hash = hashlib.md5(identifier.encode()).hexdigest()[:8]
+        cache_file = cache_dir / f"{refseq.stem}_{name_hash}{refseq.suffix}"
+
+        # 5. Copy if not exists
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            if not cache_file.exists():
+                self.logger.info(f"正在将参考序列加载到内存/本地缓存: {cache_file} ...")
+                import shutil
+                shutil.copy2(refseq, cache_file)
+                self.logger.info("参考序列缓存完成")
+            else:
+                self.logger.info(f"使用现有的参考序列缓存: {cache_file}")
+                
+            return cache_file
+        except Exception as e:
+            self.logger.warning(f"参考序列缓存失败: {e}，将使用原始路径")
+            return refseq
+
     def run_batch(self, file_map: Dict[Path, Path], refseq: Path,
                   params: Optional[Dict[str, Union[int, str]]] = None,
                   options: Optional[List[str]] = None,
@@ -1555,15 +1634,23 @@ def run_remote_command(self, command: str) -> Tuple[bool, str, float]:
 
 
 def run_batch(self, file_map: Dict[Path, Path], refseq: Path,
-              params: Optional[Dict[str, Union[int, str]]] = None,
-              options: Optional[List[str]] = None,
-              debug: bool = False,
-              yes: bool = False,
-              resume: bool = False):
+                  params: Optional[Dict[str, Union[int, str]]] = None,
+                  options: Optional[List[str]] = None,
+                  debug: bool = False,
+                  yes: bool = False,
+                  resume: bool = False):
+    # 修正：缩进错误，将文档字符串的缩进从5个空格改为4个空格，与函数体保持一致
     """批量运行FANSe3 - 支持远程模式"""
+    # 尝试将参考序列加载到内存（仅在非远程模式下，或者是通过distribute分发到节点本地执行时）
+    # 如果是远程模式(self.remote_mode=True)，refseq已经是远程路径或者映射路径，
+    # 且我们无法直接控制远程节点的内存加载（除非我们重写远程逻辑），这里暂只针对本地执行优化
+    if not self.remote_mode:
+        refseq = self._prepare_reference_in_memory(refseq)
+
     # 合并参数和选项
     final_params = {**self.default_params, **(params or {})}
     final_options = [*self.default_options, *(options or [])]
+    
 
     # 验证参考序列存在
     if not refseq.exists():
@@ -1805,21 +1892,29 @@ def add_run_subparser(subparsers):
         'run',
         help='批量运行FANSe3',
         description='''FANSe3 批量运行工具
+
 支持多种输入输出模式:  单个文件与目录形式均可，可批量运行
-  -i sample.fq 文件: 直接处理单个或多个文件。/path/sample.fastq;/path/sample.fq.支持gz读取，会先解压到本地/服务器临时目录后输入fanse3比对。可输入多个文件，用逗号隔开
-  本地临时目录默认在系统盘，可用 -w dir 指定硬盘空间大的文件夹, 或任意位置，包括服务器等
 
-  -i /path/ 目录: 如输入目录，则处理目录下所有fastq/fq/fq.gz/fastq.gz。可同时输入多个目录，用逗号隔开
+  -i sample.fq 文件:
+      直接处理单个或多个文件。支持 .gz 读取，会先解压到本地/服务器临时目录后输入fanse3比对。
+      可输入多个文件，用逗号隔开。
+      例如: /path/sample.fastq;/path/sample.fq.gz
 
-  -i /*_R1.fq 通配符: 使用通配符选择文件   为高效筛选目录中所需文件，可使用*号进行筛选。例如   /path/*R1.fastq.gz
+  -i /path/ 目录:
+      如输入目录，则处理目录下所有 fastq/fq/fq.gz/fastq.gz。
+      可同时输入多个目录，用逗号隔开。
+
+  -i /*_R1.fq 通配符:
+      使用通配符选择文件，为高效筛选目录中所需文件，可使用*号进行筛选。
+      例如: /path/*R1.fastq.gz
 
 输出目录控制:
   不指定: 输出到输入文件所在目录
-  单目录: 所有输出保存到同一目录  
+  单目录: 所有输出保存到同一目录
   多目录: 与输入一一对应的输出目录
 
   如多目录，最好文本文件记录好命令再运行。
-  ''',
+''',
         formatter_class=CustomHelpFormatter
     )
 
@@ -1939,6 +2034,25 @@ def add_run_subparser(subparsers):
         help='断点续运行模式（跳过已存在的输出文件）'
     )
 
+    # 集群运行参数
+    cluster_group = parser.add_argument_group('集群运行参数，通过fanse cluster list查看，设置')
+    cluster_group.add_argument(
+        '--cluster',
+        action='store_true',
+        help='开启集群模式：将任务分发到配置的计算节点运行'
+    )
+    cluster_group.add_argument(
+        '-n', '--nodes',
+        metavar='NODES',
+        help='指定运行节点（逗号分隔），默认使用所有可用节点'
+    )
+    cluster_group.add_argument(
+        '--timeout',
+        type=int,
+        default=60,
+        help='任务超时时间（默认60秒），0表示无超时'
+    )
+
     # 新增SSH相关参数============================================================
 
     # 创建互斥组，确保不同模式不冲突
@@ -1951,17 +2065,17 @@ def add_run_subparser(subparsers):
         help='配置本地FANSe可执行文件路径'
     )
 
-    # SSH路径配置
-    path_mode_group.add_argument(
-        '--set-ssh-path',
-        metavar='USER@HOST:PATH',
-        help='配置远程FANSe3路径 (格式: user@host:/path/to/fanse3.exe)'
-    )
 
     # ==========================
     # SSH认证参数组
-    ssh_auth_group = parser.add_argument_group('SSH认证选项')
+    ssh_auth_group = parser.add_argument_group('SSH相关参数')
 
+    # SSH路径配置
+    ssh_auth_group.add_argument(
+        '--set-ssh-path',
+        metavar='USER@HOST:PATH',
+        help='配置远程FANSe3路径 (格式: user@host:/path/to/fanse3.exe)，亦可用于linux下通过SSH配置win系统的fanse3.exe路径实现调用'
+    )
     ssh_auth_group.add_argument(
         '--ssh-key',
         metavar='PATH',
@@ -2256,6 +2370,83 @@ def run_command(args):
         ]
 
         # ========== 第五步：选择运行模式并执行 ==========
+
+        if getattr(args, 'cluster', False):
+            # 集群模式
+            runner.logger.info("🚀 准备集群分发任务...")
+            commands = []
+            
+            # 准备通用参数
+            final_params = {**runner.default_params, **params}
+            final_options = [*runner.default_options, *options]
+            
+            # 1. GZIP检测与节点限制
+            has_gzip = any(f.suffix == '.gz' for f in path_map.keys())
+            if has_gzip:
+                args.require_fansetools = True
+                runner.logger.info("📦 检测到GZIP文件，将只使用安装了FANSeTools的节点运行")
+
+            # 2. 参考序列文件处理 (传输到远程)
+            args.required_files = []
+            ref_path = Path(args.refseq)
+            # 定义远程参考序列存放路径 (使用相对路径，相对于用户主目录)
+            remote_ref_dir = "fansetools_work/refs"
+            remote_ref_path = f"{remote_ref_dir}/{ref_path.name}"
+            
+            # 添加到传输列表
+            args.required_files.append((str(ref_path), remote_ref_path))
+            runner.logger.info(f"📄 将传输参考序列文件到集群节点: {remote_ref_path}")
+
+            for input_file, output_file in path_map.items():
+                # Resume逻辑
+                if args.resume and output_file.exists():
+                    runner.logger.info(f"跳过已存在输出: {output_file}")
+                    continue
+                
+                # 检查gzip
+                curr_input = input_file
+                has_gzip_file = curr_input.suffix == '.gz'
+                
+                if has_gzip_file:
+                    # 使用 fanse run 命令 (远程节点需安装fansetools)
+                    # 构建 fanse run 命令
+                    cmd_parts = ["fanse", "run"]
+                    cmd_parts.append(f"-i {curr_input}")
+                    cmd_parts.append(f"-r {remote_ref_path}")
+                    cmd_parts.append(f"-o {output_file}")
+                    
+                    # 添加参数
+                    for k, v in final_params.items():
+                        cmd_parts.append(f"-{k} {v}")
+                    
+                    # 添加选项
+                    cmd_parts.extend(final_options)
+                    
+                    # 确保非交互模式
+                    if '-y' not in final_options and '--yes' not in final_options:
+                        cmd_parts.append('-y')
+                        
+                    cmd = " ".join(cmd_parts)
+                    runner.logger.debug(f"构建GZIP集群命令: {cmd}")
+                else:
+                    # 构建命令 - 使用远程参考序列路径
+                    # 注意：这里假设输入文件路径在远程也是可访问的（如共享存储）
+                    cmd = runner.build_command(
+                        curr_input, output_file, Path(remote_ref_path), final_params, final_options
+                    )
+                
+                commands.append(cmd)
+            
+            if not commands:
+                 runner.logger.info("没有需要执行的任务")
+            else:
+                 runner.logger.info(f"提交 {len(commands)} 个任务到集群")
+                 if distribute_command(commands, args):
+                     runner.logger.info("✅ 集群任务执行完成")
+                 else:
+                     runner.logger.error("❌ 集群任务执行失败")
+                     sys.exit(1)
+            return
 
         if runner.remote_mode:
             # 远程模式运行

@@ -67,15 +67,18 @@ def run_fastp(args, fastp_path):
     """
     cmd = [fastp_path]
     
+    output_path = None
     # 1. 处理输入输出文件
     # 单端
     if args.input:
         cmd.extend(["-i", args.input])
         if args.output:
             cmd.extend(["-o", args.output])
+            output_path = args.output
         else:
             out_name = auto_generate_output_name(args.input)
             cmd.extend(["-o", out_name])
+            output_path = out_name
             print(f"自动设置输出文件: {out_name}")
             
     # 双端
@@ -83,10 +86,12 @@ def run_fastp(args, fastp_path):
         cmd.extend(["-i", args.r1, "-I", args.r2])
         if args.output and args.paired_output:
             cmd.extend(["-o", args.output, "-O", args.paired_output])
+            output_path = args.output
         else:
             out1 = auto_generate_output_name(args.r1, "_trimmed_R1.fq.gz")
             out2 = auto_generate_output_name(args.r2, "_trimmed_R2.fq.gz")
             cmd.extend(["-o", out1, "-O", out2])
+            output_path = out1
             print(f"自动设置输出文件: {out1}, {out2}")
             
     # 2. 映射通用参数
@@ -127,8 +132,15 @@ def run_fastp(args, fastp_path):
         elif args.r1:
             report_base = Path(args.r1).stem
             
-        html_report = f"{report_base}.html"
-        json_report = f"{report_base}.json"
+        # 修正：报告文件保存到输出文件所在目录
+        if output_path:
+            output_dir = Path(output_path).parent
+            html_report = str(output_dir / f"{report_base}.html")
+            json_report = str(output_dir / f"{report_base}.json")
+        else:
+            html_report = f"{report_base}.html"
+            json_report = f"{report_base}.json"
+
         cmd.extend(["-h", html_report, "-j", json_report])
         print(f"自动生成报告: {html_report}, {json_report}")
 
@@ -154,6 +166,7 @@ def run_cutadapt(args, cutadapt_path):
     # 如果 cutadapt_path 是 "cutadapt" (系统命令) 或 具体路径
     cmd = [cutadapt_path] if cutadapt_path else ["cutadapt"]
     
+    output_path = None
     # 1. 处理输入输出
     # cutadapt 的输出通常通过 -o 指定 R1，-p 指定 R2
     
@@ -161,9 +174,11 @@ def run_cutadapt(args, cutadapt_path):
     if args.r1 and args.r2:
         if args.output:
             cmd.extend(["-o", args.output])
+            output_path = args.output
         else:
             out1 = auto_generate_output_name(args.r1, "_trimmed_R1.fq.gz")
             cmd.extend(["-o", out1])
+            output_path = out1
             print(f"自动设置输出文件: {out1}")
             
         if args.paired_output:
@@ -180,9 +195,11 @@ def run_cutadapt(args, cutadapt_path):
     elif args.input:
         if args.output:
             cmd.extend(["-o", args.output])
+            output_path = args.output
         else:
             out_name = auto_generate_output_name(args.input)
             cmd.extend(["-o", out_name])
+            output_path = out_name
             print(f"自动设置输出文件: {out_name}")
         input_files = [args.input]
         
@@ -224,7 +241,48 @@ def run_cutadapt(args, cutadapt_path):
     cmd_str = ' '.join(cmd)
     console.print(f"[bold green]执行命令:[/bold green] [yellow]{cmd_str}[/yellow]")
     
-    return subprocess.call(cmd)
+    # 修正：将日志同步保存到输出文件所在目录
+    log_file = None
+    if output_path:
+        output_dir = Path(output_path).parent
+        # 获取基础文件名，去掉 .gz 等后缀
+        stem = Path(output_path).name
+        if stem.endswith('.gz'):
+            stem = stem[:-3]
+        if stem.endswith('.fastq'):
+            stem = stem[:-6]
+        elif stem.endswith('.fq'):
+            stem = stem[:-3]
+        
+        # 如果是 cutadapt，我们加上 .cutadapt.log
+        log_file = output_dir / f"{stem}.cutadapt.log"
+        console.print(f"[bold green]日志文件:[/bold green] {log_file}")
+
+    if log_file:
+        try:
+            with open(log_file, 'w', encoding='utf-8') as f_log:
+                # 使用 Popen 同时输出到屏幕和文件
+                process = subprocess.Popen(
+                    cmd, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.STDOUT, # cutadapt 报告通常在 stdout，但合并 stderr 更保险
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                
+                # 实时读取输出
+                for line in process.stdout:
+                    print(line, end='') # 输出到屏幕
+                    f_log.write(line)   # 写入文件
+                
+                return process.wait()
+        except Exception as e:
+            console.print(f"[bold red]运行或写入日志时出错: {e}[/bold red]")
+            # Fallback to normal call if logging fails
+            return subprocess.call(cmd)
+    else:
+        return subprocess.call(cmd)
 
 def print_help():
     """打印自定义帮助信息"""
@@ -507,9 +565,9 @@ def add_trim_subparser(subparsers):
     group.add_argument('-q', '--quality', type=int, help='质量阈值')
     group.add_argument('-l', '--length', type=int, help='最小长度')
     
-    tool_group = parser.add_argument_group('工具选择')
-    tool_group.add_argument('--fastp', action='store_true', help='强制使用 fastp')
-    tool_group.add_argument('--cutadapt', action='store_true', help='强制使用 cutadapt')
+    tool_group = parser.add_argument_group('工具选择 (默认: fastp)，可不选，选其中一个即可')
+    tool_group.add_argument('--fastp', action='store_true', help='使用 fastp')
+    tool_group.add_argument('--cutadapt', action='store_true', help='使用 cutadapt')
     
     # Catch-all
     parser.add_argument('remaining_args', nargs=argparse.REMAINDER, help='输入文件和其他参数')

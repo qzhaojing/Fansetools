@@ -316,7 +316,7 @@ class DualVersionChecker:
             if installation_method == 'pip':
                 print("使用pip进行更新...")
                 result = subprocess.run([
-                    sys.executable, '-m', 'pip', 'install', '--upgrade', self.package_name
+                    sys.executable, '-m', 'pip', 'install', '--upgrade', 'git+https://github.com/qzhaojing/Fansetools.git --force-reinstall',
                 ], check=True, capture_output=True, text=True)
                 new_ver = None
                 try:

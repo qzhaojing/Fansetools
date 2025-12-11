@@ -21,7 +21,8 @@ class CustomHelpFormatter(RichHelpFormatter, argparse.RawDescriptionHelpFormatte
                 help_text = subparser.description if subparser.description else ""
                 # 手动添加一些颜色代码并渲染为ANSI
                 with c.capture() as capture:
-                    c.print(f"  [bold cyan]{choice:<12}[/bold cyan] {help_text}", end='')
+                    # 修正：移除固定宽度，让rich自动处理换行
+                    c.print(f"  [bold cyan]{choice}[/bold cyan] {help_text}", end='')
                 parts.append(capture.get())
             
             return "\n".join(parts) + "\n"

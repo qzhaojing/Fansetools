@@ -511,6 +511,85 @@ def count_main(args, progress=None, task_id=None):
         args.input = args.read1
     if getattr(args, 'read2', None) and not getattr(args, 'paired_end', None):
         args.paired_end = args.read2
+
+    # Cluster Mode Dispatch
+    if getattr(args, 'cluster', False):
+        try:
+            from .distribute import run_distributed
+            from .utils.path_utils import PathProcessor
+            
+            processor = PathProcessor()
+            input_files = processor.parse_input_paths(
+                args.input, ['.fanse', '.fanse3', '.fanse3.gz', '.fanse.gz', '.fanse3.zip'])
+            
+            if not input_files:
+                print("错误: 未找到有效的输入文件")
+                return
+
+            commands = []
+            # 获取绝对路径以确保远程节点也能访问（假设NFS共享路径一致）
+            # 注意：这里假设运行环境和集群环境共享文件系统
+            output_base = os.path.abspath(args.output) if args.output else os.getcwd()
+            
+            for infile in input_files:
+                infile_path = os.path.abspath(str(infile))
+                
+                # 构建命令
+                cmd_parts = ["fanse", "count"]
+                cmd_parts.extend(["-i", f'"{infile_path}"']) # Quote paths
+                cmd_parts.extend(["-o", f'"{output_base}"'])
+                
+                if args.gxf:
+                    cmd_parts.extend(["--gxf", f'"{os.path.abspath(args.gxf)}"'])
+                
+                if args.level:
+                    cmd_parts.extend(["--level", args.level])
+                
+                # 传递其他参数
+                if getattr(args, 'format', None):
+                    cmd_parts.extend(["--format", args.format])
+                if getattr(args, 'count_type', None):
+                    cmd_parts.extend(["--count-type", args.count_type])
+                
+                # 长度参数
+                if getattr(args, 'len', None):
+                    cmd_parts.extend(["--len", args.len])
+                if getattr(args, 'len_isoform', None):
+                    cmd_parts.extend(["--len-isoform", args.len_isoform])
+                if getattr(args, 'len_gene', None):
+                    cmd_parts.extend(["--len-gene", args.len_gene])
+                
+                # 性能参数
+                if getattr(args, 'batch_size', None):
+                    cmd_parts.extend(["--batch-size", str(args.batch_size)])
+                if getattr(args, 'quant', None):
+                    cmd_parts.extend(["--quant", args.quant])
+                if getattr(args, 'engine', None):
+                    cmd_parts.extend(["--engine", args.engine])
+                
+                # 本地写入模式
+                if getattr(args, 'local', False):
+                    cmd_parts.append("--local")
+                
+                # 这里的 -p 是给单节点内的并行度
+                if getattr(args, 'processes', 1) != 1:
+                    cmd_parts.extend(["-p", str(args.processes)])
+                
+                commands.append(" ".join(cmd_parts))
+            
+            print(f"已生成 {len(commands)} 个集群任务，准备分发...")
+            run_distributed(commands, args)
+            return
+            
+        except ImportError:
+            print("错误: 无法导入集群调度模块，请检查安装。")
+            return
+        except Exception as e:
+            print(f"集群分发失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
     if hasattr(args, 'processes') and args.processes != 1:
         return count_main_parallel(args)
     else:
@@ -537,7 +616,8 @@ class FanseCounter:
                  length_mode_isoform='txLength',     # 新增：转录本层长度模式
                  batch_size=None,  # 新增：批处理大小参数，允许用户通过CLI控制
                  quant='none',     # 新增：定量方法选择（none/tpm/rpkm/both），用于在唯一文件中追加TPM/RPKM
-                 engine='auto'     # 新增：解析引擎选择（auto/python/rust），auto优先使用Rust
+                 engine='auto',    # 新增：解析引擎选择（auto/python/rust），auto优先使用Rust
+                 local_mode=False  # 新增：本地写入优化模式
                  ):
 
         # 添加计数类型前缀
@@ -545,8 +625,42 @@ class FanseCounter:
         self.gene_prefix = 'gene_'
 
         self.input_file = Path(input_file)
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.final_output_dir = Path(output_dir)
+        self.final_output_dir.mkdir(parents=True, exist_ok=True)
+        self.local_mode = local_mode
+        
+        # 本地写入优化逻辑
+        if self.local_mode:
+            try:
+                # 尝试使用本地临时目录
+                import tempfile
+                # 获取系统临时目录 (Windows下通常是 %TEMP%, Linux下是 /tmp 或 /var/tmp)
+                # 也可以通过环境变量 FANSE_LOCAL_DIR 指定
+                local_base = os.environ.get('FANSE_LOCAL_DIR', tempfile.gettempdir())
+                
+                # 检查磁盘空间 (简单检查：需要至少 3倍于输入文件大小的空间，或者预设 5GB)
+                input_size = self.input_file.stat().st_size if self.input_file.exists() else 0
+                required_space = max(input_size * 3, 1024 * 1024 * 1024) # 至少1GB
+                
+                import shutil
+                total, used, free = shutil.disk_usage(local_base)
+                
+                if free > required_space:
+                    self.temp_dir = Path(tempfile.mkdtemp(prefix='fanse_count_', dir=local_base))
+                    self.output_dir = self.temp_dir
+                    if verbose:
+                        print(f"启用本地写入优化: {self.output_dir} (可用空间: {free/1024/1024/1024:.2f} GB)")
+                else:
+                    if verbose:
+                        print(f"本地空间不足 ({free/1024/1024/1024:.2f} GB < {required_space/1024/1024/1024:.2f} GB)，回退到直接写入输出目录")
+                    self.output_dir = self.final_output_dir
+            except Exception as e:
+                if verbose:
+                    print(f"本地写入初始化失败: {e}，回退到直接写入")
+                self.output_dir = self.final_output_dir
+        else:
+            self.output_dir = self.final_output_dir
+            
         self.level = level
         # self.minreads = minreads
         # self.rpkm = rpkm
@@ -2502,26 +2616,26 @@ class FanseCounter:
 
         return gene_annotation
 
-    # def _generate_multi_mapping_file(self, base_name):
-    #     """生成多映射信息文件"""
-    #     if not self.multi_mapping_info:
-    #         return None
+    def _generate_multi_mapping_file(self, base_name):
+        """生成多映射信息文件"""
+        if not self.multi_mapping_info:
+            return None
 
-    #     # 创建多映射信息数据框
-    #     multi_data = []
-    #     for transcript_ids, read_names in self.multi_mapping_info.items():
-    #         multi_data.append({
-    #             'transcript_ids': transcript_ids,
-    #             'read_count': len(read_names),
-    #             'read_names': ';'.join(read_names)
-    #         })
+        # 创建多映射信息数据框
+        multi_data = []
+        for transcript_ids, read_names in self.multi_mapping_info.items():
+            multi_data.append({
+                'transcript_ids': transcript_ids,
+                'read_count': len(read_names),
+                'read_names': ';'.join(read_names)
+            })
 
-    #     multi_df = pd.DataFrame(multi_data)
-    #     multi_filename = self.output_dir / \
-    #         f'{base_name}_multi_mapping_info.csv'
-    #     multi_df.to_csv(multi_filename, index=False)
+        multi_df = pd.DataFrame(multi_data)
+        multi_filename = self.output_dir / \
+            f'{base_name}_multi_mapping_info.csv'
+        multi_df.to_csv(multi_filename, index=False)
 
-    #     return multi_filename
+        return multi_filename
 
     def generate_count_files(self):
         """
@@ -2684,6 +2798,15 @@ class FanseCounter:
                     if fc_gene_file:
                         count_files['featureCounts_gene'] = fc_gene_file
 
+        # 生成多映射信息文件
+        try:
+            multi_file = self._generate_multi_mapping_file(base_name)
+            if multi_file:
+                count_files['multi_mapping_info'] = multi_file
+        except Exception as e:
+            if self.verbose:
+                self.console.print(f"生成多映射信息文件失败: {e}")
+
         return count_files
 ##########################################################################################
     # 主运行进程
@@ -2732,6 +2855,41 @@ class FanseCounter:
 
         # 5. 生成摘要报告
         self.generate_summary()
+
+        # 6. 本地模式回传逻辑
+        if self.local_mode and self.output_dir != self.final_output_dir:
+            import shutil
+            if self.verbose:
+                self.console.print(f"本地模式：正在将结果从 {self.output_dir} 回传至 {self.final_output_dir} ...")
+            
+            try:
+                # 复制所有文件
+                for item in self.output_dir.iterdir():
+                    if item.is_file():
+                        shutil.copy2(item, self.final_output_dir / item.name)
+                    elif item.is_dir():
+                        # 如果有子目录，也需要复制（虽然目前结构主要是扁平的）
+                        target_subdir = self.final_output_dir / item.name
+                        if target_subdir.exists():
+                            shutil.rmtree(target_subdir)
+                        shutil.copytree(item, target_subdir)
+                
+                # 清理临时目录
+                shutil.rmtree(self.output_dir)
+                if self.verbose:
+                    self.console.print(f"回传完成，已清理本地临时目录。")
+                    
+                # 更新 count_files 中的路径指向最终目录（以便后续引用正确）
+                new_count_files = {}
+                for k, v in count_files.items():
+                    # v 是 Path 对象
+                    new_count_files[k] = self.final_output_dir / v.name
+                count_files = new_count_files
+                
+            except Exception as e:
+                self.console.print(f"[bold red]回传结果失败: {e}[/bold red]")
+                # 尝试保留临时目录以便手动恢复
+                self.console.print(f"[bold red]警告：临时结果保留在 {self.output_dir}[/bold red]")
 
         if self.verbose:
             self.console.print("fansetools count - Processing completed")
@@ -3056,6 +3214,15 @@ def add_count_subparser(subparsers):
     # 新增：解析引擎选择（auto/python/rust）
     parser.add_argument('--engine', choices=['auto','python','rust'], default='auto',
                         help='解析引擎：auto(优先使用Rust，失败回退Python)/python(仅Python解析)/rust(强制Rust，失败回退Python)')
+
+    # 新增：本地写入优化模式（先写入本地临时目录，结束后回传，节省网络带宽）
+    parser.add_argument('--local', action='store_true', help='开启本地写入优化模式：在节点本地磁盘进行计算和临时写入，完成后回传结果到最终输出目录')
+
+    # 新增：集群模式相关参数
+    parser.add_argument('--cluster', action='store_true', help='开启集群模式：将任务分发到配置的计算节点运行')
+    parser.add_argument('--cluster-jobs', type=int, default=None, help='集群模式下每个节点并发任务数（默认使用节点配置的max_jobs）')
+    parser.add_argument('-n', '--nodes', metavar='NODES', help='指定运行节点（逗号分隔），默认使用所有可用节点')
+    parser.add_argument('--timeout', type=int, default=0, help='任务超时时间（秒），0表示无超时')
 
     # 根据是否并行选择执行函数
     def count_main_wrapper(args):

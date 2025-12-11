@@ -4,6 +4,12 @@ import argparse
 from .utils.rich_help import CustomHelpFormatter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import warnings
+try:
+    from cryptography.utils import CryptographyDeprecationWarning
+    warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+except ImportError:
+    pass
 import paramiko
 import base64  # 新增：用于 PowerShell 脚本编码
 import gzip
@@ -36,8 +42,12 @@ class ClusterNode:
     password: Optional[str] = None
     port: int = 22
     max_jobs: int = 1
+    max_cpu: int = 1000  # 默认不限制（超大值）
+    max_memory: int = 1000000  # 默认不限制（MB）
     enabled: bool = True
     work_dir: Optional[str] = None  # 修正：预留工作目录字段，便于后续 -w 更新
+    env_info: Optional[Dict] = None  # 环境检查缓存
+
 
 class OptimizedClusterManager:
     """优化后的集群管理器"""
@@ -399,6 +409,69 @@ class OptimizedClusterManager:
         finally:
             ssh.close()
 
+    def export_nodes(self, output_path: str) -> bool:
+        """导出节点配置到文件"""
+        try:
+            data = {'nodes': [vars(node) for node in self.nodes.values()]}
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"✅ 已导出 {len(self.nodes)} 个节点配置到: {output_path}")
+            return True
+        except Exception as e:
+            print(f"❌ 导出失败: {e}")
+            return False
+
+    def import_nodes(self, input_path: str, merge: bool = True, overwrite: bool = False) -> bool:
+        """从文件导入节点配置"""
+        try:
+            if not os.path.exists(input_path):
+                print(f"❌ 文件不存在: {input_path}")
+                return False
+                
+            with open(input_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            nodes_data = data.get('nodes', [])
+            if not nodes_data:
+                print("⚠️ 文件中未找到节点配置")
+                return False
+            
+            count = 0
+            for node_data in nodes_data:
+                name = node_data.get('name')
+                if not name:
+                    continue
+                
+                if name in self.nodes:
+                    if not merge:
+                        print(f"⚠️ 跳过已存在的节点: {name}")
+                        continue
+                    if not overwrite:
+                        print(f"⚠️ 跳过已存在的节点: {name} (使用 --overwrite 覆盖)")
+                        continue
+                    print(f"🔄 更新节点: {name}")
+                else:
+                    print(f"➕ 添加节点: {name}")
+                
+                # 兼容处理：确保必需字段存在
+                if 'host' not in node_data or 'user' not in node_data:
+                    print(f"⚠️ 节点 {name} 缺少 host 或 user 字段，跳过")
+                    continue
+                    
+                # 过滤掉 ClusterNode 不支持的额外字段（防止版本差异导致报错）
+                valid_keys = ClusterNode.__annotations__.keys()
+                filtered_data = {k: v for k, v in node_data.items() if k in valid_keys}
+                
+                self.nodes[name] = ClusterNode(**filtered_data)
+                count += 1
+            
+            self._save_cluster_config()
+            print(f"✅ 成功导入/更新 {count} 个节点")
+            return True
+        except Exception as e:
+            print(f"❌ 导入失败: {e}")
+            return False
+
     def remove_node(self, name: str):
         """移除节点"""
         if name not in self.nodes:
@@ -547,88 +620,78 @@ class OptimizedClusterManager:
                 # 修正：环境与路径检查（Conda/Fansetools/FANSe路径/工作目录）
                 try:
                     if is_windows:
-                        # Conda 检查：优先检测 Miniforge/Miniconda 安装目录与版本
-                        cmd = '$c = Get-Command conda -ErrorAction SilentlyContinue; if ($c) { conda -V }'
-                        success, out, _ = self._execute_remote_command(ssh, f'powershell -NoProfile -Command "{cmd}"')
-                        if success and out:
+                        # Conda 检查
+                        cmd = 'conda --version'
+                        success, out, _ = self._execute_remote_command(ssh, cmd)
+                        if success and ('conda' in out or re.search(r'\d+\.\d+\.\d+', out)):
                             info['conda_ok'] = True
                             info['conda_version'] = out.strip()
                         else:
-                            # 路径存在性回退检测
-                            success, out, _ = self._execute_remote_command(ssh, 'if exist "%USERPROFILE%\\miniforge3\\python.exe" echo YES')
-                            if not success:
-                                success, out, _ = self._execute_remote_command(ssh, 'if exist "%USERPROFILE%\\miniconda3\\python.exe" echo YES')
-                            info['conda_ok'] = True if (success and 'YES' in out) else False
-                            info['conda_version'] = None
-
-                        # Fansetools 检查：优先使用 conda python
-                        py_candidates = [
-                            '%USERPROFILE%\\miniforge3\\python.exe',
-                            '%USERPROFILE%\\miniconda3\\python.exe',
-                            'python'
-                        ]
-                        fans_ok = False
-                        fans_ver = None
-                        for py in py_candidates:
-                            cmd = f'"{py}" -c "import fansetools, sys; sys.stdout.write(getattr(fansetools,\"__version__\",\"\"))"'
-                            success, out, _ = self._execute_remote_command(ssh, cmd)
-                            if success:
-                                fans_ok = True
-                                fans_ver = out.strip() or None
-                                break
-                        info['fansetools_ok'] = fans_ok
-                        info['fansetools_version'] = fans_ver
-
-                        # FANSe 路径检查
-                        if node.fanse_path:
-                            info['fanse_path_ok'] = self._test_windows_path(ssh, node.fanse_path)
-                        else:
-                            info['fanse_path_ok'] = None
-
-                        # 工作目录检查（作为临时目录）
-                        if node.work_dir:
-                            cmd = f'powershell -NoProfile -Command "Test-Path \"{node.work_dir}\" -PathType Container"'
-                            success, out, _ = self._execute_remote_command(ssh, cmd)
-                            info['temp_folder_ok'] = True if (success and ('True' in out)) else False
-                        else:
-                            info['temp_folder_ok'] = None
-                    else:
-                        # Linux Conda 检查
-                        success, out, _ = self._execute_remote_command(ssh, 'bash -lc "conda -V"')
-                        if success and out:
-                            info['conda_ok'] = True
-                            info['conda_version'] = out.strip()
-                        else:
-                            success, out, _ = self._execute_remote_command(ssh, 'test -d "$HOME/miniforge3" && echo YES || test -d "$HOME/miniconda3" && echo YES')
-                            info['conda_ok'] = True if (success and 'YES' in out) else False
-                            info['conda_version'] = None
+                            info['conda_ok'] = False
 
                         # Fansetools 检查
-                        fans_ok = False
-                        fans_ver = None
-                        for py in ['python3', 'python']:
-                            success, out, _ = self._execute_remote_command(ssh, f'bash -lc "{py} -c \"import fansetools, sys; sys.stdout.write(getattr(fansetools,\\\"__version__\\\",\\\"\\\"))\""')
-                            if success:
-                                fans_ok = True
-                                fans_ver = out.strip() or None
-                                break
-                        info['fansetools_ok'] = fans_ok
-                        info['fansetools_version'] = fans_ver
-
-                        # FANSe 路径检查
+                        cmd = 'fanse --version'
+                        success, out, _ = self._execute_remote_command(ssh, cmd)
+                        if success and ('version' in out or re.search(r'\d+\.\d+\.\d+', out)):
+                            info['fansetools_ok'] = True
+                            info['fansetools_version'] = out.strip()
+                        else:
+                            info['fansetools_ok'] = False
+                        
+                        # Fanse Path 检查
                         if node.fanse_path:
-                            info['fanse_path_ok'] = self._test_linux_path(ssh, node.fanse_path)
-                        else:
-                            info['fanse_path_ok'] = None
-
-                        # 工作目录检查
+                            path_ok = self._test_windows_path(ssh, node.fanse_path)
+                            info['fanse_path_ok'] = path_ok
+                        
+                        # Temp Folder (Work Dir) 检查
                         if node.work_dir:
-                            success, out, _ = self._execute_remote_command(ssh, f'bash -lc "test -d \"{node.work_dir}\" && echo YES"')
-                            info['temp_folder_ok'] = True if (success and 'YES' in out) else False
+                            path_ok = self._test_windows_path(ssh, node.work_dir)
+                            info['temp_folder_ok'] = path_ok
+
+                    else:
+                        # Linux
+                        # Conda 检查
+                        cmd = 'source ~/.bashrc && conda --version'
+                        success, out, _ = self._execute_remote_command(ssh, f'bash -c "{cmd}"')
+                        if success and ('conda' in out or re.search(r'\d+\.\d+\.\d+', out)):
+                            info['conda_ok'] = True
+                            info['conda_version'] = out.strip()
                         else:
-                            info['temp_folder_ok'] = None
-                except Exception:
+                             # 尝试直接运行
+                            cmd = 'conda --version'
+                            success, out, _ = self._execute_remote_command(ssh, cmd)
+                            if success and ('conda' in out or re.search(r'\d+\.\d+\.\d+', out)):
+                                info['conda_ok'] = True
+                                info['conda_version'] = out.strip()
+                            else:
+                                info['conda_ok'] = False
+
+                        # Fansetools 检查
+                        cmd = 'fanse --version'
+                        success, out, _ = self._execute_remote_command(ssh, cmd)
+                        if success and ('version' in out or re.search(r'\d+\.\d+\.\d+', out)):
+                            info['fansetools_ok'] = True
+                            info['fansetools_version'] = out.strip()
+                        else:
+                            info['fansetools_ok'] = False
+                        
+                        # Fanse Path 检查
+                        if node.fanse_path:
+                            path_ok = self._test_linux_path(ssh, node.fanse_path)
+                            info['fanse_path_ok'] = path_ok
+                        
+                        # Temp Folder (Work Dir) 检查
+                        if node.work_dir:
+                            path_ok = self._test_linux_path(ssh, node.work_dir)
+                            info['temp_folder_ok'] = path_ok
+
+                except Exception as e:
                     pass
+                
+                # 更新节点缓存
+                node.env_info = info
+
+
 
                 # 7. 负载均值 & 网络带宽（detail模式）
                 if detail:
@@ -913,10 +976,31 @@ class OptimizedClusterManager:
 # 优化后的cluster_command函数
 def cluster_command(args):
     """优化的集群命令处理"""
+    # 如果没有子命令，显示帮助
+
+    if not hasattr(args, 'cluster_command') or args.cluster_command is None:
+        show_cluster_help(args)
+        return 0
+
     cluster_mgr = OptimizedClusterManager(get_config_dir())
     
     try:
-        if args.cluster_command == 'add':
+        if args.cluster_command == 'config':
+            if getattr(args, 'export_node_list', None):
+                if cluster_mgr.export_nodes(args.export_node_list):
+                    return 0
+                return 1
+            
+            if getattr(args, 'import_node_list', None):
+                if cluster_mgr.import_nodes(args.import_node_list, merge=args.merge, overwrite=args.overwrite):
+                    return 0
+                return 1
+            
+            # 如果没有指定参数，显示帮助
+            print("❌ 请指定 -e/--export-node-list 或 -i/--import-node-list 参数")
+            return 1
+
+        elif args.cluster_command == 'add':
             success = cluster_mgr.add_node(
                 args.name, args.host, args.user, args.fanse_path,
                 args.key, args.password, args.port
@@ -1770,6 +1854,16 @@ def cluster_command(args):
         
     return 0
 
+# 全局变量存储 parser 实例，用于 help 显示
+_CLUSTER_PARSER = None
+
+def show_cluster_help(args):
+    """显示集群命令帮助"""
+    if _CLUSTER_PARSER:
+        _CLUSTER_PARSER.print_help()
+    else:
+        print("请使用 'fanse cluster -h' 查看帮助信息")
+
 def add_cluster_subparser(subparsers):
     """添加集群管理子命令"""
     cluster_parser = subparsers.add_parser('cluster', 
@@ -1785,12 +1879,34 @@ FANSe3 集群管理工具
         ''',
         formatter_class=CustomHelpFormatter
     )
+
+    global _CLUSTER_PARSER
+    _CLUSTER_PARSER = cluster_parser
+
+    # 新增：为 cluster_parser 设置一个默认函数，当没有子命令时显示其帮助信息
+    cluster_parser.set_defaults(func=show_cluster_help)
     
     cluster_subparsers = cluster_parser.add_subparsers(
         dest='cluster_command', 
         title='子命令',
         description='使用 fanse cluster <子命令> -h 查看详细帮助'
     )
+
+    # 配置管理（新增子模块）
+    config_parser = cluster_subparsers.add_parser('config',
+        help='导入/导出集群配置',
+        description='管理集群节点配置文件的导入与导出',
+        epilog='''
+示例:
+  fanse cluster config -e nodes.json       # 导出当前节点配置
+  fanse cluster config -i nodes.json       # 导入节点配置
+  fanse cluster config -i nodes.json --overwrite  # 导入并覆盖同名节点
+        '''
+    )
+    config_parser.add_argument('-e', '--export-node-list', metavar='FILE', help='导出节点配置到指定JSON文件')
+    config_parser.add_argument('-i', '--import-node-list', metavar='FILE', help='从指定JSON文件导入节点配置')
+    config_parser.add_argument('--merge', action='store_true', default=True, help='导入时合并现有配置（默认保留原有节点，仅添加新的）')
+    config_parser.add_argument('--overwrite', action='store_true', help='导入时覆盖同名节点配置')
     
     # 添加节点
     add_parser = cluster_subparsers.add_parser('add', 
@@ -1983,5 +2099,6 @@ if __name__ != "__main__":
         'ClusterNode', 
         'add_cluster_subparser', 
         'cluster_command',
+        'show_cluster_help',
         'get_config_dir'
     ]

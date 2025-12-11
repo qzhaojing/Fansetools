@@ -15,6 +15,7 @@ from rich.text import Text
 from rich import box
 from .utils.version_check import DualVersionChecker, get_installation_method, update_fansetools
 from .utils.rich_help import CustomHelpFormatter, print_colored_text
+from .cluster import add_cluster_subparser # 新增：导入cluster子命令的解析器添加函数
 
 
 def find_and_execute_binary(command_name, remaining_args):
@@ -194,7 +195,7 @@ def show_brief_help_with_binaries(subparsers_choices=None):
     # 命令简明描述映射
     command_descriptions = {
         "parser": "解析FANSe3文件并输出结构化数据",
-        "run": "运行FANSe3比对流程: fanse run -i input.fq.gz -r reference.fasta -o output.fanse3",
+        "run": "运行FANSe3比对流程:     fanse run -i input.fq.gz -r reference.fasta -o output.fanse3",
         "list": "列出可安装的预定义包",
         "install": "安装额外的软件包",
         "update": "检查并更新fansetools",
@@ -351,7 +352,7 @@ def create_parser():
     )  # 新增导入
     from .flows.flow import add_flow_subparser
     from .runtime import add_runtime_subparser, add_java_subparser
-    from .cluster import add_cluster_subparser, cluster_command
+    from .cluster import add_cluster_subparser, cluster_command, show_cluster_help # 修正：导入show_cluster_help
     from .test_cmd import add_test_subparser
     from .check_path import add_path_subparser
     
@@ -419,7 +420,7 @@ def create_parser():
     
     # 子命令：cluster
     cluster_parser = add_cluster_subparser(subparsers)
-    cluster_parser.set_defaults(func=cluster_command)  # 添加这行：设置处理函数
+    cluster_parser.set_defaults(func=cluster_command)  # 修正：统一使用 cluster_command 处理所有逻辑
     
     # 子命令：install (新增)
     install_parser = add_install_subparser(subparsers)
