@@ -45,7 +45,7 @@ import gzip
 import sys
 from tqdm import tqdm
 from typing import Generator, Optional, Dict, Tuple, Iterator, Set, List
-from .parser import FANSeRecord, fanse_parser
+from .parser import FANSeRecord, fanse_parser,fanse_parser_high_performance
 from .utils.rich_help import CustomHelpFormatter
 from .utils.path_utils import PathProcessor
 from rich.console import Console
@@ -57,75 +57,6 @@ _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
 def reverse_complement(seq: str) -> str:
     """优化反向互补：使用str.translate"""
     return seq.translate(_COMPLEMENT_TABLE)[::-1]
-
-# def reverse_complement(seq: str) -> str:   #上个函数为此函数的优化，更高效
-#     """生成反向互补序列"""
-#     complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N'}
-#     return ''.join([complement.get(base, 'N') for base in reversed(seq)])
-
-# def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
-#     """
-#     参数:
-#         alignment: FANSe比对字符串
-#         seq_len: 序列实际长度
-#         is_reverse: 是否为反向链比对
-#     返回:
-#         符合规范的CIGAR字符串
-
-#     CIGAR操作符说明:
-#         M: 匹配/错配 (消耗参考序列和查询序列)
-#         I: 插入 (仅消耗查询序列)
-#         D: 缺失 (仅消耗参考序列)
-#         N: 跳过 (同D但用于mRNA比对)
-#         S: soft-clip (仅消耗查询序列)
-#         H: hard-clip (不消耗序列)
-#         =: 完全匹配
-#         X: 错配
-#     """
-    
-#     # if not alignment or seq_len <= 0:
-#     #     return f"{seq_len}M"
-    
-#     # 对于反向链，需要反转比对字符串
-#     if is_reverse:
-#         alignment = alignment[::-1]
-        
-#     cigar = []
-#     current_op = None
-#     count = 0
-#     # consumed_query = 0  # 已消耗的查询序列长度
-
-#     for char in alignment:
-#         # 确定操作类型
-#         if char == '.':
-#             op = 'M'
-#             # consumed_query += 1
-#         elif char == 'x':
-#             op = 'X'
-#             # consumed_query += 1
-#         elif char == '-':
-#             op = 'D'  # 不消耗查询序列
-#         elif char.isalpha():
-#             op = 'I'
-#             # consumed_query += 1
-#         else:
-#             op = 'S'
-#             # consumed_query += 1
-
-#         # 统计连续操作
-#         if op == current_op:
-#             count += 1
-#         else:
-#             if current_op is not None:
-#                 cigar.append(f"{count}{current_op}")
-#             current_op = op
-#             count = 1
-
-#     # 添加最后一个操作
-#     if current_op is not None:
-#         cigar.append(f"{count}{current_op}")
-
-#     return "".join(cigar)
 
 def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
     """优化CIGAR生成：使用更高效的算法"""
@@ -175,14 +106,6 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
     
     return ''.join(cigar_parts)
 
-# def calculate_flag(strand: str, is_secondary: bool = False) -> int:
-#     """计算SAM FLAG值"""
-#     flag = 0
-#     if strand == 'R':
-#         flag |= 0x10  # 反向互补
-#     if is_secondary:
-#         flag |= 0x100  # 辅助比对
-#     return flag
 def calculate_flag(
     strand: str,
     is_paired: bool = False,   # 默认改为False，因为fanse目前支持单端测序
@@ -486,147 +409,6 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
                         f"{cigar},255,{record.mismatches[i]}")
     return f"SA:Z:{';'.join(sa_parts)}" if sa_parts else ""
 
-
-# def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:
-#     """将FANSeRecord转换为SAM格式行"""
-#     if not record.ref_names:
-#         return
-
-
-#     # 找出主记录(错配最少)
-#     primary_idx = min(range(len(record.mismatches)),
-#                       key=lambda i: record.mismatches[i])
-
-#     # 处理主记录
-#     flag = calculate_flag(record.strands[primary_idx])
-#     is_reverse = (record.strands[primary_idx] == 'R')
-#     cigar = generate_cigar(record.alignment[primary_idx], is_reverse)
-#     seq = reverse_complement(
-#         record.seq) if 'R' in record.strands[primary_idx] else record.seq
-#     sa_tag = generate_sa_tag(record, primary_idx)
-
-#     sam_fields = [
-#         record.header,
-#         str(flag),
-#         record.ref_names[primary_idx],
-#         str(record.positions[primary_idx] + 1),  # 1-based
-#         "255",  # MAPQ
-#         cigar,
-#         "*",    # RNEXT
-#         "0",    # PNEXT
-#         "0",    # TLEN
-#         seq,
-#         "*",    # QUAL
-#         f"XM:i:{record.mismatches[primary_idx]}",
-#         f"XN:i:{record.multi_count}"
-#     ]
-
-#     if sa_tag:
-#         sam_fields.append(sa_tag)
-
-#     yield "\t".join(sam_fields)
-
-#     # 处理辅助记录
-#     for i in range(len(record.ref_names)):
-#         if i == primary_idx:
-#             continue
-#         flag = calculate_flag(record.strands[i], is_secondary=True)
-#         is_reverse = (record.strands[i] == 'R')
-#         cigar = generate_cigar(record.alignment[i], is_reverse)
-#         seq = reverse_complement(
-#             record.seq) if 'R' in record.strands[i] else record.seq
-
-#         sam_fields = [
-#             record.header,
-#             str(flag),
-#             record.ref_names[i],
-#             str(record.positions[i] + 1),
-#             "255",
-#             cigar,
-#             "*",
-#             "0",
-#             "0",
-#             seq,
-#             "*",
-#             f"XM:i:{record.mismatches[i]}",
-#             f"XN:i:{record.multi_count}"
-#         ]
-#         yield "\t".join(sam_fields)
-
-# def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #优化版 #20251024
-#     if not record.ref_names:
-#         return
-
-#     # 直接使用第一条记录作为主记录（多重比对的所有mismatches相同）
-#     primary_idx = 0
-
-#     # 预计算序列变体，避免重复计算
-#     seq_cache = {
-#         'F': record.seq,  # 正向序列
-#         'R': reverse_complement(record.seq)  # 反向互补序列
-#     }
-    
-#     # 预计算所有CIGAR字符串
-#     cigars = []
-#     for i in range(len(record.ref_names)):
-#         is_reverse = (record.strands[i] == 'R')
-#         cigars.append(generate_cigar(record.alignment[i], is_reverse))
-
-#     # 处理主记录
-#     strand = record.strands[primary_idx]
-#     flag = calculate_flag(strand)
-    
-#     sam_fields = [
-#         record.header,
-#         str(flag),
-#         record.ref_names[primary_idx],
-#         str(record.positions[primary_idx] + 1),     # 1-based
-#         "255",                                      # MAPQ
-#         cigars[primary_idx],
-#         "*",    # RNEXT
-#         "0",    # PNEXT
-#         "0",    # TLEN
-#         seq_cache[strand],
-#         "*",    # QUAL   fanse 文件没有质量值，因此忽略
-#         f"XM:i:{record.mismatches[primary_idx]}",
-#         f"XN:i:{record.multi_count}"
-#     ]
-    
-#     # 生成SA标签（仅当有多重比对时）
-#     if record.multi_count > 1:
-#         sa_parts = []
-#         for i in range(len(record.ref_names)):
-#             if i == primary_idx:
-#                 continue
-#             strand_i = record.strands[i]
-#             sa_parts.append(f"{record.ref_names[i]},{record.positions[i]+1},{strand_i},"
-#                             f"{cigars[i]},255,{record.mismatches[i]}")
-#         if sa_parts:
-#             sam_fields.append(f"SA:Z:{';'.join(sa_parts)}")
-
-#     yield "\t".join(sam_fields)
-
-#     # 处理辅助记录（仅当有多重比对时）
-#     if record.multi_count > 1:
-#         for i in range(1, len(record.ref_names)):  # 从1开始，因为0是主记录，跳过第一个
-#             strand_i = record.strands[i]
-#             flag_i = calculate_flag(strand_i, is_secondary=True)
-            
-#             sam_fields_secondary = [
-#                 record.header,
-#                 str(flag_i),
-#                 record.ref_names[i],
-#                 str(record.positions[i] + 1),
-#                 "255",
-#                 cigars[i],
-#                 "*", "0", "0",
-#                 seq_cache[strand_i],
-#                 "*",
-#                 f"XM:i:{record.mismatches[i]}",
-#                 f"XN:i:{record.multi_count}"
-#             ]
-#             yield "\t".join(sam_fields_secondary)
-
 def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #20251024第二次优化
     if not record.ref_names:
         return
@@ -772,31 +554,6 @@ def parse_fasta(fasta_path: str) -> Dict[str, int]:
             ref_info[current_seq] = current_length
 
     return ref_info
-
-
-# def generate_sam_header_from_fasta(fasta_path: str) -> str:
-#     """
-#     从FASTA文件生成完整的SAM头部
-
-#     参数:
-#         fasta_path: FASTA文件路径
-
-#     返回:
-#         完整的SAM头部字符串
-#     """
-#     ref_info = parse_fasta(fasta_path)
-
-#     header_lines = [
-#         "@HD\tVN:1.6\tSO:unsorted",
-#         "@PG\tID:fanse3\tPN:fanse3\tVN:3.0\tCL:fanse3"
-#     ]
-
-#     # 添加参考序列信息
-#     for ref_name, length in ref_info.items():
-#         header_lines.append(f"@SQ\tSN:{ref_name}\tLN:{length}")
-
-#     return '\n'.join(header_lines) + '\n'
-
 
 # def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None):
 #     """
@@ -1030,7 +787,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             console.print('Write SAM header down.')
             
             # 处理记录
-            batch_size = 10000
+            batch_size = 100000
             batch_count = 0
             batch_lines = []
             filtered_count = 0
@@ -1038,7 +795,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             
             file_read_size = os.path.getsize(fanse_file) / 450     #粗略估计平均 450字节一个fanse记录
             with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True) as pbar:
-                for record in fanse_parser(fanse_file):
+                for record in fanse_parser_high_performance(fanse_file):
                     total_count += 1
                     
                     # 区域过滤，没有过滤信息则直接跳过（regions为None）

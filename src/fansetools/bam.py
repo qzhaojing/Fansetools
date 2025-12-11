@@ -177,7 +177,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         # 检测samtools版本是否为旧版(0.x)，旧版不支持 '-o'
         legacy = False
         try:
-            ver_cmd = [samtools_path, '']
+            ver_cmd = [samtools_path, '--version']
             ver_result = subprocess.run(ver_cmd, capture_output=True, text=True, check=True)
             legacy = ('samtools 0.' in ver_result.stdout) or ('samtools 0.' in ver_result.stderr)
             log(f"Samtools version check: legacy={legacy}")
