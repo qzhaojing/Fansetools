@@ -376,10 +376,12 @@ def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
                 continue
 
             parts = line.split('\t')
-            if len(parts) < 2:
-                raise ValueError(f"Invalid unmapped record format: {line}")
-
-            yield UnmappedRecord(read_id=parts[0], sequence=parts[1])
+            if len(parts) >= 2:
+                # 如果有制表符且至少两部分，按 read_id\tsequence 解析
+                yield UnmappedRecord(read_id=parts[0], sequence=parts[1])
+            else:
+                # 如果没有制表符，则认为整行是 read_id，序列为空
+                yield UnmappedRecord(read_id=line, sequence="")
 
 
 if __name__ == "__main__":
