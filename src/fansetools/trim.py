@@ -289,16 +289,16 @@ def print_help():
     help_text = """
 [bold cyan]fanse trim[/bold cyan] - 自动接头去除与质控工具
 
-[bold yellow]简介:[/bold yellow]
+[bold]简介:[/bold]
   集成 [green]fastp[/green] 和 [green]cutadapt[/green] 的通用接头去除工具。
   默认优先使用 fastp（速度快，功能全），如果未安装则尝试使用 cutadapt。
   
   支持 "无脑操作"：只需指定输入文件，自动推断输出文件名、检测接头、生成报告。
 
-[bold yellow]用法:[/bold yellow]
+[bold]用法:[/bold]
   fanse trim [选项] [输入文件]
 
-[bold yellow]常用选项:[/bold yellow]
+[bold]常用选项:[/bold]
   [bold cyan]-i, --input[/bold cyan] FILE        输入文件 (单端)
   [bold cyan]-1, --r1[/bold cyan] FILE           输入文件 R1 (双端)
   [bold cyan]-2, --r2[/bold cyan] FILE           输入文件 R2 (双端)
@@ -311,11 +311,11 @@ def print_help():
   [bold cyan]-a, --adapter[/bold cyan] STR/FILE  正向接头序列 或 接头fasta文件
   [bold cyan]-A, --adapter2[/bold cyan] STR      反向接头序列 (双端)
 
-[bold yellow]工具选择:[/bold yellow]
+[bold]工具选择:[/bold]
   [bold cyan]--fastp[/bold cyan]               强制使用 fastp
   [bold cyan]--cutadapt[/bold cyan]            强制使用 cutadapt
 
-[bold yellow]原生帮助与高级参数:[/bold yellow]
+[bold]原生帮助与高级参数:[/bold]
   如果您想查看工具的原生帮助或使用更多高级参数：
   
   [green]fanse trim --help --fastp[/green]     查看 fastp 原生帮助 (彩色)
@@ -324,7 +324,7 @@ def print_help():
   任何未被 fanse 识别的参数都将直接传递给底层工具。
   例如: [italic]fanse trim -i in.fq --umi --umi_loc=read1[/italic] (传递给 fastp)
 
-[bold yellow]示例:[/bold yellow]
+[bold]示例:[/bold]
   1. 最简单的单端处理 (自动命名输出，自动检测接头):
      [green]fanse trim -i input.fq.gz[/green]
 

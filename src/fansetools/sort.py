@@ -10,7 +10,7 @@ import os
 import argparse
 from pathlib import Path
 from rich.console import Console
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from .utils.path_utils import PathProcessor
 from collections import defaultdict
 import tempfile
@@ -274,6 +274,27 @@ def add_sort_subparser(subparsers):
         help='按read名称排序')
     
     sort_parser.set_defaults(func=run_sort_command)
+
+    add_rich_epilog(sort_parser, """
+[bold]功能说明:[/bold]
+  对 SAM 文件进行排序。
+  实现了类似 samtools sort 的功能，支持按坐标或 Read 名称排序。
+  支持大文件外排序 (内存不足时自动使用临时文件)。
+
+[bold]排序模式:[/bold]
+  [cyan]--coord[/cyan]   按坐标排序 (默认): 染色体 -> 位置 -> 链方向
+  [cyan]--name[/cyan]    按 Read 名称排序 (通常用于 mate-pair 处理)
+
+[bold]示例:[/bold]
+  1. 按坐标排序 (最常用):
+     [green]fanse sort -i input.sam -o sorted.sam --coord[/green]
+
+  2. 按名称排序:
+     [green]fanse sort -i input.sam -o name_sorted.sam --name[/green]
+
+  3. 批量处理当前目录下所有 SAM 文件:
+     [green]fanse sort -i "*.sam" -o sorted_dir/ --coord[/green]
+""")
 
 
     

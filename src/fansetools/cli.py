@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import box
 from .utils.version_check import DualVersionChecker, get_installation_method, update_fansetools
-from .utils.rich_help import CustomHelpFormatter, print_colored_text
+from .utils.rich_help import CustomHelpFormatter, print_colored_text, add_rich_epilog
 from .cluster import add_cluster_subparser # 新增：导入cluster子命令的解析器添加函数
 
 
@@ -40,7 +40,7 @@ def find_and_execute_binary(command_name, remaining_args):
     
     bin_dir = bin_base / platform_dir
     if not bin_dir.exists():
-        print(f"bin目录不存在: {bin_dir}")
+        # print(f"bin目录不存在: {bin_dir}")
         return False
     
     # 构建可执行文件路径
@@ -186,7 +186,7 @@ def show_brief_help_with_binaries(subparsers_choices=None):
     
     # 定义命令分组
     command_groups = {
-        "基础模块": ["parser","trim", "run", "count"],
+        "基础模块": ["parser","trim", "run", "count", "quant"],
         "转换模块": ["bam", "sam", "bed", "mpileup", "fastx", "sort"],
         "后备模块": ["install", "update", "test", "path", "list", "installed", "uninstall", "java", "flow"],
         "集群模块": ["cluster"],
@@ -196,6 +196,7 @@ def show_brief_help_with_binaries(subparsers_choices=None):
     command_descriptions = {
         "parser": "解析FANSe3文件并输出结构化数据",
         "run": "运行FANSe3比对流程:     fanse run -i input.fq.gz -r reference.fasta -o output.fanse3",
+        "quant": "汇总多个样本并导出RSEM/Salmon/Kallisto/featureCounts格式或矩阵",
         "list": "列出可安装的预定义包",
         "install": "安装额外的软件包",
         "update": "检查并更新fansetools",
@@ -331,11 +332,30 @@ def show_detailed_version_info():
     print("=" * 50)
 
 
+def handle_parser_command(args):
+    """处理 parser 命令"""
+    try:
+        from .parser import fanse_parser
+        count = 0
+        print(f"Parsing {args.input_file}...")
+        for record in fanse_parser(args.input_file):
+            print(record)
+            count += 1
+            if count >= 10:
+                print("... (showing first 10 records)")
+                break
+        print(f"Done.")
+        return 0
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
 def create_parser():
     """创建主解析器"""
     # 延迟导入子命令模块
     from .trim import add_trim_subparser
     from .run import add_run_subparser
+    from .quant import add_quant_subparser
     from .count import add_count_subparser
     from .sam import add_sam_subparser
     from .bam import add_bam_subparser
@@ -377,14 +397,21 @@ def create_parser():
     
     # 添加所有子命令   
     add_run_subparser(subparsers)
+    add_quant_subparser(subparsers)
     
     # 子命令：parser
     parser_parser = subparsers.add_parser(
         'parser',
         help='解析 FANSe3 文件',
-        description='解析 FANSe3 文件并输出结构化数据'
+        description='解析 FANSe3 文件并输出结构化数据',
+        formatter_class=CustomHelpFormatter
     )
     parser_parser.add_argument('input_file', help='输入文件路径（FANSe3 格式）')
+    parser_parser.set_defaults(func=handle_parser_command)
+    add_rich_epilog(parser_parser, '''
+[bold]示例:[/bold]
+  fanse parser input.fanse3      [dim]# 解析并打印文件内容结构[/dim]
+''')
     
 
     #子命令  get()  
@@ -429,34 +456,57 @@ def create_parser():
     list_parser = subparsers.add_parser(
         'list',
         help='列出可安装的包',
-        description='列出可安装的预定义包并显示仓库网址'
+        description='列出可安装的预定义包并显示仓库网址',
+        formatter_class=CustomHelpFormatter
     )
     list_parser.set_defaults(func=lambda args: list_available_packages())
+    add_rich_epilog(list_parser, '''
+[bold]示例:[/bold]
+  fanse list                     [dim]# 列出所有可用的软件包及其来源[/dim]
+''')
+
     # 顶层代理：installed
     installed_parser = subparsers.add_parser(
         'installed',
         help='列出已安装的包',
-        description='列出已安装的包及其状态'
+        description='列出已安装的包及其状态',
+        formatter_class=CustomHelpFormatter
     )
     installed_parser.set_defaults(func=lambda args: list_installed_packages())
+    add_rich_epilog(installed_parser, '''
+[bold]示例:[/bold]
+  fanse installed                [dim]# 查看已安装的工具列表[/dim]
+''')
+
     # 顶层命令：uninstall
     uninstall_parser = subparsers.add_parser(
         'uninstall',
         help='卸载软件包',
-        description='卸载已安装的软件包'
+        description='卸载已安装的软件包',
+        formatter_class=CustomHelpFormatter
     )
     uninstall_parser.add_argument('packages', nargs='*', help='要卸载的包名')
     uninstall_parser.set_defaults(func=lambda args: uninstall_packages(args.packages or []))
+    add_rich_epilog(uninstall_parser, '''
+[bold]示例:[/bold]
+  fanse uninstall samtools       [dim]# 卸载 samtools[/dim]
+''')
     
     # 子命令：update
     update_parser = subparsers.add_parser(
         'update',
         help='检查并更新 fansetools',
-        description='检查最新版本并更新 fansetools'
+        description='检查最新版本并更新 fansetools',
+        formatter_class=CustomHelpFormatter
     )
     update_parser.add_argument('-y', '--yes', action='store_true', 
                               help='自动确认更新，无需交互')
     update_parser.set_defaults(func=update_fansetools)
+    add_rich_epilog(update_parser, '''
+[bold]示例:[/bold]
+  fanse update                   [dim]# 检查更新并询问[/dim]
+  fanse update -y                [dim]# 自动更新不询问[/dim]
+''')
 
     # 子命令：flow（由模块提供）
     add_flow_subparser(subparsers)

@@ -3,7 +3,7 @@ import platform
 import urllib.request
 import zipfile
 from pathlib import Path
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 
 
 def get_runtime_base():
@@ -74,7 +74,17 @@ def add_runtime_subparser(subparsers):
     )
     runtime_sub = runtime_parser.add_subparsers(dest='rt_cmd')
     rt_java = runtime_sub.add_parser('install', help='安装 Java JRE', formatter_class=CustomHelpFormatter)
+    add_rich_epilog(rt_java, '''
+[bold]示例:[/bold]
+  fanse runtime install      [dim]# 自动下载并配置 Java 运行时[/dim]
+''')
     rt_java.set_defaults(func=lambda a: install_java())
+    
+    add_rich_epilog(runtime_parser, '''
+[bold]说明:[/bold]
+  用于管理 FANSe 运行所需的外部环境（如 Java）。
+  Windows 用户通常需要此步骤来运行 Java 版本的 FANSe3。
+''')
     return runtime_parser
 
 
@@ -85,5 +95,9 @@ def add_java_subparser(subparsers):
         description='安装或更新本地 Java JRE 到 runtime/java',
         formatter_class=CustomHelpFormatter
     )
+    add_rich_epilog(java_parser, '''
+[bold]示例:[/bold]
+  fanse java                 [dim]# 自动下载并配置 Java 运行时[/dim]
+''')
     java_parser.set_defaults(func=lambda a: install_java())
     return java_parser

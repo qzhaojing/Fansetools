@@ -16,7 +16,7 @@ import os
 import argparse
 import sys
 from pathlib import Path
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from .utils.path_utils import PathProcessor
 from rich.console import Console
 from tqdm import tqdm
@@ -168,3 +168,22 @@ def add_bed_subparser(subparsers):
     parser.add_argument('-n', '--max-reads', type=int, 
                        help='Max reads to process')
     parser.set_defaults(func=fanse2bed)
+
+    add_rich_epilog(parser, """
+[bold]功能说明:[/bold]
+  将 FANSe3 格式的比对结果转换为标准的 BED 格式。
+  支持单文件处理和批量处理 (通过通配符或目录)。
+
+[bold]输出格式 (BED6):[/bold]
+  chrom    start    end    name    score    strand
+
+[bold]示例:[/bold]
+  1. 单个文件转换:
+     [green]fanse bed -i sample.fanse3 -o sample.bed[/green]
+
+  2. 批量转换目录下的所有 .fanse3 文件:
+     [green]fanse bed -i ./data/ -o ./bed_output/[/green]
+
+  3. 使用通配符批量转换:
+     [green]fanse bed -i "data/*.fanse3" -o ./bed_output/[/green]
+""")

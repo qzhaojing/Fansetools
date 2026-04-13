@@ -1170,12 +1170,15 @@ class FanseRunner:
 
     def build_command(self, input_file: Path, output_file: Path,
                       refseq: Path, params: Dict[str, Union[int, str]],
-                      options: List[str]) -> str:
+                      options: List[str], fanse_path_override: str = None) -> str:
         """构建FANSe3命令 - 保证路径的引号使用，避免出错"""
-        fanse_path = self.get_fanse3_path()
-        if not fanse_path:
-            raise RuntimeError(
-                "未配置FANSe路径，请使用fanse run --set-path /path    添加fanse.exe路径或所在文件夹")
+        if fanse_path_override:
+            fanse_path = fanse_path_override
+        else:
+            fanse_path = self.get_fanse3_path()
+            if not fanse_path:
+                raise RuntimeError(
+                    "未配置FANSe路径，请使用fanse run --set-path /path    添加fanse.exe路径或所在文件夹")
 
         # 验证路径存在
         if not input_file.exists():
@@ -1891,29 +1894,29 @@ def add_run_subparser(subparsers):
     parser = subparsers.add_parser(
         'run',
         help='批量运行FANSe3',
-        description='''FANSe3 批量运行工具
+        description='''[bold]FANSe3 批量运行工具[/bold]
 
 支持多种输入输出模式:  单个文件与目录形式均可，可批量运行
 
-  -i sample.fq 文件:
+  [cyan]-i sample.fq 文件:[/cyan]
       直接处理单个或多个文件。支持 .gz 读取，会先解压到本地/服务器临时目录后输入fanse3比对。
       可输入多个文件，用逗号隔开。
-      例如: /path/sample.fastq;/path/sample.fq.gz
+      [dim]例如: /path/sample.fastq;/path/sample.fq.gz[/dim]
 
-  -i /path/ 目录:
+  [cyan]-i /path/ 目录:[/cyan]
       如输入目录，则处理目录下所有 fastq/fq/fq.gz/fastq.gz。
       可同时输入多个目录，用逗号隔开。
 
-  -i /*_R1.fq 通配符:
+  [cyan]-i /*_R1.fq 通配符:[/cyan]
       使用通配符选择文件，为高效筛选目录中所需文件，可使用*号进行筛选。
-      例如: /path/*R1.fastq.gz
+      [dim]例如: /path/*R1.fastq.gz[/dim]
 
-输出目录控制:
+[bold]输出目录控制:[/bold]
   不指定: 输出到输入文件所在目录
   单目录: 所有输出保存到同一目录
   多目录: 与输入一一对应的输出目录
 
-  如多目录，最好文本文件记录好命令再运行。
+  [yellow]如多目录，最好文本文件记录好命令再运行。[/yellow]
 ''',
         formatter_class=CustomHelpFormatter
     )
@@ -2098,6 +2101,12 @@ def add_run_subparser(subparsers):
         dest='ssh',
         action='store_true',
         help='采用远程fanse调用模式（不好用，使用场景不对）'
+    )
+    # 新增 --remote-ssh 参数，用于显式启用远程模式
+    ssh_auth_group.add_argument(
+        '--remote-ssh',
+        action='store_true',
+        help='强制启用远程SSH模式，跳过本地FANSe路径检查（等同于 --ssh，但意图更明确）'
     )
     # 路径配置
     # parser.add_argument(
@@ -2300,7 +2309,9 @@ def run_command(args):
         # 检查是否配置了SSH（用于后续运行）
 
         ssh_config = runner.config.load_ssh_config()
-        ssh_mode = args.ssh
+        # 更新 ssh_mode 逻辑：支持 --ssh 或 --remote-ssh
+        ssh_mode = args.ssh or getattr(args, 'remote_ssh', False)
+
         if ssh_mode:
             runner.remote_mode = True
             runner.logger.info("🌐 使用远程FANSe3模式")
@@ -2310,13 +2321,22 @@ def run_command(args):
                 runner.logger.error("SSH连接失败，回退到本地模式")
                 runner.remote_mode = False
         else:
-            # 检查本地FANSe路径
+            # 检查本地FANSe路径 (非集群模式下必需)
+            # 修改：只要指定了 nodes (-n)，也视为集群模式，跳过本地检查
+            is_cluster = getattr(args, 'cluster', False) or (getattr(args, 'nodes', None) is not None)
+
             fanse_path = runner.get_fanse3_path()
-            if not fanse_path:
+            
+            if fanse_path:
+                runner.logger.info(f"💻 使用本地FANSe3模式: {fanse_path}")
+            elif not is_cluster:
+                # 只有在非集群模式下，本地路径缺失才是错误
                 runner.logger.error(
                     "未配置FANSe路径，请先使用 --set-path 或 --set-ssh-path 配置")
                 sys.exit(1)
-            runner.logger.info(f"💻 使用本地FANSe3模式: {fanse_path}")
+            else:
+                # 集群模式下，本地路径缺失是允许的
+                runner.logger.info("🚀 集群模式/多节点模式: 跳过本地FANSe路径检查")
 
         # ========== 第四步：检查运行参数 ==========
 
@@ -2371,7 +2391,10 @@ def run_command(args):
 
         # ========== 第五步：选择运行模式并执行 ==========
 
-        if getattr(args, 'cluster', False):
+        # 修改：只要指定了 nodes (-n)，也视为集群模式
+        is_cluster_mode = getattr(args, 'cluster', False) or (getattr(args, 'nodes', None) is not None)
+
+        if is_cluster_mode:
             # 集群模式
             runner.logger.info("🚀 准备集群分发任务...")
             commands = []
@@ -2431,8 +2454,10 @@ def run_command(args):
                 else:
                     # 构建命令 - 使用远程参考序列路径
                     # 注意：这里假设输入文件路径在远程也是可访问的（如共享存储）
+                    # 使用 {{FANSE_PATH}} 占位符，由 distribute 模块根据节点配置替换
                     cmd = runner.build_command(
-                        curr_input, output_file, Path(remote_ref_path), final_params, final_options
+                        curr_input, output_file, Path(remote_ref_path), final_params, final_options,
+                        fanse_path_override="{{FANSE_PATH}}"
                     )
                 
                 commands.append(cmd)

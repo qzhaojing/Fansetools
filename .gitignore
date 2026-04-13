@@ -1,32 +1,42 @@
-# Python
-__pycache__/
-src/fansetools/__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
+# 编译输出
+fansetools-*/
 build/
 dist/
-venv/
-.env/
-.python-version
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
 
-# Windows
-Thumbs.db
-Desktop.ini
-[Dd]esktop.ini
-*.lnk
-~$*
+# 二进制文件
+src/fansetools/bin/windows/*.exe
+src/fansetools/bin/windows/*.bat
 
-# IDE/Editor
-.vscode/
-.idea/
-*.swp
-*.swo
+# 测试和临时文件
+out_test/
+test_recursive*.py
+debug_*.py
+deploy_*.py
+extract_*.py
 
-# Testing/Debugging
-*.log
-*.tmp
-*.bak
-.pytest_cache/
-.coverage
-htmlcov/
+# 配置和IDE文件
+.trae/
+.promptx/
+.vercel/
+.vercelignore
+vercel.json
+
+# 备份和副本文件
+*backup*
+*副本*
+* - 副本.*
+*.backup.*
+quan.py
+cli copy.py
+
+# 大文件和数据
+*.fa
+*.fq
+*.fastq
+*.fasta
+*.bam
+*.sam

@@ -64,9 +64,10 @@ class PathProcessor:
                 item = item.replace('/', '\\')
             
             try:
-                # 处理通配符
+                # 处理通配符（支持递归 **）
                 if '*' in item or '?' in item:
-                    matched_paths = glob.glob(item)
+                    # 启用递归搜索
+                    matched_paths = glob.glob(item, recursive=True)
                     if not matched_paths:
                         self.logger.warning(f"未找到匹配的文件: {item}") if self.logger else None
                         continue

@@ -6,7 +6,9 @@ from rich.text import Text
 from rich_argparse import RichHelpFormatter
 
 class CustomHelpFormatter(RichHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    """自定义帮助格式化器，结合Rich的色彩和自定义的简洁格式"""
+    """自定义帮助格式化器，结合Rich的色彩和自定义的简洁格式
+    修正：保留 description/epilog 中的显式换行符，避免被自动重排为单行
+    """
     
     def _format_action(self, action):
         # 简化子命令的显示格式
@@ -27,6 +29,33 @@ class CustomHelpFormatter(RichHelpFormatter, argparse.RawDescriptionHelpFormatte
             
             return "\n".join(parts) + "\n"
         return super()._format_action(action)
+
+    # 修正：覆盖 _fill_text，强制保留原文本与换行，避免Rich/argparse自动换行导致的行合并
+    def _fill_text(self, text, width, indent):
+        """
+        保留传入文本的原始结构（含换行与缩进），不进行自动重排。
+        用于确保 epilog/description 中的多行示例在终端正确换行显示。
+        """
+        return text
+
+    # 说明：不覆盖 add_text，避免与 rich_argparse 的内部渲染逻辑冲突
+
+def add_rich_epilog(parser, epilog_rich):
+    """
+    为 parser 添加一个支持 Rich 渲染和保留换行的 epilog。
+    使用 Hook 方式在原 help 打印后追加 epilog。
+    """
+    _orig_print_help = parser.print_help
+    def _print_help_with_epilog(file=None):
+        _orig_print_help(file=file)
+        try:
+            from rich.console import Console
+            console = Console(force_terminal=True)
+            console.print(epilog_rich)
+        except Exception:
+            # 发生异常时，降级为纯文本打印
+            print(epilog_rich)
+    parser.print_help = _print_help_with_epilog
 
 def print_colored_text(text):
     """

@@ -69,7 +69,11 @@ _worker_annotation_df = None
 def process_single_file_task(task):
     """处理单个文件（独立函数，避免pickling问题）"""
     global _worker_annotation_df
-    
+    # Notify start
+    if task.get('queue') and task.get('task_index') is not None:
+        try:
+             task['queue'].put((task['task_index'], f"[yellow]启动: {task['file_stem']}", None, 0, None))
+        except: pass    
     try:
         # Load annotation data if needed and not cached
         if task['gxf_file'] and _worker_annotation_df is None:
@@ -196,6 +200,7 @@ class ParallelFanseCounter:
                         except Exception as e:
                             results.append((t['input_file'], False, str(e)))
                             prog_list[slot_idx].update(task_id_list[slot_idx], total=1, completed=1, description=f"[red]失败: {t['file_stem']}")
+                            self.console.print(f"[bold red]任务失败 {t['file_stem']}: {str(e)}[/bold red]") 
                         finally:
                             overall.update(overall_task, advance=1)
 
@@ -459,10 +464,18 @@ def count_main_serial(args, progress=None, task_id=None):
                 return
 
         # 串行处理每个文件
+        total_input_count = len(input_files)
+        console.print(f"匹配到 {total_input_count} 个输入文件")
+        if skipped_files > 0:
+             console.print(f"跳过 {skipped_files} 个已存在的文件")
+
         for i, (input_file, output_file) in enumerate(output_map.items(), 1):
             # 确保输出目录存在
             if not output_file.parent.exists():
                 output_file.parent.mkdir(parents=True, exist_ok=True)
+               
+            current_idx = i + skipped_files
+            console.print(f"[{current_idx}/{total_input_count}] 正在处理: {input_file.name}")
 
             if getattr(args, 'verbose', False):
                 console.print(
@@ -479,7 +492,7 @@ def count_main_serial(args, progress=None, task_id=None):
                     # paired_end=args.paired_end,
                     annotation_df=annotation_df,
                     verbose=getattr(args, 'verbose', False),
-                    export_format=getattr(args, 'format', 'rsem'),
+                    export_format=getattr(args, 'format', 'salmon'),
                     export_count_type=getattr(args, 'count_type', 'Final_EM'),
                     progress=progress,  # Pass progress object
                     task_id=task_id,     # Pass task_id
@@ -2213,9 +2226,21 @@ class FanseCounter:
             gene_eff_map = dict(df_anno.groupby('geneName')[eff_len_col].max())
         rows = []
         for gene, count in counter.items():
-            length = gene_len_map.get(gene, 0)
-            eff_len = gene_eff_map.get(gene, length)
-            rows.append((gene, length, eff_len, round(float(count), 1)))
+            try:
+                length_val = float(gene_len_map.get(gene, 0))
+            except Exception:
+                length_val = 0.0
+            try:
+                eff_raw = gene_eff_map.get(gene, length_val)
+                eff_len_val = float(eff_raw)
+            except Exception:
+                eff_len_val = length_val
+            rows.append((
+                gene,
+                int(length_val) if abs(length_val - round(length_val)) < 1e-6 else round(length_val, 2),
+                int(eff_len_val) if abs(eff_len_val - round(eff_len_val)) < 1e-6 else round(eff_len_val, 2),
+                round(float(count), 1)
+            ))
         out_df = pd.DataFrame(rows, columns=['gene_id', 'length', 'effective_length', 'expected_count'])
         rsem_path = self.output_dir / (f'{base_name}.rsem.genes.{ctype}.results' if count_type is not None else f'{base_name}.rsem.genes.results')
         out_df.to_csv(rsem_path, sep='\t', index=False)
@@ -2241,11 +2266,23 @@ class FanseCounter:
             eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
         rows = []
         for tid, count in counter.items():
-            length = length_map.get(tid, 0)
-            eff_len_raw = eff_length_map.get(tid, length)
-            # 修正：当有效长度缺失或<=0时，回退到总长度，避免输出0长度
-            eff_len = eff_len_raw if (eff_len_raw is not None and not pd.isna(eff_len_raw) and float(eff_len_raw) > 0) else length
-            rows.append((tid, length, eff_len, round(float(count), 1)))
+            try:
+                length_val = float(length_map.get(tid, 0))
+            except Exception:
+                length_val = 0.0
+            try:
+                eff_raw = eff_length_map.get(tid, length_val)
+                eff_val = float(eff_raw)
+                if not (eff_val > 0):
+                    eff_val = length_val
+            except Exception:
+                eff_val = length_val
+            rows.append((
+                tid,
+                int(length_val) if abs(length_val - round(length_val)) < 1e-6 else round(length_val, 2),
+                int(eff_val) if abs(eff_val - round(eff_val)) < 1e-6 else round(eff_val, 2),
+                round(float(count), 1)
+            ))
         out_df = pd.DataFrame(rows, columns=['transcript_id', 'length', 'effective_length', 'expected_count'])
         rsem_path = self.output_dir / (f'{base_name}.rsem.isoforms.{ctype}.results' if count_type is not None else f'{base_name}.rsem.isoforms.results')
         out_df.to_csv(rsem_path, sep='\t', index=False)
@@ -2272,10 +2309,16 @@ class FanseCounter:
         tpm_map = self._calculate_tpm(counter, eff_length_map or length_map)
         rows = []
         for tid, count in counter.items():
-            _len_val = length_map.get(tid, 0)
-            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
-            eff_len = eff_length_map.get(tid, length)
-            # 数值处理：整数不带小数，浮点保留两位
+            try:
+                length_f = float(length_map.get(tid, 0))
+            except Exception:
+                length_f = 0.0
+            try:
+                eff_raw = eff_length_map.get(tid, length_f)
+                eff_len = float(eff_raw)
+            except Exception:
+                eff_len = length_f
+            length = int(length_f) if abs(length_f - round(length_f)) < 1e-6 else round(length_f, 2)
             cval = float(count)
             if abs(cval - round(cval)) < 1e-6:
                 num_reads = int(round(cval))
@@ -2308,9 +2351,16 @@ class FanseCounter:
         tpm_map = self._calculate_tpm(counter, gene_len_map)
         rows = []
         for gid, count in counter.items():
-            _len_val = gene_len_map.get(gid, 0)
-            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
-            eff_len = gene_eff_map.get(gid, length)
+            try:
+                length_f = float(gene_len_map.get(gid, 0))
+            except Exception:
+                length_f = 0.0
+            try:
+                eff_raw = gene_eff_map.get(gid, length_f)
+                eff_len = float(eff_raw)
+            except Exception:
+                eff_len = length_f
+            length = int(length_f) if abs(length_f - round(length_f)) < 1e-6 else round(length_f, 2)
             cval = float(count)
             num_reads = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
             tpm = round(float(tpm_map.get(gid, 0.0)), 2)
@@ -2340,9 +2390,16 @@ class FanseCounter:
         tpm_map = self._calculate_tpm(counter, length_map)
         rows = []
         for tid, count in counter.items():
-            _len_val = length_map.get(tid, 0)
-            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
-            eff_len = eff_length_map.get(tid, length)
+            try:
+                length_f = float(length_map.get(tid, 0))
+            except Exception:
+                length_f = 0.0
+            try:
+                eff_raw = eff_length_map.get(tid, length_f)
+                eff_len = float(eff_raw)
+            except Exception:
+                eff_len = length_f
+            length = int(length_f) if abs(length_f - round(length_f)) < 1e-6 else round(length_f, 2)
             cval = float(count)
             if abs(cval - round(cval)) < 1e-6:
                 est_counts = int(round(cval))
@@ -2374,9 +2431,16 @@ class FanseCounter:
         tpm_map = self._calculate_tpm(counter, gene_len_map)
         rows = []
         for gid, count in counter.items():
-            _len_val = gene_len_map.get(gid, 0)
-            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
-            eff_len = gene_eff_map.get(gid, length)
+            try:
+                length_f = float(gene_len_map.get(gid, 0))
+            except Exception:
+                length_f = 0.0
+            try:
+                eff_raw = gene_eff_map.get(gid, length_f)
+                eff_len = float(eff_raw)
+            except Exception:
+                eff_len = length_f
+            length = int(length_f) if abs(length_f - round(length_f)) < 1e-6 else round(length_f, 2)
             cval = float(count)
             est_counts = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
             tpm = round(float(tpm_map.get(gid, 0.0)), 2)
@@ -2408,9 +2472,16 @@ class FanseCounter:
             gene_eff_map = dict(df_anno.groupby('geneName')[eff_len_col].max())
         rows = []
         for gene, count in counter.items():
-            _len_val = gene_len_map.get(gene, 0)
-            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
-            eff_len = gene_eff_map.get(gene, length)
+            try:
+                length_f = float(gene_len_map.get(gene, 0))
+            except Exception:
+                length_f = 0.0
+            try:
+                eff_raw = gene_eff_map.get(gene, length_f)
+                eff_len = float(eff_raw)
+            except Exception:
+                eff_len = length_f
+            length = int(length_f) if abs(length_f - round(length_f)) < 1e-6 else round(length_f, 2)
             cval = float(count)
             if abs(cval - round(cval)) < 1e-6:
                 fc_count = int(round(cval))
@@ -2441,9 +2512,16 @@ class FanseCounter:
             eff_length_map = dict(zip(df_anno[name_col], df_anno[eff_len_col]))
         rows = []
         for tid, count in counter.items():
-            _len_val = length_map.get(tid, 0)
-            length = int(_len_val) if (isinstance(_len_val, (int, float)) and not pd.isna(_len_val)) else 0
-            eff_len = eff_length_map.get(tid, length)
+            try:
+                length_f = float(length_map.get(tid, 0))
+            except Exception:
+                length_f = 0.0
+            try:
+                eff_raw = eff_length_map.get(tid, length_f)
+                eff_len = float(eff_raw)
+            except Exception:
+                eff_len = length_f
+            length = int(length_f) if abs(length_f - round(length_f)) < 1e-6 else round(length_f, 2)
             cval = float(count)
             fc_count = int(round(cval)) if abs(cval - round(cval)) < 1e-6 else round(cval, 2)
             rows.append((tid, length, eff_len, fc_count))
@@ -3120,44 +3198,59 @@ def add_count_subparser(subparsers):
     parser = subparsers.add_parser(
         'count',
         help='运行FANSe to count，输出readcount',
+        # formatter_class=argparse.RawDescriptionHelpFormatter,
         formatter_class=CustomHelpFormatter,
-        epilog="""
-        [bold]使用示例:[/bold]
-            [dim]默认isoform level[/dim]
-          [bold cyan]单个文件/单端测序文件处理:[/bold cyan]
-            fanse count -i sample.fanse3 -o results/ --gxf annotation.gtf
-
-          [bold cyan]批量处理目录中所有fanse3文件:[/bold cyan]
-            fanse count -i /data/*.fanse3 -o /output/ --gxf annotation.gtf
-
-          [bold cyan]双端测序数据:[/bold cyan] [dim](不支持通配符和文件夹等用此方法处理)[/dim]
-            fanse count -1 R1.fanse3 -2 R2.fanse3 -o results/ --gxf annotation.gtf
-
-        [bold yellow]**如需要基因水平计数，需要输入gtf/gff/refflat/简单g-t对应文件，--gxf都可以解析[/bold yellow]
-          [bold cyan]基因水平计数:[/bold cyan]
-            fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level gene
-
-          [bold cyan]同时输出基因和转录本水平:[/bold cyan]
-            fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level both
-
-          [bold cyan]处理中断后重新运行:[/bold cyan] [dim]（自动跳过已处理的文件）[/dim]
-            fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --resume
-
-            [dim]# 指定4个并行进程，展示总体运行进度和简易进度条[/dim]
-            fanse count -i "*.fanse3" -o results --gxf annotation.gtf --p 4
-
-          [bold cyan]使用所有CPU核心并行处理:[/bold cyan]
-            fanse count -i *.fanse3 -o results --gxf annotation.gtf -p 0
-
-        [bold]基因定量归一化长度指标说明 (--len):[/bold]
-          - [green]geneEffectiveLength[/green]: 所有转录本外显子并集的非重叠长度，用于更稳健的TPM归一化
-          - [green]genelongesttxLength[/green]: 每个基因的最长转录本长度，常作为简化替代
-          - [green]txLength[/green]: 基于转录本长度的回退选项（按基因取最大）
-          - [green]geneNonOverlapLength[/green]: 与 geneEffectiveLength 一致，显式提供非重叠外显子长度
-          - [green]geneReadCoveredLength[/green]: 依据reads覆盖区间的长度（无覆盖信息时退化为有效长度）
-          - [green]other[/green]: 自定义列名（若不存在自动回退至有效长度）
-                """
     )
+
+    # 修正：将彩色 epilog 以 Rich 文本形式追加打印，保留颜色与换行
+    EPILOG_RICH = """
+[bold]使用示例:[/bold]
+  [dim]默认isoform level[/dim]
+[bold cyan]单个文件/单端测序文件处理:[/bold cyan]
+  fanse count -i sample.fanse3 -o results/ --gxf annotation.gtf
+
+[bold cyan]批量处理目录中所有fanse3文件:[/bold cyan]
+  fanse count -i /data/*.fanse3 -o /output/ --gxf annotation.gtf
+
+[bold cyan]双端测序数据:[/bold cyan] [dim](不支持通配符和文件夹等用此方法处理)[/dim]
+  fanse count -1 R1.fanse3 -2 R2.fanse3 -o results/ --gxf annotation.gtf
+
+[bold yellow]**如需要基因水平计数，需要输入gtf/gff/refflat/简单g-t对应文件，--gxf都可以解析[/bold yellow]
+[bold cyan]基因水平计数:[/bold cyan]
+  fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level gene
+
+[bold cyan]同时输出基因和转录本水平:[/bold cyan]
+  fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --level both
+
+[bold cyan]处理中断后重新运行:[/bold cyan] [dim]（自动跳过已处理的文件）[/dim]
+  fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --resume
+
+[dim]# 指定4个并行进程，展示总体运行进度和简易进度条[/dim]
+  fanse count -i "*.fanse3" -o results --gxf annotation.gtf --p 4
+
+[bold cyan]使用所有CPU核心并行处理:[/bold cyan]
+  fanse count -i *.fanse3 -o results --gxf annotation.gtf -p 0
+
+[bold]基因定量归一化长度指标说明 (--len):[/bold]
+  - [green]geneEffectiveLength[/green]: 所有转录本外显子并集的非重叠长度，用于更稳健的TPM归一化
+  - [green]genelongesttxLength[/green]: 每个基因的最长转录本长度，常作为简化替代
+  - [green]txLength[/green]: 基于转录本长度的回退选项（按基因取最大）
+  - [green]geneNonOverlapLength[/green]: 与 geneEffectiveLength 一致，显式提供非重叠外显子长度
+  - [green]geneReadCoveredLength[/green]: 依据reads覆盖区间的长度（无覆盖信息时退化为有效长度）
+  - [green]other[/green]: 自定义列名（若不存在自动回退至有效长度）
+    """
+
+    _orig_print_help = parser.print_help
+    def _print_help_with_epilog(file=None):
+        _orig_print_help(file=file)
+        try:
+            from rich.console import Console
+            console = Console(force_terminal=True)
+            console.print(EPILOG_RICH)
+        except Exception:
+            # 发生异常时，降级为纯文本打印
+            print(EPILOG_RICH)
+    parser.print_help = _print_help_with_epilog
 
     parser.add_argument('-i', '--input', required=False,
                         help='输入FANSe3文件/目录/通配符（支持批量处理）')

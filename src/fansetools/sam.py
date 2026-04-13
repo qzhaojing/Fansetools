@@ -49,7 +49,7 @@ from multiprocessing import Pool
 from tqdm import tqdm
 from typing import Generator, Optional, Dict, Tuple, Iterator, Set, List
 from .parser import FANSeRecord, fanse_parser, fanse_parser_high_performance, fanse_line_reader, parse_records_from_lines
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from .utils.path_utils import PathProcessor
 from rich.console import Console
 import pathlib
@@ -58,6 +58,17 @@ import pathlib
 _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
 
 def _worker_process_batch(records: List[FANSeRecord], regions: Optional[Dict] = None) -> List[str]:
+    """
+    Worker function for parallel processing of FANSe records.
+    (Kept for compatibility if needed, but new implementation uses _worker_process_lines)
+    """
+    results = []
+    for record in records:
+        if regions and not is_record_in_region(record, regions):
+            continue
+        results.extend(fanse_to_sam_type(record))
+    return results
+
     """
     Worker function for parallel processing of FANSe records.
     (Kept for compatibility if needed, but new implementation uses _worker_process_lines)
@@ -486,6 +497,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         f"XN:i:{record.multi_count}",
         f"NM:i:{nm}",  # 添加编辑距离
         f"XS:i:{mapq_values[primary_idx]}"  # 添加原始得分标签
+        
     ]
     
     # 处理多重比对记录（只有multi_count > 1时才需要额外处理）
@@ -809,112 +821,120 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
     # 生成SAM头部
     header = generate_sam_header_from_ref_info(ref_info)
     
-    if output_sam:
-        with open(output_sam, 'w') as out_f:
-            # 写入SAM头
-            out_f.write(header)
+    # 统一输出处理逻辑
+    writer = None
+    should_close = False
+    is_binary = False
+    
+    try:
+        if output_sam:
+            writer = open(output_sam, 'w', encoding='utf-8')
+            should_close = True
             console.print('Write SAM header down.')
-            
-            if threads > 1:
+            writer.write(header)
+        else:
+            # 标准输出模式：使用buffer直接写入bytes，避免编码问题
+            writer = sys.stdout.buffer
+            is_binary = True
+            writer.write(header.encode('utf-8'))
+            writer.flush()  # 确保头部立即写入，防止samtools等待或超时
+
+        # 核心处理逻辑（并行/串行）
+        if threads > 1:
+            if output_sam:
                 console.print(f"启用并行处理: 使用 {threads} 个线程")
-                from functools import partial
-                
-                # 调整批次大小，平衡内存和调度开销
-                # 原始行数据比较小，可以适当增大batch_size
-                batch_size = 20000 
-                file_read_size = os.path.getsize(fanse_file) / 450
-                
-                # 使用fanse_line_reader作为数据源
-                reader = fanse_line_reader(fanse_file, chunk_size=batch_size)
-                worker_func = partial(_worker_process_lines, regions=regions)
-                
-                with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True) as pbar:
-                    # 使用 multiprocessing.Pool.imap 替代 executor.map
-                    # imap 是惰性的，不会一次性读取所有数据，有效控制内存
-                    with Pool(processes=threads) as pool:
-                        for lines in pool.imap(worker_func, reader, chunksize=1):
-                            if lines:
-                                out_f.write('\n'.join(lines) + '\n')
-                            # 更新进度条 (lines包含多个record生成的sam行，难以精确计数record，只能估算)
-                            # 由于我们知道chunk_size是行数，除以2即为记录数
-                            pbar.update(batch_size // 2)
-                                
-                console.print(f"处理完成")
             
-            else:
-                # 处理记录
-                batch_size = 200_000
-                batch_count = 0
-                batch_lines = []
-                filtered_count = 0
-                total_count = 0
-                
-                file_read_size = os.path.getsize(fanse_file) / 450     #粗略估计平均 450字节一个fanse记录
-                with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True) as pbar:
-                    for record in fanse_parser_high_performance(fanse_file):
-                        total_count += 1
+            from functools import partial
+            
+            # 调整批次大小
+            batch_size = 20000 
+            file_read_size = os.path.getsize(fanse_file) / 450
+            
+            reader = fanse_line_reader(fanse_file, chunk_size=batch_size)
+            worker_func = partial(_worker_process_lines, regions=regions)
+            
+            # 进度条仅在输出到文件时显示，避免干扰stdout
+            disable_pbar = (output_sam is None)
+            
+            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True, disable=disable_pbar) as pbar:
+                with Pool(processes=threads) as pool:
+                    for lines in pool.imap(worker_func, reader, chunksize=1):
+                        if lines:
+                            text = '\n'.join(lines) + '\n'
+                            if is_binary:
+                                writer.write(text.encode('utf-8'))
+                            else:
+                                writer.write(text)
                         
-                        # 区域过滤，没有过滤信息则直接跳过（regions为None）
-                        if regions and not is_record_in_region(record, regions):
-                            filtered_count += 1
-                            pbar.update(1)
-                            continue
-                        
-                        for sam_line in fanse_to_sam_type(record):
-                            batch_lines.append(sam_line)
-                            batch_count += 1
-                        
-                        if batch_count >= batch_size:
-                            out_f.write('\n'.join(batch_lines) + '\n')
-                            batch_lines = []
-                            batch_count = 0
-                        
-                        pbar.update(1)
-                    
-                    # 写入剩余批次
-                    if batch_lines:
-                        out_f.write('\n'.join(batch_lines) + '\n')
-                
-                # 输出统计信息
-                console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
-                    
-    else:
-        # 标准输出模式
-        try:
-            sys.stdout.buffer.write(header.encode())
+                        pbar.update(batch_size // 2)
+                            
+            if output_sam:
+                console.print(f"处理完成")
+        
+        else:
+            # 单线程处理
+            batch_size = 200_000
+            batch_count = 0
             batch_lines = []
             filtered_count = 0
             total_count = 0
             
-            for record in fanse_parser(fanse_file):
-                total_count += 1
-                
-                # 区域过滤
-                if regions and not is_record_in_region(record, regions):
-                    filtered_count += 1
-                    continue
-                
-                for sam_line in fanse_to_sam_type(record):
-                    batch_lines.append(sam_line)
-                
-                if len(batch_lines) >= 1000:
-                    sys.stdout.buffer.write(('\n'.join(batch_lines) + '\n').encode())
-                    batch_lines = []
+            file_read_size = os.path.getsize(fanse_file) / 450
             
-            if batch_lines:
-                sys.stdout.buffer.write(('\n'.join(batch_lines) + '\n').encode())
-                
-            # 错误输出统计信息
-            console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
+            # 进度条仅在输出到文件时显示
+            disable_pbar = (output_sam is None)
             
-        except AttributeError:
-            # 回退方案
-            sys.__stdout__.write(header)
-            for record in fanse_parser(fanse_file):
-                if regions and not is_record_in_region(record, regions):
-                    continue
-                for sam_line in fanse_to_sam_type(record):
-                    sys.__stdout__.write(sam_line + "\n")
+            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True, disable=disable_pbar) as pbar:
+                for record in fanse_parser_high_performance(fanse_file):
+                    total_count += 1
+                    
+                    if regions and not is_record_in_region(record, regions):
+                        filtered_count += 1
+                        pbar.update(1)
+                        continue
+                    
+                    for sam_line in fanse_to_sam_type(record):
+                        batch_lines.append(sam_line)
+                        batch_count += 1
+                    
+                    if batch_count >= batch_size:
+                        text = '\n'.join(batch_lines) + '\n'
+                        if is_binary:
+                            writer.write(text.encode('utf-8'))
+                        else:
+                            writer.write(text)
+                        batch_lines = []
+                        batch_count = 0
+                    
+                    pbar.update(1)
+                
+                # 写入剩余批次
+                if batch_lines:
+                    text = '\n'.join(batch_lines) + '\n'
+                    if is_binary:
+                        writer.write(text.encode('utf-8'))
+                    else:
+                        writer.write(text)
+            
+            if output_sam:
+                console.print(f"处理完成: 总共 {total_count} 条记录，过滤 {filtered_count} 条，输出 {total_count - filtered_count} 条")
+
+    except (BrokenPipeError, OSError) as e:
+        # 处理管道断开错误（例如 | head 或 samtools 提前退出）
+        # 此时应静默退出，不需要打印错误堆栈
+        # errno 32 是 Broken pipe
+        if isinstance(e, BrokenPipeError) or (hasattr(e, 'errno') and e.errno == 32):
+            try:
+                sys.stderr.close()
+            except:
+                pass
+            sys.exit(0)
+        else:
+            raise e
+            
+    finally:
+        if should_close and writer:
+            writer.close()
 
 def run_sam_command(args):
     """Handle sam subcommand"""
@@ -978,7 +998,7 @@ def add_sam_subparser(subparsers):
     sam_parser = subparsers.add_parser(
         'sam',
         help='转换为 SAM 格式',
-        description='将 FANSe3 文件转换为标准 SAM 格式, 在linux中不加-o参数可接 samtools 管道处理直接保存为bam格式，支持区域过滤',
+        description='将 FANSe3 文件转换为标准 SAM 格式',
         formatter_class=CustomHelpFormatter
     )
     
@@ -1000,6 +1020,31 @@ def add_sam_subparser(subparsers):
     )
 
     sam_parser.set_defaults(func=run_sam_command)
+
+    add_rich_epilog(sam_parser, """
+[bold]功能说明:[/bold]
+  本工具将 FANSe3 比对结果转换为标准 SAM 格式。
+  支持多线程并行处理，支持区域过滤。
+  在 Linux 环境下，如果不指定 [green]-o[/green] 参数，结果将输出到标准输出 (stdout)，
+  可以直接通过管道传递给 samtools 进行处理 (如转换为 BAM)。
+
+[bold]区域格式 (-R/--region):[/bold]
+  [green]chr1[/green]             整个染色体
+  [green]chr1:1000-[/green]       从 1000bp 开始到末尾
+  [green]chr1:1000-2000[/green]   指定区间
+  [green]chr1,chr2[/green]        多个染色体
+
+[bold]示例:[/bold]
+  1. 基本转换:
+     [green]fanse sam -i sample.fanse3 -r ref.fa -o sample.sam[/green]
+
+  2. 管道操作 (Linux):
+     [green]fanse sam -i sample.fanse3 -r ref.fa | samtools view -bS - > sample.bam[/green]
+
+  3. 区域过滤:
+     [green]fanse sam -i sample.fanse3 -r ref.fa -R chr1:1000-2000 -o filtered.sam[/green]
+""")
+
 
 
 

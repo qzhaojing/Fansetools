@@ -124,10 +124,17 @@ class DistributedScheduler:
             if not ssh:
                 raise Exception(f"Failed to connect to {node_name}")
             
+            # Prepare command (replace placeholder with node-specific path)
+            actual_command = task.command
+            if "{{FANSE_PATH}}" in actual_command:
+                # Use node specific path or default to "FANSe3"
+                fanse_exe = node.fanse_path if node.fanse_path else "FANSe3"
+                actual_command = actual_command.replace("{{FANSE_PATH}}", fanse_exe)
+
             # Execute
             # Note: exec_command returns (stdin, stdout, stderr)
             # The command is executed asynchronously on the server
-            stdin, stdout, stderr = ssh.exec_command(task.command)
+            stdin, stdout, stderr = ssh.exec_command(actual_command)
             channel = stdout.channel
             
             # Wait for completion with timeout support

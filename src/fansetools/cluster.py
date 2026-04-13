@@ -1,7 +1,7 @@
 import json
 import os
 import argparse
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import warnings
@@ -37,6 +37,7 @@ class ClusterNode:
     name: str
     host: str
     user: str
+    ip: Optional[str] = None  # 修复：dataclass 字段顺序，所有非默认参数置于前；该字段为可选
     fanse_path: Optional[str] = None  # 修正：Linux节点可不设置fanse可执行路径
     key_path: Optional[str] = None
     password: Optional[str] = None
@@ -81,6 +82,36 @@ class OptimizedClusterManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"❌ 保存配置失败: {e}")
+
+    def _get_connect_host(self, node: ClusterNode) -> str:
+        """根据节点配置选择用于连接的主机地址
+        修改说明：优先使用节点 IP 字段，其次使用 host 字段；
+        解决 Linux 下无法解析 Windows 主机名的问题，保持名称用于显示但连接走 IP。
+        """
+        return (node.ip or node.host).strip()
+
+    def _auto_resolve_ip(self, host: str) -> Optional[str]:
+        """在 Windows 上尽量解析主机名为 IP，用于自动填充 ip 字段
+        修改说明：当用户在 Windows 下使用主机名添加节点时，尝试解析 IP 以提升跨平台兼容性。
+        """
+        try:
+            # 首选标准解析
+            ip = socket.gethostbyname(host)
+            # 过滤掉解析失败返回自身或非 IPv4 的情况（简单校验）
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                return ip
+        except Exception:
+            pass
+        # 备用：使用 nslookup（Windows 更常见），解析失败则返回 None
+        try:
+            proc = subprocess.run(["nslookup", host], capture_output=True, text=True, timeout=3)
+            out = proc.stdout
+            m = re.search(r"Address:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return None
     
     def _test_network_connectivity(self, host: str, port: int, timeout: int = 2) -> bool:
         """优化的网络连通性测试"""
@@ -99,7 +130,7 @@ class OptimizedClusterManager:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             
             connect_kwargs = {
-                'hostname': node.host,
+                'hostname': self._get_connect_host(node),  # 修改：优先使用 IP 进行连接，避免 Linux 下主机名解析失败
                 'username': node.user,
                 'port': node.port,
                 'timeout': timeout,
@@ -192,12 +223,14 @@ class OptimizedClusterManager:
     def test_node_connection(self, node: ClusterNode, verbose: bool = True) -> bool:
         """优化的节点连接测试"""
         if verbose:
-            print(f"🔍 测试节点连接: {node.name} ({node.user}@{node.host}:{node.port})")
+            # 修改：显示连接目标（若有 IP 则显示 ip），但保留原主机名用于标识
+            connect_host = self._get_connect_host(node)
+            print(f"🔍 测试节点连接: {node.name} ({node.user}@{connect_host}:{node.port})")
         
         # 1. 测试网络连通性
         if verbose:
             print("  📡 测试网络连通性...")
-        if not self._test_network_connectivity(node.host, node.port):
+        if not self._test_network_connectivity(self._get_connect_host(node), node.port):  # 修改：使用解析后的连接地址
             if verbose:
                 print("  ❌ 网络连接失败")
             return False
@@ -248,13 +281,19 @@ class OptimizedClusterManager:
             ssh.close()
     
     def add_node(self, name: str, host: str, user: str, fanse_path: Optional[str] = None, 
-                 key_path: Optional[str] = None, password: Optional[str] = None, port: int = 22) -> bool:
+                 key_path: Optional[str] = None, password: Optional[str] = None, port: int = 22, ip: Optional[str] = None) -> bool:
         """优化的添加节点方法"""
         if name in self.nodes:
             raise ValueError(f"节点 '{name}' 已存在")
         
+        # 修改：Windows 下若未指定 ip，尝试自动解析主机名为 IP，便于后续在 Linux 环境使用
+        if ip is None and os.name == 'nt':
+            ip = self._auto_resolve_ip(host)
+            if ip:
+                print(f"  🔎 自动解析到 IP: {ip}")
+
         node = ClusterNode(
-            name=name, host=host, user=user, fanse_path=fanse_path,
+            name=name, host=host, ip=ip, user=user, fanse_path=fanse_path,  # 修改：保存解析到的 IP（如有）
             key_path=key_path, password=password, port=port
         )
         
@@ -264,7 +303,7 @@ class OptimizedClusterManager:
         
         # 分步测试并提供详细反馈
         steps = [
-            ("网络连通性", self._test_network_connectivity, (host, port)),
+            ("网络连通性", self._test_network_connectivity, (self._get_connect_host(node), port)),  # 修改：使用解析后的连接地址
             ("SSH连接", lambda: bool(self._create_ssh_connection(node)), ()),
             ("环境检测", self.test_node_connection, (node, False))
         ]
@@ -288,7 +327,11 @@ class OptimizedClusterManager:
         
         print("=" * 60)
         print(f"✅ 节点 '{name}' 添加成功!")
-        print(f"   地址: {node.user}@{node.host}:{node.port}")
+        # 修改：显示主机名与 IP，提升信息完整性
+        addr_disp = f"{node.user}@{(node.ip or node.host)}:{node.port}"
+        if node.ip and node.host and node.ip != node.host:
+            addr_disp += f" (name: {node.host})"
+        print(f"   地址: {addr_disp}")
         print(f"   路径: {node.fanse_path if node.fanse_path else '-'}")
         print("=" * 60)
         return True
@@ -458,8 +501,14 @@ class OptimizedClusterManager:
                     print(f"⚠️ 节点 {name} 缺少 host 或 user 字段，跳过")
                     continue
                     
-                # 过滤掉 ClusterNode 不支持的额外字段（防止版本差异导致报错）
+                # 兼容导入：支持 'ip' 字段及其常见同义键（IP/ip_addr），并过滤掉不支持的字段
                 valid_keys = ClusterNode.__annotations__.keys()
+                # 同义键规范化
+                if 'ip' not in node_data:
+                    if 'IP' in node_data:
+                        node_data['ip'] = node_data.get('IP')
+                    elif 'ip_addr' in node_data:
+                        node_data['ip'] = node_data.get('ip_addr')
                 filtered_data = {k: v for k, v in node_data.items() if k in valid_keys}
                 
                 self.nodes[name] = ClusterNode(**filtered_data)
@@ -514,11 +563,13 @@ class OptimizedClusterManager:
             
             # 1. 网络连通性与响应时间
             start = time.time()
-            if not self._test_network_connectivity(node.host, node.port, timeout=2):
+            # 修改：优先使用 IP 进行连通性测试，避免 Linux 下主机名解析失败
+            if not self._test_network_connectivity(self._get_connect_host(node), node.port, timeout=2):
                 return info
             info['response_time'] = round((time.time() - start) * 1000, 2)  # ms
             
             # 2. SSH连接
+            # 修改：创建 SSH 连接时优先使用 IP
             ssh = self._create_ssh_connection(node, timeout=3)
             if not ssh:
                 return info
@@ -1001,12 +1052,13 @@ def cluster_command(args):
             return 1
 
         elif args.cluster_command == 'add':
-            success = cluster_mgr.add_node(
-                args.name, args.host, args.user, args.fanse_path,
-                args.key, args.password, args.port
-            )
-            if not success:
-                return 1
+                # 修改：支持 --ip 参数，优先用于连接（Linux 下避免主机名解析失败）
+                success = cluster_mgr.add_node(
+                    args.name, args.host, args.user, args.fanse_path,
+                    args.key, args.password, args.port, getattr(args, 'ip', None)
+                )
+                if not success:
+                    return 1
         
         elif args.cluster_command == 'update':
             # 修正：支持更新节点配置（host/user/password/key/port/fanse_path/max_jobs/enabled/work_dir）
@@ -1019,6 +1071,8 @@ def cluster_command(args):
             # 应用变更
             if getattr(args, 'host', None):
                 node.host = args.host; changed.append('host')
+            if getattr(args, 'ip', None):
+                node.ip = args.ip; changed.append('ip')  # 修改：允许更新 IP 字段
             if getattr(args, 'user', None):
                 node.user = args.user; changed.append('user')
             if getattr(args, 'password', None):
@@ -1080,7 +1134,11 @@ def cluster_command(args):
                     cpu = info.get('cpu_usage')
                     mem = info.get('memory_usage')
                     disk = info.get('disk_usage')
-                    address = f"{node.user}@{node.host}:{node.port}"
+                    # 修改：显示连接地址优先使用 IP，并在存在主机名时附加 name 信息
+                    address_host = (node.ip or node.host)
+                    address = f"{node.user}@{address_host}:{node.port}"
+                    if node.ip and node.host and node.ip != node.host:
+                        address += f" (name: {node.host})"
                     path = node.fanse_path if node.fanse_path else '-'
                     auth = '密钥' if node.key_path else '密码'
                     row = [
@@ -1896,13 +1954,14 @@ FANSe3 集群管理工具
     config_parser = cluster_subparsers.add_parser('config',
         help='导入/导出集群配置',
         description='管理集群节点配置文件的导入与导出',
-        epilog='''
-示例:
-  fanse cluster config -e nodes.json       # 导出当前节点配置
-  fanse cluster config -i nodes.json       # 导入节点配置
-  fanse cluster config -i nodes.json --overwrite  # 导入并覆盖同名节点
-        '''
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(config_parser, '''
+[bold]示例:[/bold]
+  fanse cluster config -e nodes.json       [dim]# 导出当前节点配置[/dim]
+  fanse cluster config -i nodes.json       [dim]# 导入节点配置[/dim]
+  fanse cluster config -i nodes.json --overwrite  [dim]# 导入并覆盖同名节点[/dim]
+    ''')
     config_parser.add_argument('-e', '--export-node-list', metavar='FILE', help='导出节点配置到指定JSON文件')
     config_parser.add_argument('-i', '--import-node-list', metavar='FILE', help='从指定JSON文件导入节点配置')
     config_parser.add_argument('--merge', action='store_true', default=True, help='导入时合并现有配置（默认保留原有节点，仅添加新的）')
@@ -1930,31 +1989,33 @@ FANSe3 集群管理工具
 其他选项:
   --port       : SSH端口号（默认: 22）
         ''',
-        epilog='''
-使用示例:
+        formatter_class=CustomHelpFormatter
+    )
+    add_rich_epilog(add_parser, '''
+[bold]使用示例:[/bold]
 
-1. 使用SSH密钥添加节点:
+[cyan]1. 使用SSH密钥添加节点:[/cyan]
    fanse cluster add lab-pc1 192.168.1.100 user /home/user/fanse/FANSe3g.exe --key ~/.ssh/id_rsa
 
-2. 使用密码添加Windows节点:
+[cyan]2. 使用密码添加Windows节点:[/cyan]
    fanse cluster add win-server 192.168.1.101 administrator "C:\\\\Program Files\\\\FANSe3\\\\FANSe3g.exe" --password mypass123
 
-3. 使用非标准端口:
+[cyan]3. 使用非标准端口:[/cyan]
    fanse cluster add remote-server example.com user /opt/fanse/FANSe3g.exe --key ~/.ssh/key --port 2222
 
-验证节点:
+[bold]验证节点:[/bold]
   添加完成后使用以下命令验证:
-  fanse cluster test <节点名称>    # 测试单个节点
-  fanse cluster check            # 检查所有节点状态
-  fanse cluster list             # 列出所有节点信息
-        ''',
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+  fanse cluster test <节点名称>    [dim]# 测试单个节点[/dim]
+  fanse cluster check            [dim]# 检查所有节点状态[/dim]
+  fanse cluster list             [dim]# 列出所有节点信息[/dim]
+    ''')
     
     add_parser.add_argument('name', help='节点唯一标识名称')
     add_parser.add_argument('host', help='远程主机地址（IP或域名）')
     add_parser.add_argument('user', help='SSH登录用户名')
     add_parser.add_argument('--fanse-path', help='远程FANSe3可执行文件完整路径（可选，可后续update再配置）')
+    # 修改：新增 --ip 参数，用于显式指定节点 IP（优先用于连接）。
+    add_parser.add_argument('--ip', help='节点固定 IP（优先用于连接，Linux 下建议设置）')
     
     auth_group = add_parser.add_mutually_exclusive_group()
     auth_group.add_argument('--key', help='SSH私钥文件路径（推荐使用）')
@@ -1967,35 +2028,38 @@ FANSe3 集群管理工具
     remove_parser = cluster_subparsers.add_parser('remove', 
         help='移除集群节点',
         description='从集群中移除指定的节点。',
-        epilog='''
-示例:
-  fanse cluster remove lab-pc1    # 移除名为lab-pc1的节点
-        '''
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(remove_parser, '''
+[bold]示例:[/bold]
+  fanse cluster remove lab-pc1    [dim]# 移除名为lab-pc1的节点[/dim]
+    ''')
     remove_parser.add_argument('name', help='要移除的节点名称')
     
     # 列出节点
     list_parser = cluster_subparsers.add_parser('list', 
         help='列出所有集群节点',
         description='显示当前配置的所有集群节点及其状态信息。',
-        epilog='''
-输出说明:
-  ✅ 节点在线且可访问
-  ❌ 节点离线或无法连接
-        '''
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(list_parser, '''
+[bold]输出说明:[/bold]
+  [green]✅ 节点在线且可访问[/green]
+  [red]❌ 节点离线或无法连接[/red]
+    ''')
     list_parser.add_argument('-t', '--table', action='store_true', help='以表格形式显示（离线缓存）')
     
     # 检查节点
     check_parser = cluster_subparsers.add_parser('check', 
         help='检查所有节点状态',
         description='快速检查所有集群节点的连接状态。',
-        epilog='''
-示例输出:
-  ✅ node1: 在线
-  ❌ node2: 离线（可能网络问题或服务未启动）
-        '''
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(check_parser, '''
+[bold]示例输出:[/bold]
+  [green]✅ node1: 在线[/green]
+  [red]❌ node2: 离线（可能网络问题或服务未启动）[/red]
+    ''')
     check_parser.add_argument('-t', '--table', action='store_true', help='以表格形式显示（实时检测）')
     # 修正：新增实时监控刷新参数
     check_parser.add_argument('-w', '--watch', type=int, default=0, help='持续监控，间隔秒数（1-5）')
@@ -2007,21 +2071,24 @@ FANSe3 集群管理工具
     test_parser = cluster_subparsers.add_parser('test', 
         help='测试节点连接',
         description='测试指定节点的SSH连接和FANSe3路径可访问性。',
-        epilog='''
-示例:
-  fanse cluster test lab-pc1    # 测试lab-pc1节点的连接
-        '''
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(test_parser, '''
+[bold]示例:[/bold]
+  fanse cluster test lab-pc1    [dim]# 测试lab-pc1节点的连接[/dim]
+    ''')
     test_parser.add_argument('name', help='要测试的节点名称')
 
     # 更新节点
     update_parser = cluster_subparsers.add_parser('update',
         help='更新节点配置',
-        description='更新已存在的节点字段（host/user/password/key/port/fanse_path/max_jobs/enabled/work_dir）',
-        epilog='示例: fanse cluster update -n c128 --fanse-path C:\\FANSe3\\FANSe3g.exe --max-jobs 2 --enable'
+        description='更新已存在的节点字段（host/ip/user/password/key/port/fanse_path/max_jobs/enabled/work_dir）',
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(update_parser, '[bold]示例:[/bold] fanse cluster update -n c128 --fanse-path C:\\FANSe3\\FANSe3g.exe --max-jobs 2 --enable')
     update_parser.add_argument('-n', '--name', help='节点名称', required=True)
     update_parser.add_argument('--host', help='主机地址（IP或域名）')
+    update_parser.add_argument('--ip', help='节点固定 IP（优先用于连接）')
     update_parser.add_argument('--user', help='SSH用户名')
     auth_group_u = update_parser.add_mutually_exclusive_group()
     auth_group_u.add_argument('--key', help='SSH私钥文件路径')
@@ -2039,7 +2106,9 @@ FANSe3 集群管理工具
     run_parser = cluster_subparsers.add_parser('run', 
         help='在节点上运行命令（最小版）',
         description='将原 fanse run 参数通过 SSH 在指定节点执行（支持 -i 通配符展开、--jobs 作业文件、-p 自动选择最快N台）',
-        epilog='示例: fanse cluster run -n nodeA -i C\\data\\*.fastq.gz -r C\\ref\\ref.fa -E5 -C20')
+        formatter_class=CustomHelpFormatter,
+    )
+    add_rich_epilog(run_parser, '[bold]示例:[/bold] fanse cluster run -n nodeA -i C\\data\\*.fastq.gz -r C\\ref\\ref.fa -E5 -C20')
     # 修正：统一 -n/--nodes，支持单/多；新增 -p 选择最快N台
     run_parser.add_argument('-n', '--nodes', help='节点名称（单个或逗号分隔多个）')
     run_parser.add_argument('-p', type=int, default=0, help='自动选择响应最快的N台节点')
@@ -2063,8 +2132,9 @@ FANSe3 集群管理工具
     install_parser = cluster_subparsers.add_parser('install',
         help='在节点上安装软件',
         description='在远程节点上安装 Conda 环境和 fansetools',
-        epilog='示例: fanse cluster install -n node1 --conda --fansetools'
+        formatter_class=CustomHelpFormatter,
     )
+    add_rich_epilog(install_parser, '[bold]示例:[/bold] fanse cluster install -n node1 --conda --fansetools')
     install_parser.add_argument('-n', '--nodes', help='节点名称（单个或逗号分隔多个，all表示所有）', required=True)
     install_parser.add_argument('--conda', action='store_true', help='安装 Miniconda')
     install_parser.add_argument('--fansetools', action='store_true', help='安装 fansetools')

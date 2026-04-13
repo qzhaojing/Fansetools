@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 import posixpath
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 
 # 预定义的软件包列表
 REPO_URL = "https://github.com/qzhaojing/Fansetools/wiki"
@@ -750,6 +750,18 @@ def add_install_subparser(subparsers):
         dest='name',
         help='安装后使用的自定义别名（默认用包名）'
     )
+    add_rich_epilog(install_parser, '''
+[bold]示例:[/bold]
+  fanse install samtools     [dim]# 安装 samtools[/dim]
+  fanse install fastqc       [dim]# 安装 fastqc[/dim]
+  fanse install list         [dim]# 列出所有可用软件包[/dim]
+  fanse install https://example.com/tool.zip  [dim]# 从 URL 安装[/dim]
+  fanse install tool.zip -n mytool            [dim]# 从本地文件安装并指定别名[/dim]
+
+[bold]说明:[/bold]
+  支持自动安装常用生物信息学软件 (samtools, bcftools, bwa 等)。
+  自动识别系统平台 (Windows/Linux) 并下载对应版本。
+''')
     install_parser.set_defaults(func=handle_install_command)
     return install_parser
 

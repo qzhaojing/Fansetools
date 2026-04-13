@@ -7,6 +7,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from .utils.path_utils import PathProcessor
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 
 def handle_path_command(args):
     """
@@ -111,9 +112,15 @@ def add_path_subparser(subparsers):
     parser = subparsers.add_parser(
         'path',
         help='测试路径解析与通配符匹配',
-        description='测试路径解析功能，帮助调试通配符和文件查找问题'
+        description='测试路径解析功能，帮助调试通配符和文件查找问题',
+        formatter_class=CustomHelpFormatter
     )
     parser.add_argument('-i', '--input', required=True, help='输入路径模式 (支持通配符 * ?)')
     parser.add_argument('-o', '--output', help='(可选) 测试输出目录，用于预览输出文件路径')
+    add_rich_epilog(parser, '''
+[bold]示例:[/bold]
+  fanse path -i "*.fastq.gz"           [dim]# 查找当前目录下的 fastq.gz 文件[/dim]
+  fanse path -i "data/*.fq" -o out     [dim]# 查找文件并预览输出到 out 目录[/dim]
+''')
     parser.set_defaults(func=handle_path_command)
     return parser

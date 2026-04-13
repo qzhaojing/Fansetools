@@ -4,7 +4,7 @@ import sys
 import subprocess
 from pathlib import Path
 from .bin_utils import bin_manager
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 
 def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None):
     """
@@ -352,39 +352,54 @@ def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, ke
 
 	# fansetools/cli.py
 def add_bam_subparser(subparsers):
-	"""添加精简版bam子命令解析器"""
-	bam_parser = subparsers.add_parser(
-		'bam',
-		help='直接转换FANSe3文件为BAM格式',
-		description='将FANSe3文件直接转换为BAM格式（自动排序和索引）。支持通配符批量处理。',
-		formatter_class=CustomHelpFormatter
-	)
-	
-	bam_parser.add_argument(
-		'-i', '--input', dest='fanse_file', required=True,
-		help='输入FANSe3文件路径 (支持通配符 *.fanse3)'
-	)
-	bam_parser.add_argument(
-		'-r', '--fasta', dest='fasta_path', required=True,
-		help='参考基因组FASTA文件路径'
-	)
-	bam_parser.add_argument(
-		'-o', '--output', dest='output_bam',
-		help='输出BAM文件路径或目录（默认：输入文件同目录，同名.bam）'
-	)
-	bam_parser.add_argument(
-		'--no-sort', action='store_true',
-		help='不排序BAM文件'
-	)
-	bam_parser.add_argument(
-		'--no-index', action='store_true',
-		help='不创建BAM索引'
-	)
+    """添加精简版bam子命令解析器"""
+    bam_parser = subparsers.add_parser(
+        'bam',
+        help='直接转换FANSe3文件为BAM格式',
+        description='将FANSe3文件直接转换为BAM格式（自动排序和索引）。支持通配符批量处理。',
+        formatter_class=CustomHelpFormatter
+    )
+    
+    bam_parser.add_argument(
+        '-i', '--input', dest='fanse_file', required=True,
+        help='输入FANSe3文件路径 (支持通配符 *.fanse3)'
+    )
+    bam_parser.add_argument(
+        '-r', '--fasta', dest='fasta_path', required=True,
+        help='参考基因组FASTA文件路径'
+    )
+    bam_parser.add_argument(
+        '-o', '--output', dest='output_bam',
+        help='输出BAM文件路径或目录（默认：输入文件同目录，同名.bam）'
+    )
+    bam_parser.add_argument(
+        '--no-sort', action='store_true',
+        help='不排序BAM文件'
+    )
+    bam_parser.add_argument(
+        '--no-index', action='store_true',
+        help='不创建BAM索引'
+    )
 
-	bam_parser.add_argument(
-		'-s', '--sam', action='store_true',
-		help='保留中间SAM文件（Windows临时文件模式）'
-	)
+    bam_parser.add_argument(
+        '-s', '--sam', action='store_true',
+        help='保留中间SAM文件（Windows临时文件模式）'
+    )
+    
+    bam_parser.set_defaults(func=bam_command)
 
-	
-	bam_parser.set_defaults(func=bam_command)
+    add_rich_epilog(bam_parser, """
+[bold]功能说明:[/bold]
+  直接将 FANSe3 结果转换为 BAM 文件，无需生成中间的 SAM 文件。
+  自动调用 samtools 进行排序和索引 (需安装 samtools)。
+
+[bold]示例:[/bold]
+  1. 标准转换 (自动排序+索引):
+     [green]fanse bam -i sample.fanse3 -r ref.fa -o sample.bam[/green]
+
+  2. 仅转换不排序:
+     [green]fanse bam -i sample.fanse3 -r ref.fa --no-sort[/green]
+
+  3. 批量处理 (使用通配符):
+     [green]fanse bam -i "*.fanse3" -r ref.fa[/green]
+""")

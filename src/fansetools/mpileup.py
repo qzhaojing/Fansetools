@@ -9,7 +9,7 @@ mpileup.py - FANSe3转mpileup格式模块,暂时无indel处理功能
 """
 
 import argparse
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from typing import Dict, List, Tuple
 from collections import defaultdict
 from .parser import fanse_parser
@@ -33,6 +33,23 @@ def add_mpileup_subparser(subparsers):
     parser.add_argument('--base-qual', type=int, default=30,
                        help='模拟碱基质量分数(默认: 30)')
     parser.set_defaults(func=convert_fanse_to_mpileup)
+
+    add_rich_epilog(parser, """
+[bold]功能说明:[/bold]
+  将 FANSe3 比对结果转换为 mpileup 格式。
+  输出格式兼容 samtools mpileup，可用于后续的变异检测。
+  (目前版本暂不支持 INDEL 处理，仅支持 mismatch)
+
+[bold]示例:[/bold]
+  1. 基本转换:
+     [green]fanse mpileup sample.fanse3 ref.fa -o sample.mpileup[/green]
+
+  2. 设置最小深度阈值:
+     [green]fanse mpileup sample.fanse3 ref.fa --min-depth 10 -o filtered.mpileup[/green]
+
+  3. 管道操作 (直接传递给 bcftools):
+     [green]fanse mpileup sample.fanse3 ref.fa | bcftools call -mv -o variants.vcf[/green]
+""")
 
 def convert_fanse_to_mpileup(args):
     """
