@@ -5,7 +5,7 @@ Support Fanse/unmapped/fasta/fastq to FASTA/FASTQ.
 '''
 import os
 import argparse
-from .utils.rich_help import CustomHelpFormatter
+from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from tqdm import tqdm
 from typing import Optional, Generator, NamedTuple
 # from collections import namedtuple
@@ -87,7 +87,9 @@ def unmap2fasta(input_file: str, output_file: Optional[str] = None) -> str:
     with open(output_file, 'w') as f_out:
         pbar = tqdm(total=total, desc="Converting unmapped to FASTA")
         for record in unmapped_parser(input_file):
-            f_out.write(f">{record.read_id}\n{record.sequence}\n")
+            # 处理零长度reads：即使序列长度为0，也输出完整的FASTA记录
+            sequence = record.sequence if record.sequence else "N"  # 空序列用"N"占位
+            f_out.write(f">{record.read_id}\n{sequence}\n")
             pbar.update(1)
         pbar.close()
 
@@ -106,8 +108,10 @@ def unmap2fastq(input_file: str, output_file: Optional[str] = None) -> str:
     with open(output_file, 'w') as f_out:
         pbar = tqdm(total=total, desc="Converting unmapped to FASTQ")
         for record in unmapped_parser(input_file):
-            qual = 'I' * len(record.sequence)  # Default quality score
-            f_out.write(f"@{record.read_id}\n{record.sequence}\n+\n{qual}\n")
+            # 处理零长度reads：即使序列长度为0，也输出完整的FASTQ记录
+            sequence = record.sequence if record.sequence else "N"  # 空序列用"N"占位
+            qual = 'I' * len(sequence)  # 质量字符串长度必须与序列长度匹配
+            f_out.write(f"@{record.read_id}\n{sequence}\n+\n{qual}\n")
             pbar.update(1)
         pbar.close()
 
@@ -262,3 +266,26 @@ def add_fastx_subparser(subparsers):
                               help='Convert to FASTQ format (for fanse/unmapped)')
 
     parser.set_defaults(func=fastx_command)
+
+    add_rich_epilog(parser, """
+[bold]功能说明:[/bold]
+  处理 FASTA/FASTQ 格式转换和过滤工具。
+  支持从 FANSe3 文件提取序列，或处理 Unmapped reads。
+  支持 FASTA 和 FASTQ 之间的互转。
+
+[bold]模式选择:[/bold]
+  [cyan]--fanse[/cyan]         处理 FANSe3 格式文件 (提取序列)
+  [cyan]--unmapped[/cyan]      处理 Unmapped reads 文件
+  [cyan]--fasta2fastq[/cyan]   将 FASTA 转换为 FASTQ (默认质量值)
+  [cyan]--fastq2fasta[/cyan]   将 FASTQ 转换为 FASTA
+
+[bold]示例:[/bold]
+  1. 从 FANSe3 文件中提取序列为 FASTQ:
+     [green]fanse fastx -i input.fanse3 --fanse --fastq -o output.fq[/green]
+
+  2. 将 FASTQ 转换为 FASTA:
+     [green]fanse fastx -i input.fq --fastq2fasta -o output.fa[/green]
+
+  3. 处理 Unmapped reads 并输出为 FASTA:
+     [green]fanse fastx -i unmapped.txt --unmapped --fasta -o unmapped.fa[/green]
+""")
