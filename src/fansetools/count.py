@@ -15,6 +15,8 @@ fansetools count 组件 - 用于处理fanse3文件的read计数
 
 import argparse
 from .utils.rich_help import CustomHelpFormatter
+# 修正：新增 bisect 支撑 BED 区域的排序区间快速重叠查询
+from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from itertools import chain  # 修正：用于生成器级展开multi2all，避免构建巨大的中间列表
 from fansetools.quant import add_quant_columns, build_length_maps  # 新增：引入统一的定量计算函数
@@ -61,6 +63,98 @@ try:
 except Exception:
     pass
 
+# %% BED 区域计数支持（-b/--bed）
+# 修正：新增 BED 区域加载与区间查询工具函数，用于区域级 read 计数
+
+def _normalize_chrom_name(chrom: str) -> str:
+    """规范化染色体名：统一去除 chr/CHR 前缀后比较，解决 fanse ref_names 与 BED 第一列
+    'chr1' vs '1' 命名不一致的问题（染色体名一致性校验的基础）"""
+    if not chrom:
+        return chrom
+    c = str(chrom).strip()
+    if c.lower().startswith('chr'):
+        c = c[3:]
+    return c
+
+
+def load_bed_regions(bed_path: str):
+    """解析 BED 文件，构建按染色体分组的排序区间数组，供 bisect 快速重叠查询。
+
+    BED 格式（0-based，半开区间 [start, end)）: chrom \\t start \\t end \\t [name] ...
+    自动跳过 track/browser/注释行；name 列缺失时输出阶段回退为 chrom:start-end。
+
+    返回:
+      regions_by_chrom: {规范化染色体名: {'starts': 升序起点列表, 'ends': 终点列表,
+                                           'order_idx': 对应 region_order 下标, 'max_len': int}}
+        - max_len 为该染色体最长区间长度，查询时用于剪枝
+      region_order: [(原始染色体名, start, end, name), ...] 保持 BED 出现顺序，用于输出
+    """
+    regions_by_chrom = {}
+    region_order = []
+    with open(bed_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            # 修正：跳过空行、注释行与 UCSC track/browser 声明行
+            if not line or line.startswith('#') or line.startswith('track') or line.startswith('browser'):
+                continue
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            chrom_raw, start_s, end_s = fields[0], fields[1], fields[2]
+            name = fields[3] if len(fields) >= 4 else ''
+            try:
+                start, end = int(start_s), int(end_s)
+            except ValueError:
+                # 修正：非整数坐标行直接跳过，避免整个文件解析失败
+                continue
+            if end <= start:
+                continue
+            order_idx = len(region_order)
+            region_order.append((chrom_raw, start, end, name))
+            key = _normalize_chrom_name(chrom_raw)
+            entry = regions_by_chrom.get(key)
+            if entry is None:
+                entry = {'starts': [], 'ends': [], 'order_idx': [], 'max_len': 0}
+                regions_by_chrom[key] = entry
+            entry['starts'].append(start)
+            entry['ends'].append(end)
+            entry['order_idx'].append(order_idx)
+            entry['max_len'] = max(entry['max_len'], end - start)
+    # 修正：每条染色体按起点排序，支撑 bisect 查询
+    for entry in regions_by_chrom.values():
+        paired = sorted(zip(entry['starts'], entry['ends'], entry['order_idx']))
+        entry['starts'] = [p[0] for p in paired]
+        entry['ends'] = [p[1] for p in paired]
+        entry['order_idx'] = [p[2] for p in paired]
+    return regions_by_chrom, region_order
+
+
+def query_bed_hits(regions_by_chrom, chrom: str, start: int, end: int):
+    """查询 [start, end) 与 BED 区域的全部重叠命中，返回命中的 region_order 下标列表。
+
+    重叠定义与 featureCounts 默认语义对齐：两区间存在任一重叠即命中
+    （BED 区间 [bs,be) 与查询 [qs,qe) 满足 bs < qe 且 be > qs）。
+    算法：bisect 定位 start < qe 的右边界，再向左扫描并用 max_len 剪枝。
+    """
+    entry = regions_by_chrom.get(chrom)
+    if entry is None:
+        return []
+    starts = entry['starts']
+    ends = entry['ends']
+    order_idx = entry['order_idx']
+    max_len = entry['max_len']
+    # 修正：bed 区间起点 start < qe 等价于 start <= qe-1，故用 bisect_right(starts, end-1)
+    hi = bisect_right(starts, end - 1)
+    lo_limit = start - max_len  # 起点比这更小的区间（长度<=max_len）不可能与查询重叠
+    hits = []
+    i = hi - 1
+    while i >= 0 and starts[i] > lo_limit:
+        if ends[i] > start:
+            hits.append(order_idx[i])
+        i -= 1
+    return hits
+
+
 # %% ParallelFanseCounter
 
 # Global variable for worker process annotation cache
@@ -95,7 +189,9 @@ def process_single_file_task(task):
             length_mode_isoform=task.get('length_mode_isoform', 'txLength'),
             batch_size=task.get('batch_size', None),
             quant=task.get('quant', 'none'),
-            engine=task.get('engine', 'auto')
+            engine=task.get('engine', 'auto'),
+            # 新增：BED 区域计数参数透传（-b/--bed）
+            bed_file=task.get('bed_file', None)
         )
 
         result = counter.run()
@@ -116,7 +212,7 @@ class ParallelFanseCounter:
         if self.verbose:
             self.console.print(f"初始化并行处理器: {self.max_workers} 个进程")
 
-    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none', engine='auto', export_format='rsem', export_count_type='Final_EM'):
+    def process_files_parallel(self, file_list, output_base_dir, gxf_file=None, level='gene', paired_end=None, annotation_df=None, length_mode_gene=None, length_mode_isoform='txLength', verbose=False, batch_size=None, quant='none', engine='auto', export_format='rsem', export_count_type='Final_EM', bed_file=None):
         """并行处理多个文件（仅显示正在运行的任务）"""
         if verbose:
             self.console.print(f" 开始并行处理 {len(file_list)} 个文件，使用 {self.max_workers} 个进程")
@@ -140,7 +236,9 @@ class ParallelFanseCounter:
                 'quant': quant,
                 'engine': engine,
                 'format': export_format,
-                'count_type': export_count_type
+                'count_type': export_count_type,
+                # 新增：BED 区域计数参数写入 task dict，随任务分发到工作进程
+                'bed_file': bed_file
             }
             tasks.append(task)
 
@@ -230,7 +328,9 @@ class ParallelFanseCounter:
                 batch_size=task.get('batch_size', None),
                 # 修正：并行路径中追加定量参数
                 quant=task.get('quant', 'none'),
-                engine=task.get('engine', 'auto')
+                engine=task.get('engine', 'auto'),
+                # 新增：BED 区域计数参数透传（-b/--bed），保持与 process_single_file_task 一致
+                bed_file=task.get('bed_file', None)
             )
 
             # 运行计数处理
@@ -304,6 +404,11 @@ def count_main_parallel(args):
                 output_files_to_check.append(
                     individual_output_dir / f"{file_stem}.gene_level_multi.csv")
 
+            # 新增：BED 区域计数文件也纳入断点续传检查，避免"已跑完但缺 region 文件"被误判为完成
+            if getattr(args, 'bed', None):
+                output_files_to_check.append(
+                    individual_output_dir / f"{file_stem}.region_level_counts.csv")
+
             # 检查文件是否存在，都存在才算运行完。有一个不再都算没运行完，然后重新跑一次
             all_files_exist = all(f.exists() for f in output_files_to_check)
 
@@ -354,7 +459,9 @@ def count_main_parallel(args):
             quant=getattr(args, 'quant', 'none'),
             engine=getattr(args, 'engine', 'auto'),
             export_format=getattr(args, 'format', 'salmon'),
-            export_count_type=getattr(args, 'count_type', 'Final_EM')
+            export_count_type=getattr(args, 'count_type', 'Final_EM'),
+            # 新增：BED 区域计数参数透传（-b/--bed）
+            bed_file=getattr(args, 'bed', None)
         )
 
         duration = time.time() - start_time
@@ -445,6 +552,11 @@ def count_main_serial(args, progress=None, task_id=None):
                     output_files_to_check.append(
                         output_dir / f"{input_stem}.counts_gene_level_multi.csv")
 
+                # 新增：BED 区域计数文件也纳入断点续传检查，避免"已跑完但缺 region 文件"被误判为完成
+                if getattr(args, 'bed', None):
+                    output_files_to_check.append(
+                        output_dir / f"{input_stem}.region_level_counts.csv")
+
                 all_files_exist = all(f.exists()
                                       for f in output_files_to_check)
                 if all_files_exist:
@@ -500,7 +612,9 @@ def count_main_serial(args, progress=None, task_id=None):
                     length_mode_isoform=getattr(args, 'len_isoform', 'txLength'),
                     batch_size=getattr(args, 'batch_size', None),
                     quant=getattr(args, 'quant', 'none'),
-                    engine=getattr(args, 'engine', 'auto')
+                    engine=getattr(args, 'engine', 'auto'),
+                    # 新增：BED 区域计数参数透传（-b/--bed）
+                    bed_file=getattr(args, 'bed', None)
                 )
                 count_files = counter.run()
                 if getattr(args, 'verbose', False):
@@ -579,6 +693,10 @@ def count_main(args, progress=None, task_id=None):
                     cmd_parts.extend(["--quant", args.quant])
                 if getattr(args, 'engine', None):
                     cmd_parts.extend(["--engine", args.engine])
+
+                # 新增：BED 区域计数参数透传（-b/--bed），集群节点使用绝对路径
+                if getattr(args, 'bed', None):
+                    cmd_parts.extend(["--bed", f'"{os.path.abspath(args.bed)}"'])
                 
                 # 本地写入模式
                 if getattr(args, 'local', False):
@@ -630,7 +748,8 @@ class FanseCounter:
                  batch_size=None,  # 新增：批处理大小参数，允许用户通过CLI控制
                  quant='none',     # 新增：定量方法选择（none/tpm/rpkm/both），用于在唯一文件中追加TPM/RPKM
                  engine='auto',    # 新增：解析引擎选择（auto/python/rust），auto优先使用Rust
-                 local_mode=False  # 新增：本地写入优化模式
+                 local_mode=False,  # 新增：本地写入优化模式
+                 bed_file=None      # 新增：BED 区域文件（-b/--bed），提供时额外输出区域级计数
                  ):
 
         # 添加计数类型前缀
@@ -697,6 +816,24 @@ class FanseCounter:
         # 新增：解析引擎选择
         self.engine = engine if engine in ('auto','python','rust') else 'auto'
         self.console = Console(force_terminal=True)
+
+        # 新增：BED 区域计数支持（-b/--bed）
+        # 解析 BED → 按染色体建排序区间数组 + bisect 重叠查询；文件缺失时警告并禁用区域计数
+        self.bed_file = Path(bed_file) if bed_file else None
+        self.bed_regions = None        # {规范化染色体名: 排序区间数组}
+        self.bed_region_order = []     # [(原始染色体名, start, end, name)] 保持 BED 行序，用于输出
+        self.region_counts = None      # 区域计数结果 {'raw'/'unique'/'firstID'/'multi'/'multi2all': [int]}
+        self._bed_unknown_chroms = set()  # fanse 中出现但 BED 未覆盖的染色体（一次性 warning 用）
+        if self.bed_file is not None:
+            if self.bed_file.exists():
+                self.bed_regions, self.bed_region_order = load_bed_regions(str(self.bed_file))
+                if self.verbose:
+                    self.console.print(f"BED区域文件已加载: {self.bed_file} ({len(self.bed_region_order)} 个区域, "
+                                       f"{len(self.bed_regions)} 条染色体)")
+            else:
+                # 修正：BED 文件不存在时给出明确错误提示并禁用区域计数，避免运行中途崩溃
+                self.console.print(f"[bold red]BED文件不存在: {self.bed_file}，将忽略区域计数[/bold red]")
+                self.bed_file = None
 
         # # 存储计数结果
         # self.counts_data = {}
@@ -805,6 +942,17 @@ class FanseCounter:
         firstID  = counts_data[f'{self.isoform_prefix}firstID']
         multi2all= counts_data[f'{self.isoform_prefix}multi2all']
 
+        # 新增：BED 区域计数器初始化（-b/--bed 启用时）；固定 raw/unique/firstID/multi/multi2all
+        region_hits = None
+        if self.bed_regions and self.bed_region_order:
+            region_hits = {
+                'raw': [0] * len(self.bed_region_order),
+                'unique': [0] * len(self.bed_region_order),
+                'firstID': [0] * len(self.bed_region_order),
+                'multi': [0] * len(self.bed_region_order),
+                'multi2all': [0] * len(self.bed_region_order),
+            }
+
         FANSE_EXTS = {'.fanse3','.fanse','.fanse3.zip', '.fanse3.gz'}
         candidate_files = [self.input_file]
         
@@ -836,7 +984,9 @@ class FanseCounter:
                 continue
 
             # 优先尝试 Rust 引擎（若启用且可用），一次性解析并返回计数；失败则回退Python
-            if self.engine in ('rust','auto') and rust_fastcount_available() and parse_and_count_rust:
+            # 修正：BED 区域计数需要逐条读取记录坐标（positions），Rust 引擎暂不支持，
+            #       启用 -b/--bed 时强制回退 Python 解析路径
+            if (self.engine in ('rust','auto')) and not region_hits and rust_fastcount_available() and parse_and_count_rust:
                 try:
                     if self.verbose:
                         print("Using Rust fastcount engine")
@@ -881,6 +1031,9 @@ class FanseCounter:
                         batch.append(record)
                         if len(batch) >= batch_size:
                             self._fast_batch_process(batch, raw, multi, unique, firstID, multi2all)
+                            # 新增：BED 区域计数与转录本计数共用同一批记录，避免二次遍历
+                            if region_hits is not None:
+                                self._region_count_batch(batch, region_hits)
                             batch = []
 
                         update_counter += 1
@@ -904,6 +1057,9 @@ class FanseCounter:
 
                 if batch:
                     self._fast_batch_process(batch, raw, multi, unique, firstID, multi2all)
+                    # 新增：尾部不足一批的记录同样执行 BED 区域计数
+                    if region_hits is not None:
+                        self._region_count_batch(batch, region_hits)
 
             except Exception as e:
                 print(f"Error: {e}")
@@ -913,6 +1069,14 @@ class FanseCounter:
         if self.verbose:
             print(
                 f" Completed: {total_count} records in {duration:.2f}s ({total_count/duration:.0f} rec/sec)")
+
+        # 新增：保存 BED 区域计数结果；对 fanse 中出现但 BED 未覆盖的染色体给出一次性 warning
+        self.region_counts = region_hits
+        if region_hits is not None and self._bed_unknown_chroms:
+            sample = ', '.join(sorted(self._bed_unknown_chroms)[:10])
+            self.console.print(
+                f"[bold yellow]warning: {len(self._bed_unknown_chroms)} 条染色体未在 BED 文件中定义"
+                f"（其 reads 不参与区域计数）: {sample}[/bold yellow]")
 
         return counts_data, total_count
 
@@ -974,6 +1138,75 @@ class FanseCounter:
             multi.update(multi_joined_to_add)
         if multi2all_ids_to_add:
             multi2all.update(multi2all_ids_to_add)
+
+    # 新增：BED 区域批量计数（-b/--bed 启用时由 parse 主循环按批调用）
+    def _region_count_batch(self, batch, region_hits):
+        """
+        批量处理 BED 区域级计数。
+
+        重叠定义：与 featureCounts 默认语义对齐——read 区间
+        [positions[i], positions[i]+len(seq)) 与 BED 区域 [start, end) 存在任一重叠即命中。
+
+        计数类型（固定输出，不跟随 -c/--count-type）:
+          raw      : 任一比对位置命中该区域的 reads 各计 1（无论唯一/多重，每条 read 每区域最多 1）
+          unique   : 唯一比对 reads 命中该区域计 1
+          firstID  : 首个比对位置命中该区域计 1
+          multi    : 多重比对 reads 至少一个比对位置命中该区域计 1（multimapping reads 报告）
+          multi2all: 每个命中（比对位置 × 区域）均累加 1（多重比对完全展开）
+
+        参数
+        ----
+        batch : list[FANSeRecord]
+            待处理的一批记录（与 _fast_batch_process 共用同一批，避免二次遍历文件）。
+        region_hits : dict[str, list[int]]
+            各计数类型对应的区域计数数组，下标与 self.bed_region_order 对齐。
+        """
+        raw_r = region_hits['raw']
+        unique_r = region_hits['unique']
+        first_r = region_hits['firstID']
+        multi_r = region_hits['multi']
+        all_r = region_hits['multi2all']
+        bed_regions = self.bed_regions
+
+        for record in batch:
+            names = record.ref_names
+            if not names:
+                continue
+            # 修正：read 跨度按序列长度推算；序列缺失时退化为单碱基，避免除零/负长度
+            read_len = len(record.seq) if record.seq else 1
+            is_multi_read = record.is_multi
+            raw_flag = set()    # 本条 read 命中且需计入 raw 的区域（每 read 每区域最多 1）
+            multi_flag = set()  # 本条多重比对 read 命中的区域
+            for i, name in enumerate(names):
+                start = record.positions[i] if i < len(record.positions) else None
+                # 修正：坐标异常（缺失/负值）时跳过该比对，防止误命中
+                if start is None or start < 0:
+                    continue
+                # 修正：染色体名规范化后再查询，兼容 fanse 'chr1' vs BED '1' 命名差异
+                chrom_key = _normalize_chrom_name(name)
+                hits = query_bed_hits(bed_regions, chrom_key, start, start + read_len)
+                # 修正：仅当 BED 中完全没有该染色体时才记为未知；有染色体但无重叠属正常情况
+                if chrom_key not in bed_regions:
+                    self._bed_unknown_chroms.add(chrom_key)
+                if not hits:
+                    continue
+                for r in hits:
+                    all_r[r] += 1          # multi2all：每个比对命中都累计
+                if i == 0:
+                    for r in hits:
+                        first_r[r] += 1    # firstID：仅首个比对位置
+                if is_multi_read:
+                    multi_flag.update(hits)
+                else:
+                    for r in hits:
+                        unique_r[r] += 1   # unique：唯一比对直接计入
+                        raw_flag.add(r)
+            # 修正：多重比对 read 的 multi/raw 每区域只计 1，避免同 read 多位置重复累加
+            for r in multi_flag:
+                multi_r[r] += 1
+                raw_flag.add(r)
+            for r in raw_flag:
+                raw_r[r] += 1
 
         # # 修正：使用生成器进行Counter.update，避免构建巨大中间列表导致的内存压力与GC抖动
         # # 说明：保持“每批每类型1次update”的策略，同时用生成器表达式与chain展开multi2all
@@ -2729,6 +2962,38 @@ class FanseCounter:
 
         return multi_filename
 
+    # 新增：BED 区域计数文件输出（-b/--bed 启用时调用）
+    def _generate_region_level_counts(self, base_name):
+        """输出 BED 区域级计数文件 {base_name}.region_level_counts.csv。
+
+        每行一个 BED 区域（保持 BED 文件行序），计数类型固定为
+        raw/unique/firstID/multi/multi2all（不跟随 -c/--count-type，
+        因为 Final_EM 等依赖转录本层面的分配结果，对任意基因组区域无意义）。
+        name 列缺失时 Region 列回退为 chrom:start-end。
+        """
+        region_hits = self.region_counts
+        if not region_hits or not self.bed_region_order:
+            return None
+        rows = []
+        for idx, (chrom, start, end, name) in enumerate(self.bed_region_order):
+            rows.append({
+                'Region': name if name else f'{chrom}:{start}-{end}',
+                'Chrom': chrom,
+                'Start': start,
+                'End': end,
+                'raw': region_hits['raw'][idx],
+                'unique': region_hits['unique'][idx],
+                'firstID': region_hits['firstID'][idx],
+                'multi': region_hits['multi'][idx],
+                'multi2all': region_hits['multi2all'][idx],
+            })
+        out_df = pd.DataFrame(rows)
+        out_path = self.output_dir / f'{base_name}.region_level_counts.csv'
+        out_df.to_csv(out_path, index=False)
+        if self.verbose:
+            self.console.print(f"区域计数文件生成完成: {out_path}")
+        return out_path
+
     def generate_count_files(self):
         """
         生成isoform 和 gene level 计数文件
@@ -2898,6 +3163,15 @@ class FanseCounter:
         except Exception as e:
             if self.verbose:
                 self.console.print(f"生成多映射信息文件失败: {e}")
+
+        # 新增：BED 区域计数文件输出（-b/--bed 启用时），独立于 -c/-f 的导出体系
+        if self.bed_file is not None:
+            try:
+                region_file = self._generate_region_level_counts(base_name)
+                if region_file:
+                    count_files['region_counts'] = region_file
+            except Exception as e:
+                self.console.print(f"[bold red]区域计数文件生成失败: {e}[/bold red]")
 
         return count_files
 ##########################################################################################
@@ -3239,6 +3513,9 @@ def add_count_subparser(subparsers):
 [bold cyan]处理中断后重新运行:[/bold cyan] [dim]（自动跳过已处理的文件）[/dim]
   fanse count -i *.fanse3 -o results/ --gxf annotation.gtf --resume
 
+[bold cyan]BED 区域计数:[/bold cyan] [dim]（额外输出 {stem}.region_level_counts.csv，计数类型固定为 raw/unique/firstID/multi/multi2all）[/dim]
+  fanse count -i sample.fanse3 -o results/ -b regions.bed
+
 [dim]# 指定4个并行进程，展示总体运行进度和简易进度条[/dim]
   fanse count -i "*.fanse3" -o results --gxf annotation.gtf --p 4
 
@@ -3288,6 +3565,15 @@ def add_count_subparser(subparsers):
                         help='输出常见定量格式选择，默认salmon')
     parser.add_argument('-c', '--count-type', choices=['raw','unique','firstID','Final_EM','Final_EQ','Final_MA','all'], default='Final_EM',
                         help="定量文件中用作计数与TPM计算的计数类型；选择'all'时为每种计数类型分别导出定量文件")
+
+    # 新增：BED 区域计数参数（-b/--bed），指定后额外输出区域级计数文件
+    parser.add_argument('-b', '--bed', required=False,
+                        help='BED区域文件路径（可选）：每行一个区域 chrom<TAB>start<TAB>end<TAB>[name]，'
+                             '0-based坐标，支持任意多区域；提供后额外输出 {stem}.region_level_counts.csv。'
+                             '计数类型固定为 raw/unique/firstID/multi/multi2all（不跟随 -c，'
+                             'multi与multi2all用于报告multimapping reads）；'
+                             '重叠判定与featureCounts默认语义一致（read区间与区域任一重叠即命中）；'
+                             '启用时解析自动回退Python引擎（Rust引擎暂不支持区域计数）')
 
     # 长度指标选择：兼容旧参数 + 新增分别指定 isoform/gene
     parser.add_argument('--len', dest='len',
