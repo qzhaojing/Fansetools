@@ -890,7 +890,10 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
         
         else:
             # 单线程处理
-            batch_size = 200_000
+            # 修正：写批次从 200_000 降到 20_000。multi-mapping 重的文件单条可产出
+            # ~23KB SAM 文本（如 48 个比对位置全展开），200k 条/批内存峰值可达数 GB
+            # 直接 MemoryError；20k 条/批峰值仅数百 MB，写盘频率增加对性能影响可忽略
+            batch_size = 20_000
             batch_count = 0
             batch_lines = []
             filtered_count = 0

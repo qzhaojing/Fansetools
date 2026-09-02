@@ -41,6 +41,12 @@ def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None):
     cmd = ['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path)]
     if ref_info_json:
         cmd.extend(['--ref-info-json', str(ref_info_json)])
+    # 修正：强制 -t 1（单线程流式输出）。
+    # fanse sam 默认 -t 4 会启用 multiprocessing Pool 并按 20000 条/批 pickle 结果，
+    # 对 multi-mapping 重的文件（实测 280k 条记录产出 6.5GB SAM，约 23KB/条）单批可达
+    # 数百 MB，4 个 worker + 队列积压直接 MemoryError（见 *.bam_conv.log）。
+    # 管道模式下下游 samtools view/sort 才是真正的并行主力，上游流式单线程最稳。
+    cmd.extend(['-t', '1'])
     return cmd
 
 def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None):
