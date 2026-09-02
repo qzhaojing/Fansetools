@@ -350,6 +350,64 @@ def handle_parser_command(args):
         print(f"Error: {e}")
         return 1
 
+
+def run_sam_command(args):
+    """处理 sam 命令"""
+    from rich.console import Console
+    from .utils.file_processor import FileProcessor
+    console = Console(force_terminal=True)
+    processor = FileProcessor()
+
+    # 解析输入文件
+    try:
+        input_files = processor.parse_input_paths(args.fanse_file, ['.fanse3', '.fanse', '.fanse3.gz', '.fanse.gz'])
+    except Exception as e:
+        console.print(f"[bold red]错误: 解析输入文件失败 - {e}[/bold red]")
+        sys.exit(1)
+
+    # 检查是否启用了双端模式
+    is_paired_end = getattr(args, 'is_paired_end', False)
+    unmapped_file_path = None
+
+    if is_paired_end:
+        if len(input_files) > 1:
+            console.print("[bold red]错误: 双端模式下，一次只能处理一个FANSe文件。[/bold red]")
+            sys.exit(1)
+        
+        base_file = Path(input_files[0])
+        # 尝试从.fanse3或.fanse文件中推断.unmapped文件
+        # 移除所有后缀，然后添加.unmapped
+        stem = base_file.stem
+        if stem.endswith('.fanse3') or stem.endswith('.fanse'):
+            stem = Path(stem).stem # Remove .fanse3 or .fanse
+        unmapped_file_path = base_file.parent / (stem + '.unmapped')
+
+        if not unmapped_file_path.exists():
+            console.print(f"[bold yellow]警告: 启用了双端模式，但未找到对应的 .unmapped 文件: {unmapped_file_path}[/bold yellow]")
+            console.print("[bold yellow]将以单端模式处理。[/bold yellow]")
+            is_paired_end = False # 回退到单端模式
+        else:
+            console.print(f"[bold green]双端模式已启用。将合并处理文件: {input_files[0]} 和 {unmapped_file_path}[/bold green]")
+
+    # 导入sam模块
+    from . import sam
+
+    for fanse_file in input_files:
+        try:
+            sam.fanse2sam(
+                fanse_file=fanse_file,
+                fasta_path=args.fasta_path,
+                output_sam=args.output,
+                region=args.region,
+                console=console,
+                threads=args.threads,
+                unmapped_file=unmapped_file_path if is_paired_end else None, # 只有在双端模式下才传递unmapped_file
+                is_paired_end=is_paired_end # 传递is_paired_end标志
+            )
+        except Exception as e:
+            console.print(f"[bold red]错误: 处理文件 {fanse_file} 失败 - {e}[/bold red]")
+            sys.exit(1)
+
 def create_parser():
     """创建主解析器"""
     # 延迟导入子命令模块
@@ -421,8 +479,9 @@ def create_parser():
     # 子命令：trim
     add_trim_subparser(subparsers)
     
-    # 子命令：sam
+    # 子命令：sam（参数在 sam.py::add_sam_subparser 中统一定义，避免重复注册冲突）
     add_sam_subparser(subparsers)
+
 
     # 子命令：bam
     add_bam_subparser(subparsers)

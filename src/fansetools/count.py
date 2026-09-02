@@ -1206,11 +1206,18 @@ class FanseCounter:
         total_rpk = 0
 
         for transcript, count in unique_counts.items():
-            if transcript in lengths and lengths[transcript] > 0:
-                length_kb = lengths[transcript] / 1000
-                rpk = count / length_kb
-                rpk_values[transcript] = rpk
-                total_rpk += rpk  # 计算总rpk
+            if transcript in lengths:
+                # 安全转换为数值类型
+                try:
+                    length_val = float(lengths[transcript])
+                    if length_val > 0:
+                        length_kb = length_val / 1000
+                        rpk = count / length_kb
+                        rpk_values[transcript] = rpk
+                        total_rpk += rpk  # 计算总rpk
+                except (ValueError, TypeError):
+                    # 忽略无法转换为数值的长度值
+                    continue
 
         # 计算TPM (Transcripts Per Million)
         tpm_values = {}
@@ -1274,6 +1281,13 @@ class FanseCounter:
         if df is None or df.empty:
             return {}
 
+        # 安全转换函数
+        def _safe_float(x, default=0.0):
+            try:
+                return float(x)
+            except (ValueError, TypeError):
+                return default
+
         if prefix == self.isoform_prefix:
             # 修正：支持 isoform 层长度选择（txLength/cdsLength/isoformEffectiveLength）
             id_col = 'txname' if 'txname' in df.columns else None
@@ -1288,7 +1302,7 @@ class FanseCounter:
                     break
             if not selected:
                 return {}
-            return dict(zip(df[id_col], df[selected]))
+            return {k: _safe_float(v) for k, v in zip(df[id_col], df[selected])}
 
         # gene level
         id_col = 'geneName' if 'geneName' in df.columns else None
@@ -1309,19 +1323,19 @@ class FanseCounter:
             if 'txLength' in df.columns:
                 if self.verbose:
                     self.console.print(f"[len] 未找到列 {mode_gene} ，回退为按 txLength 聚合的基因最长转录本长度")
-                return df.groupby(id_col)['txLength'].max().to_dict()
+                return {k: _safe_float(v) for k, v in df.groupby(id_col)['txLength'].max().items()}
             return {}
 
         # gene 层面长度字典：若 selected 是转录本列需聚合
         if selected == 'txLength':
             if self.verbose:
                 self.console.print(f"[len] 选择 txLength，按基因聚合为最长转录本长度用于归一化")
-            return df.groupby(id_col)['txLength'].max().to_dict()
+            return {k: _safe_float(v) for k, v in df.groupby(id_col)['txLength'].max().items()}
         if selected == 'genelongestcdsLength':
-            return df.groupby(id_col)['genelongestcdsLength'].max().to_dict()
+            return {k: _safe_float(v) for k, v in df.groupby(id_col)['genelongestcdsLength'].max().items()}
         if self.verbose:
             self.console.print(f"[len] 使用列 {selected} 作为 {prefix} 层面的长度指标")
-        return df.groupby(id_col)[selected].max().to_dict()
+        return {k: _safe_float(v) for k, v in df.groupby(id_col)[selected].max().items()}
 
     def generate_isoform_level_counts(self, counts_data, total_count):
         """

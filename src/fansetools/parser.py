@@ -16,11 +16,50 @@ import subprocess
 import shutil
 # import os
 from dataclasses import dataclass
-from typing import List, Generator
-# from typing import List, Generator, Deque
-# from collections import deque
-# from tqdm import tqdm
+from typing import List, Generator, Optional, Tuple
+import re
+import sys
+import os
+import io
+import gzip
+import zipfile
+import subprocess
+import shutil
 
+# 定义一个正则表达式来匹配常见的R1/R2后缀
+# 例如：/1, /2, 1:N:0:..., 2:N:0:...
+_READ_PAIR_SUFFIX_PATTERN = re.compile(r'(/1$|/2$|\s1:N:0:.*$|\s2:N:0:.*$)')
+
+def _standardize_read_name(read_id: str) -> Tuple[str, Optional[bool], Optional[bool]]:
+    """
+    标准化read name，去除R1/R2后缀，并判断是否为R1或R2。
+
+    参数:
+        read_id: 原始的read name字符串。
+
+    返回:
+        一个元组 (standardized_id, is_first_in_pair, is_second_in_pair)。
+        standardized_id: 去除R1/R2后缀后的read name。
+        is_first_in_pair: 如果是R1，则为True；否则为False或None。
+        is_second_in_pair: 如果是R2，则为True；否则为False或None。
+    """
+    is_first = None
+    is_second = None
+    
+    match = _READ_PAIR_SUFFIX_PATTERN.search(read_id)
+    if match:
+        suffix = match.group(0)
+        standardized_id = read_id[:match.start()]
+        if suffix.startswith('/1') or suffix.startswith(' 1:'):
+            is_first = True
+            is_second = False
+        elif suffix.startswith('/2') or suffix.startswith(' 2:'):
+            is_first = False
+            is_second = True
+    else:
+        standardized_id = read_id
+    
+    return standardized_id, is_first, is_second
 
 @dataclass(slots=True)
 class FANSeRecord:
@@ -28,8 +67,6 @@ class FANSeRecord:
     存储FANSe3单条记录的类
     使用slots减少内存开销
     """
-    # 修正：启用 dataclass(slots=True) 以降低每条记录的对象开销，减少内存占用并提升大批处理时的缓存友好性
-    
     header: str               # Read名称
     seq: str                  # Read序列
     alignment: str = ''       # 比对结果(可选)
@@ -38,9 +75,16 @@ class FANSeRecord:
     mismatches: List[int] = None  # 错配数列表
     positions: List[int] = None  # 起始位置列表(0-based)
     multi_count: int = 0      # multi-mapping次数
+    
+    # 新增字段，用于双端和SAM FLAG处理
+    is_mapped: bool = True                     # 当前read是否比对成功
+    is_first_in_pair: Optional[bool] = None    # 是否为R1
+    is_second_in_pair: Optional[bool] = None   # 是否为R2
+    flag: int = 0                              # SAM FLAG (内部使用，由sam.py计算)
+    read_pair_id: Optional[str] = None         # 标准化后的read name，用于配对
 
     def __post_init__(self):
-        """初始化后处理，确保列表类型字段不为None"""
+        """初始化后处理，确保列表类型字段不为None，并标准化read name"""
         if self.strands is None:
             self.strands = []
         if self.ref_names is None:
@@ -49,6 +93,13 @@ class FANSeRecord:
             self.mismatches = []
         if self.positions is None:
             self.positions = []
+        
+        # 标准化read name并填充新字段
+        if self.header:
+            self.read_pair_id, self.is_first_in_pair, self.is_second_in_pair = _standardize_read_name(self.header)
+        else:
+            self.read_pair_id = None
+
 
     def __str__(self):
         """自定义__str__方法，确保ref_names元组转换为逗号分隔的字符串"""
@@ -359,15 +410,15 @@ class UnmappedRecord:
     sequence: str
 
 
-def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
+def unmapped_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     """
-    解析未比对reads文件
+    解析未比对reads文件，并将其转换为FANSeRecord格式。
 
     参数:
-        file_path: 输入文件路径（制表符分隔的read_id和序列）
+        file_path: 输入文件路径（制表符分隔的read_id和序列，或每行一个read_id）
 
     返回:
-        生成器，每次yield一个UnmappedRecord对象
+        生成器，每次yield一个FANSeRecord对象
     """
     with open(file_path, 'r') as f:
         for line in f:
@@ -376,12 +427,28 @@ def unmapped_parser(file_path: str) -> Generator[UnmappedRecord, None, None]:
                 continue
 
             parts = line.split('\t')
+            read_id = ""
+            sequence = ""
+
             if len(parts) >= 2:
-                # 如果有制表符且至少两部分，按 read_id\tsequence 解析
-                yield UnmappedRecord(read_id=parts[0], sequence=parts[1])
+                read_id = parts[0]
+                sequence = parts[1]
             else:
-                # 如果没有制表符，则认为整行是 read_id，序列为空
-                yield UnmappedRecord(read_id=line, sequence="")
+                read_id = line
+                sequence = "" # 序列为空
+
+            # 创建FANSeRecord，标记为未比对
+            yield FANSeRecord(
+                header=read_id,
+                seq=sequence,
+                alignment='',
+                strands=[],
+                ref_names=[], # 未比对，参考序列名为空
+                mismatches=[],
+                positions=[],
+                multi_count=0,
+                is_mapped=False # 明确标记为未比对
+            )
 
 
 if __name__ == "__main__":

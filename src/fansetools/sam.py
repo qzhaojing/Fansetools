@@ -48,19 +48,38 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Pool
 from tqdm import tqdm
 from typing import Generator, Optional, Dict, Tuple, Iterator, Set, List
-from .parser import FANSeRecord, fanse_parser, fanse_parser_high_performance, fanse_line_reader, parse_records_from_lines
+from .parser import FANSeRecord, fanse_parser, fanse_parser_high_performance, fanse_line_reader, parse_records_from_lines, unmapped_parser
 from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
 from .utils.path_utils import PathProcessor
 from rich.console import Console
 import pathlib
+import subprocess # 导入subprocess模块
+
+def _merge_fanse_and_unmapped_records(fanse_file: str, unmapped_file: str) -> Generator[FANSeRecord, None, None]:
+    """
+    合并FANSe3文件和unmapped文件中的记录，生成统一的FANSeRecord流。
+
+    参数:
+        fanse_file: FANSe3文件路径。
+        unmapped_file: unmapped文件路径。
+
+    返回:
+        生成器，每次yield一个FANSeRecord对象。
+    """
+    # 从FANSe3文件解析记录
+    for record in fanse_parser(fanse_file):
+        yield record
+    
+    # 从unmapped文件解析记录
+    for record in unmapped_parser(unmapped_file):
+        yield record
 
 # 预编译转换表（全局变量）
 _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
 
 def _worker_process_batch(records: List[FANSeRecord], regions: Optional[Dict] = None) -> List[str]:
     """
-    Worker function for parallel processing of FANSe records.
-    (Kept for compatibility if needed, but new implementation uses _worker_process_lines)
+    Worker function for parallel processing of FANSe records in batches.
     """
     results = []
     for record in records:
@@ -69,29 +88,28 @@ def _worker_process_batch(records: List[FANSeRecord], regions: Optional[Dict] = 
         results.extend(fanse_to_sam_type(record))
     return results
 
+def _worker_process_records(records: List[FANSeRecord], regions: Optional[Dict] = None) -> List[str]:
     """
-    Worker function for parallel processing of FANSe records.
-    (Kept for compatibility if needed, but new implementation uses _worker_process_lines)
+    兼容并行分支调用名称，实际复用批处理逻辑。
+    修正意图：避免 threads>1 时出现 NameError: _worker_process_records 未定义。
     """
-    results = []
-    for record in records:
-        if regions and not is_record_in_region(record, regions):
-            continue
-        results.extend(fanse_to_sam_type(record))
-    return results
+    return _worker_process_batch(records, regions=regions)
 
-def _worker_process_lines(lines: List[str], regions: Optional[Dict] = None) -> List[str]:
+def _iter_record_batches(record_generator, batch_size: int):
     """
-    Worker function that parses raw lines and converts to SAM format.
-    Reduces main process overhead and pickling costs.
+    按批次惰性切分记录，避免对超大输入一次性 list() 带来的内存压力。
+    修正意图：替代原先 list(record_generator) 的重复构造。
     """
-    results = []
-    # Parse records from raw lines inside the worker process
-    for record in parse_records_from_lines(lines):
-        if regions and not is_record_in_region(record, regions):
-            continue
-        results.extend(fanse_to_sam_type(record))
-    return results
+    batch = []
+    for record in record_generator:
+        batch.append(record)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 
 def reverse_complement(seq: str) -> str:
     """优化反向互补：使用str.translate"""
@@ -116,14 +134,11 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
         =: 完全匹配
         X: 错配
     """
-    if is_reverse:
-        alignment = alignment[::-1]
-    
     if not alignment:
         return ""
     
     # 预编译操作符映射
-    op_map = {'.': 'M', 'x': 'X', '-': 'D'}
+    op_map = {'.': 'M', 'x': 'X', '-': 'I', '+': 'D'} # 修正：根据FANSe规范调整I和D的映射
     
     cigar_parts = []
     count = 1
@@ -134,91 +149,56 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
             count += 1
         else:
             # 确定操作符
-            op = op_map.get(prev_char, 'I' if prev_char.isalpha() else 'S')
+            op = op_map.get(prev_char, 'M') # 修正：如果遇到未知字符，默认按M处理，避免生成S
             cigar_parts.append(f"{count}{op}")
             count = 1
             prev_char = char
     
     # 处理最后一个字符
-    op = op_map.get(prev_char, 'I' if prev_char.isalpha() else 'S')
+    op = op_map.get(prev_char, 'M') # 修正：如果遇到未知字符，默认按M处理，避免生成S
     cigar_parts.append(f"{count}{op}")
     
     return ''.join(cigar_parts)
 
-def calculate_flag(
-    strand: str,
-    is_paired: bool = False,   # 默认改为False，因为fanse目前支持单端测序
-    is_proper_pair: bool = False,
-    is_mapped: bool = True,
-    mate_mapped: bool = False,
-    is_read1: bool = False,
-    is_read2: bool = False,
-    is_secondary: bool = False,
-    is_qc_failed: bool = False,
-    is_duplicate: bool = False
-) -> int:
+def calculate_flag(record: FANSeRecord, is_reverse_strand: bool, is_primary_alignment: bool) -> int:
     """
-    计算SAM FLAG值（基于SAM格式规范v1.6）
-
-    参数说明：
-    strand:      链方向 - 'F'正向 / 'R'反向互补
-    is_paired:   是否为双端测序片段（默认True）
-    is_proper_pair: 是否满足双端比对条件（默认True）
-    is_mapped:   当前read是否比对成功（默认True）
-    mate_mapped: 配对比对是否成功（默认True）
-    is_read1:    是否为read1（双端中的第一条）
-    is_read2:    是否为read2（双端中的第二条）
-    is_secondary:是否为辅助比对（默认False）
-    is_qc_failed:未通过质量控制（默认False）
-    is_duplicate:是否为PCR重复序列（默认False）
-
-    返回：完整SAM FLAG值（按位组合）
+    根据FANSeRecord信息计算SAM FLAG。
+    现在FANSeRecord中已经包含了is_mapped, is_first_in_pair, is_second_in_pair等信息。
     """
     flag = 0
 
-    # 0x1 (1): 模板包含多个测序片段（双端测序）
-    if is_paired:
+    # 0x1: read is paired in sequencing
+    if record.is_first_in_pair is not None or record.is_second_in_pair is not None:
         flag |= 0x1
 
-    # 0x2 (2): 所有片段均正确比对（仅当双端时有效）
-    if is_paired and is_proper_pair:
-        flag |= 0x2
-
-    # 0x4 (4): 当前片段未比对到参考序列
-    if not is_mapped:
+    # 0x2: read is mapped in a proper pair (由samtools fixmate设置)
+    # 0x4: read is unmapped
+    if not record.is_mapped:
         flag |= 0x4
 
-    # 0x8 (8): 配对片段未比对到参考序列（仅当双端时有效）
-    if is_paired and not mate_mapped:
-        flag |= 0x8
+    # 0x8: mate is unmapped (由samtools fixmate设置)
 
-    # 0x10 (16): 当前片段为反向互补链
-    if strand == 'R':
+    # 0x10: read reverse strand
+    if is_reverse_strand:
         flag |= 0x10
 
-    # 0x20 (32): 配对片段为反向互补链（仅当双端时有效）
-    if is_paired and strand == 'F':  # 假设配对链方向相反
-        flag |= 0x20
+    # 0x20: mate reverse strand (由samtools fixmate设置)
 
-    # 0x40 (64): 第一条测序片段（read1）
-    if is_read1:
+    # 0x40: first in pair
+    if record.is_first_in_pair:
         flag |= 0x40
 
-    # 0x80 (128): 第二条测序片段（read2）
-    if is_read2:
+    # 0x80: second in pair
+    if record.is_second_in_pair:
         flag |= 0x80
 
-    # 0x100 (256): 辅助比对（非主要比对）
-    if is_secondary:
+    # 0x100: not primary alignment
+    if not is_primary_alignment:
         flag |= 0x100
 
-    # 0x200 (512): 未通过QC过滤
-    if is_qc_failed:
-        flag |= 0x200
-
-    # 0x400 (1024): PCR或光学重复
-    if is_duplicate:
-        flag |= 0x400
+    # 0x200: read fails platform/vendor quality checks (FANSe3无此信息，默认为通过)
+    # 0x400: read is PCR or optical duplicate (FANSe3无此信息)
+    # 0x800: supplementary alignment (由fanse_to_sam_type处理)
 
     return flag
 
@@ -228,73 +208,15 @@ def calculate_nm(alignment: str) -> int:
     for char in alignment:
         if char == 'x':  # 错配
             nm += 1
-        elif char == '-':  # 缺失
+        elif char == '-':  # read 插入（参考序列缺失）
             nm += 1
-        elif char.isalpha() and char not in 'x':  # 插入
+        elif char == '+':  # read 缺失（参考序列插入）
             nm += 1
     return nm
 
 
 
-def calculate_mapq(record: FANSeRecord, alignment_index: int, is_primary: bool = True) -> int:
-    """
-    计算精确的MAPQ值，基于FANSe3比对特征
-    
-    参数:
-        record: FANSe记录
-        alignment_index: 当前比对在记录中的索引
-        is_primary: 是否为主要比对
-    
-    返回:
-        MAPQ值 (0-60)
-    """
-    # 获取当前比对信息
-    alignment_str = record.alignment[alignment_index]
-    mismatches = record.mismatches[alignment_index]
-    read_length = len(record.seq)
-    multi_count = record.multi_count
-    
-    # 1. 计算基础比对质量（基于错配率）
-    alignment_length = len(alignment_str)
-    
-    # 计算有效比对长度（排除缺失和软裁剪）
-    effective_length = sum(1 for char in alignment_str if char not in '-S')
-    
-    if effective_length == 0:
-        return 0  # 无效比对
-    
-    # 错配率
-    mismatch_rate = mismatches / effective_length
-    
-    # 2. 基础质量得分（基于错配率，0-60分）
-    # 完美比对: 60分，每增加1%错配率减少3分
-    base_quality = max(0, 60 - (mismatch_rate * 100 * 3))
-    
-    # 3. 长度惩罚因子（短比对惩罚）
-    length_factor = min(1.0, effective_length / 100.0)  # 以100bp为基准
-    
-    # 4. 多重比对惩罚因子
-    if multi_count > 1:
-        # 多重比对惩罚：每个额外比对减少质量
-        multi_penalty = min(30, 10 * math.log2(multi_count))
-    else:
-        multi_penalty = 0
-    
-    # 5. 比对一致性得分（基于连续匹配）
-    consistency_score = calculate_alignment_consistency(alignment_str)
-    
-    # 6. 最终MAPQ计算
-    mapq = base_quality * length_factor - multi_penalty + consistency_score
-    
-    # 7. 如果是次要比对，进一步降低质量
-    if not is_primary:
-        mapq *= 0.7  # 次要比对质量降低30%
-    
-    # 边界检查和质量分级
-    mapq = max(0, min(60, mapq))
-    
-    # 8. 质量分级（离散化到标准MAPQ级别）
-    return discretize_mapq(mapq)
+
 
 def calculate_alignment_consistency(alignment: str) -> float:
     """
@@ -382,7 +304,8 @@ def calculate_mapq_advanced(record: FANSeRecord, alignment_index: int,
         }
     
     alignment = record.alignment[alignment_index]
-    mismatches = record.mismatches[alignment_index]
+    mismatches = record.mismatches[alignment_index] # 从record中获取
+    multi_count = record.multi_count # 从record中获取
     
     # 计算比对得分
     alignment_score = 0
@@ -418,21 +341,21 @@ def calculate_mapq_advanced(record: FANSeRecord, alignment_index: int,
     score_ratio = alignment_score / max_possible_score
     
     # 转换为MAPQ
-    raw_mapq = score_ratio * scoring_system['max_mapq']
+    raw_mapq_val = -10 * math.log10(1 - score_ratio) if score_ratio < 1 else scoring_system['max_mapq'] # 使用Phred-scaled概率
     
     # 多重比对惩罚,太多了就罚60分了，没分了
-    if record.multi_count > 1:
-        multi_penalty = min(60, math.log2(record.multi_count) * 5)
-        raw_mapq -= multi_penalty
+    if multi_count > 1:
+        multi_penalty = min(60, math.log2(multi_count) * 5)
+        raw_mapq_val -= multi_penalty
     
     # 次要比对惩罚
     if not is_primary:
-        raw_mapq *= 0.6
+        raw_mapq_val *= 0.6
     
     # 边界检查
-    raw_mapq = max(scoring_system['min_mapq'], min(scoring_system['max_mapq'], raw_mapq))
+    raw_mapq_val = max(scoring_system['min_mapq'], min(scoring_system['max_mapq'], raw_mapq_val))
     
-    return discretize_mapq(raw_mapq)
+    return discretize_mapq(raw_mapq_val)
 
 def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
     """生成SA标签字符串"""
@@ -441,123 +364,176 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
         if i == primary_idx:
             continue
         
-        strand = 'R' if 'R' in record.strands[i] else 'F'
-        is_reverse = (strand == 'R')
-        cigar = generate_cigar(record.alignment[i], is_reverse)
-        sa_parts.append(f"{record.ref_names[i]},{record.positions[i]+1},{strand}," +
-                        f"{cigar},255,{record.mismatches[i]}")
+        # 获取辅助比对信息
+        supp_ref_name = record.ref_names[i]
+        supp_position = record.positions[i]
+        supp_strand = record.strands[i] if record.strands else 'F'
+        is_supp_reverse = (supp_strand == 'R')
+        
+        supp_cigar = generate_cigar(record.alignment[i], is_supp_reverse)
+        supp_mapq = calculate_mapq_advanced(record, i, is_primary=False) # 计算辅助比对的MAPQ
+        supp_nm = calculate_nm(record.alignment[i]) # 计算辅助比对的NM
+
+        strand_char = '+' if not is_supp_reverse else '-'
+        sa_parts.append(f"{supp_ref_name},{supp_position+1},{strand_char}," +
+                        f"{supp_cigar},{supp_mapq},{supp_nm}") # 修正：使用正确的MAPQ和NM
     return f"SA:Z:{';'.join(sa_parts)}" if sa_parts else ""
 
 def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #20251024第二次优化
-    if not record.ref_names:
-        return
-    
-        
-    # 直接使用第一条记录作为主记录
-    primary_idx = 0
-    primary_strand = record.strands[primary_idx]
-    is_primary_reverse = (primary_strand == 'R')
+    """
+    将FANSeRecord对象转换为SAM格式的字符串。
+    现在支持FANSeRecord中包含的双端信息和未比对信息。
+    """
+    # 质量值（FANSe3不提供，默认为所有位置'I'）
+    qual = 'I' * len(record.seq)
 
-    # 预计算所有MAPQ值
-    mapq_values = []
-    for i in range(len(record.ref_names)):
-        is_primary = (i == primary_idx)
-        # 使用高级MAPQ计算
-        mapq = calculate_mapq_advanced(record, i, is_primary)
-        mapq_values.append(mapq)
-    
-    # 按需计算：只在需要时才计算反向互补序列
-    primary_seq = record.seq
-    if is_primary_reverse:
-        primary_seq = reverse_complement(record.seq)
-    
-    # 主记录的CIGAR
-    primary_cigar = generate_cigar(
-        record.alignment[primary_idx], 
-        is_primary_reverse
-    )
-    nm = calculate_nm(record.alignment[i])
-    # 主记录的FLAG
-    primary_flag = calculate_flag(primary_strand, is_secondary=False)
-    
-    # 构建主记录SAM行
-    sam_fields = [
-        record.header,
-        str(primary_flag),
-        record.ref_names[primary_idx],
-        str(record.positions[primary_idx] + 1),
-        str(mapq_values[primary_idx]),  # 使用计算的MAPQ
-        primary_cigar,
-        "*", 
-        "0", 
-        "0",
-        primary_seq,
-        "*",
-        f"XM:i:{record.mismatches[primary_idx]}",
-        f"XN:i:{record.multi_count}",
-        f"NM:i:{nm}",  # 添加编辑距离
-        f"XS:i:{mapq_values[primary_idx]}"  # 添加原始得分标签
-        
-    ]
-    
-    # 处理多重比对记录（只有multi_count > 1时才需要额外处理）
-    if record.multi_count > 1:
-        # 对于多重比对，预计算所有CIGAR和序列变体
-        cigars = []
-        seq_cache = {}
-        
-        # 预计算所有CIGAR
-        for i in range(len(record.ref_names)):
-            is_reverse = (record.strands[i] == 'R')
-            cigars.append(generate_cigar(record.alignment[i], is_reverse))
-        
-        # 预计算序列变体（只在需要时）
-        if any(strand == 'R' for strand in record.strands):
-            seq_cache['R'] = reverse_complement(record.seq)
-        if any(strand == 'F' for strand in record.strands):
-            seq_cache['F'] = record.seq
-        
-        # 生成SA标签
+    # 预先计算所有辅助比对的SA标签，如果存在的话
+    all_sa_tag_str = ""
+    if record.is_multi and len(record.ref_names) > 1:
         sa_parts = []
+        primary_idx = 0 # 假设第一个是主比对
+        for i in range(len(record.ref_names)):
+            # 获取比对信息
+            ref_name = record.ref_names[i]
+            position = record.positions[i]
+            strand = record.strands[i] if record.strands else 'F'
+            is_reverse = (strand == 'R')
+            
+            cigar = generate_cigar(record.alignment[i], is_reverse)
+            mapq = calculate_mapq_advanced(record, i, is_primary=(i == primary_idx)) # 计算MAPQ
+            nm = calculate_nm(record.alignment[i]) # 计算NM
+
+            strand_char = '+' if not is_reverse else '-'
+            sa_parts.append(f"{ref_name},{position+1},{strand_char},{cigar},{mapq},{nm}")
+        all_sa_tag_str = f"SA:Z:{';'.join(sa_parts)};"
+
+    # 如果read未比对
+    if not record.is_mapped:
+        # 计算FLAG
+        flag = calculate_flag(record, is_reverse_strand=False, is_primary_alignment=True) # 未比对read，不考虑链方向和辅助比对
+
+        # RNEXT, PNEXT, TLEN 占位符，由samtools fixmate修正
+        rnext = '*'
+        pnext = 0
+        tlen = 0
+
+        # 生成SAM行
+        sam_line = '\t'.join([
+            record.header,
+            str(flag),
+            '*',  # RNAME
+            '0',  # POS
+            '0',  # MAPQ
+            '*',  # CIGAR
+            rnext,
+            str(pnext),
+            str(tlen),
+            record.seq,
+            qual
+        ])
+        yield sam_line
+        return # 未比对read只有一行SAM输出
+
+    # 处理比对上的reads
+    # 确定主要比对
+    primary_idx = 0
+    if record.is_multi:
+        # 查找最佳比对作为主要比对
+        # 假设第一个比对是主要比对，或者根据错配数选择
+        # 这里简化为第一个比对作为主要比对
+        pass 
+    
+    # 确保索引在范围内
+    if not record.ref_names or primary_idx >= len(record.ref_names):
+        # 这应该不会发生，因为is_mapped为True时ref_names不应为空
+        # 但为了健壮性，如果出现问题，可以作为未比对处理或跳过
+        yield from fanse_to_sam_type(FANSeRecord(header=record.header, seq=record.seq, is_mapped=False))
+        return
+
+    # 获取主要比对信息
+    primary_ref_name = record.ref_names[primary_idx]
+    primary_position = record.positions[primary_idx]
+    primary_mismatches = record.mismatches[primary_idx] if record.mismatches else 0
+    primary_strand = record.strands[primary_idx] if record.strands else 'F'
+    
+    is_reverse_strand = (primary_strand == 'R')
+    is_primary_alignment = True # 当前处理的是主要比对
+
+    # 计算CIGAR和MAPQ
+    cigar = generate_cigar(record.alignment[primary_idx], is_reverse_strand) # 修正：第一个参数应为比对字符串
+    mapq = calculate_mapq_advanced(record, primary_idx, is_primary=True) # 传递record和primary_idx
+
+    # 计算FLAG
+    flag = calculate_flag(record, is_reverse_strand, is_primary_alignment)
+
+    # RNEXT, PNEXT, TLEN 占位符，由samtools fixmate修正
+    rnext = '=' if (record.is_first_in_pair or record.is_second_in_pair) else '*'
+    pnext = primary_position + 1 if (record.is_first_in_pair or record.is_second_in_pair) else 0
+    tlen = 0
+
+    # 生成主要比对的SAM行
+    sam_line_parts = [
+        record.header,
+        str(flag),
+        primary_ref_name,
+        str(primary_position + 1),  # SAM是1-based
+        str(mapq),
+        cigar,
+        rnext,
+        str(pnext),
+        str(tlen),
+        record.seq,
+        qual,
+        f"XM:i:{primary_mismatches}", # 添加XM标签
+        f"XN:i:{record.multi_count}", # 添加XN标签
+        f"NM:i:{calculate_nm(record.alignment[primary_idx])}", # 添加NM标签
+        f"XS:i:{mapq}" # 添加XS标签
+    ]
+    if all_sa_tag_str:
+        sam_line_parts.append(all_sa_tag_str)
+    yield '\t'.join(sam_line_parts)
+
+    # 处理辅助比对（如果存在）
+    if record.is_multi and len(record.ref_names) > 1:
         for i in range(len(record.ref_names)):
             if i == primary_idx:
-                continue
-            strand_i = record.strands[i]
-            sa_parts.append(f"{record.ref_names[i]},{record.positions[i]+1},{strand_i},"
-                           f"{cigars[i]},{mapq_values[i]},{record.mismatches[i]}")
-        
-        if sa_parts:
-            sam_fields.append(f"SA:Z:{';'.join(sa_parts)}")
-        
-        yield "\t".join(sam_fields)
-        
-        # 处理辅助记录
-        for i in range(1, len(record.ref_names)):
-            strand_i = record.strands[i]
-            flag_i = calculate_flag(strand_i, is_secondary=True)
-            seq_i = seq_cache[strand_i]  # 使用预计算的序列
+                continue # 跳过主要比对
+
+            supp_ref_name = record.ref_names[i]
+            supp_position = record.positions[i]
+            supp_mismatches = record.mismatches[i] if record.mismatches else 0
+            supp_strand = record.strands[i] if record.strands else 'F'
             
-            sam_fields_secondary = [
+            is_supp_reverse_strand = (supp_strand == 'R')
+            is_supp_primary_alignment = False # 辅助比对
+
+            # 辅助比对的FLAG需要设置0x100 (not primary alignment) 和 0x800 (supplementary alignment)
+            supp_flag = calculate_flag(record, is_supp_reverse_strand, is_supp_primary_alignment)
+            supp_flag |= 0x800 # 设置辅助比对标志
+
+            supp_cigar = generate_cigar(record.alignment[i], is_supp_reverse_strand) # 修正：第一个参数应为比对字符串
+            supp_mapq = calculate_mapq_advanced(record, i, is_primary=False) # 传递record和索引
+
+            supp_sam_line_parts = [
                 record.header,
-                str(flag_i),
-                record.ref_names[i],
-                str(record.positions[i] + 1),
-                str(mapq_values[i]),  # 辅助比对的MAPQ（通常较低）
-                cigars[i],
-                "*", 
-                "0", 
-                "0",
-                seq_i,
-                "*",
-                f"XM:i:{record.mismatches[i]}",
-                f"XN:i:{record.multi_count}",
-                f"NM:i:{nm}",  # 添加编辑距离,这里目前与主记录一致，是否应该这样，后面再检查
-                f"XS:i:{mapq_values[i]}",
+                str(supp_flag),
+                supp_ref_name,
+                str(supp_position + 1),
+                str(supp_mapq),
+                supp_cigar,
+                rnext, # 辅助比对的RNEXT, PNEXT, TLEN与主要比对相同
+                str(pnext),
+                str(tlen),
+                record.seq,
+                qual,
+                f"XM:i:{supp_mismatches}", # 添加XM标签
+                f"XN:i:{record.multi_count}", # 添加XN标签
+                f"NM:i:{calculate_nm(record.alignment[i])}", # 添加NM标签
+                f"XS:i:{supp_mapq}" # 添加XS标签
             ]
-            yield "\t".join(sam_fields_secondary)
-    else:
-        # 单映射记录，直接生成主记录
-        yield "\t".join(sam_fields)
+            if all_sa_tag_str:
+                supp_sam_line_parts.append(all_sa_tag_str)
+            yield '\t'.join(supp_sam_line_parts)
 
 def parse_fasta(fasta_path: str) -> Dict[str, int]:
     """
@@ -587,7 +563,7 @@ def parse_fasta(fasta_path: str) -> Dict[str, int]:
                 current_seq = line[1:].split()[0]  # 取>后的第一个单词作为名称
                 current_length = 0
             else:
-                current_length += len(line)
+                current_length += len(line.strip()) # 修正：去除换行符再计算长度
 
         # 添加最后一个序列
         if current_seq:
@@ -722,7 +698,7 @@ def parse_region_string(region_str: str, ref_info: Dict[str, int], console=None)
                 try:
                     start_str, end_str = pos_part.split('-', 1)
                     start = int(start_str.strip()) - 1  # 转换为0-based
-                    end = int(end_str.strip())  # 保持1-based
+                    end = int(end_str.strip())  # 保持1-based，但实际使用时需要注意是包含还是不包含
                     
                     # 边界检查
                     if start < 0:
@@ -791,17 +767,23 @@ def is_record_in_region(record: FANSeRecord, regions: Dict[str, List[Tuple[int, 
                     
     return False
 
-def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: Optional[str] = None, console=None, threads: int = 4):
+def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None, 
+              region: Optional[str] = None, console=None, threads: int = 4,
+              unmapped_file: Optional[str] = None, is_paired_end: bool = False,
+              _pipe_writer=None): # 新增_pipe_writer参数
     """
-    将FANSe3文件转换为SAM格式，支持区域过滤
-
+    将FANSe3文件转换为SAM格式，支持区域过滤和双端模式。
+    
     参数:
-        fanse_file: 输入FANSe3文件路径
-        fasta_path: 参考基因组FASTA文件路径
-        output_sam: 输出SAM文件路径(如果为None则打印到标准输出)
-        region: 区域过滤字符串
-        console: rich Console 对象，用于日志输出
-        threads: 并行处理的线程数（仅在输出到文件时有效）
+        fanse_file: 输入FANSe3文件路径。
+        fasta_path: 参考基因组FASTA文件路径。
+        output_sam: 输出SAM文件路径(如果为None则打印到标准输出)。
+        region: 区域过滤字符串。
+        console: rich Console 对象，用于日志输出。
+        threads: 并行处理的线程数。
+        unmapped_file: 未比对reads文件路径（仅在is_paired_end为True时有效）。
+        is_paired_end: 是否启用双端模式，将合并fanse_file和unmapped_file的记录。
+        _pipe_writer: 内部参数，用于将输出写入到subprocess管道的stdin。
     """
     if console is None:
         console = Console(stderr=True)
@@ -827,7 +809,12 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
     is_binary = False
     
     try:
-        if output_sam:
+        if _pipe_writer: # 如果提供了管道写入器，则使用它
+            writer = _pipe_writer
+            is_binary = True # 管道通常处理字节流
+            writer.write(header.encode('utf-8'))
+            writer.flush()
+        elif output_sam:
             writer = open(output_sam, 'w', encoding='utf-8')
             should_close = True
             console.print('Write SAM header down.')
@@ -848,25 +835,35 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             
             # 调整批次大小
             batch_size = 20000 
-            file_read_size = os.path.getsize(fanse_file) / 450
             
-            reader = fanse_line_reader(fanse_file, chunk_size=batch_size)
-            worker_func = partial(_worker_process_lines, regions=regions)
+            # 根据是否双端模式选择记录解析器
+            if is_paired_end and unmapped_file:
+                # 双端模式下，合并fanse和unmapped记录
+                record_generator = _merge_fanse_and_unmapped_records(fanse_file, unmapped_file)
+                # 估算文件大小，用于进度条
+                file_read_size = (os.path.getsize(fanse_file) + os.path.getsize(unmapped_file)) / 450
+            else:
+                # 单端模式，只解析fanse文件
+                record_generator = fanse_parser_high_performance(fanse_file)
+                file_read_size = os.path.getsize(fanse_file) / 450
+            
+            reader = _iter_record_batches(record_generator, batch_size)
+            worker_func = partial(_worker_process_records, regions=regions)
             
             # 进度条仅在输出到文件时显示，避免干扰stdout
             disable_pbar = (output_sam is None)
             
             with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True, disable=disable_pbar) as pbar:
                 with Pool(processes=threads) as pool:
-                    for lines in pool.imap(worker_func, reader, chunksize=1):
-                        if lines:
-                            text = '\n'.join(lines) + '\n'
+                    for sam_lines_batch in pool.imap(worker_func, reader, chunksize=1):
+                        if sam_lines_batch:
+                            text = '\n'.join(sam_lines_batch) + '\n'
                             if is_binary:
                                 writer.write(text.encode('utf-8'))
                             else:
                                 writer.write(text)
-                        
-                        pbar.update(batch_size // 2)
+                        # 修正意图：并行模式下按批次近似推进进度，避免固定错误步长
+                        pbar.update(batch_size)
                             
             if output_sam:
                 console.print(f"处理完成")
@@ -879,13 +876,19 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             filtered_count = 0
             total_count = 0
             
-            file_read_size = os.path.getsize(fanse_file) / 450
+            # 根据是否双端模式选择记录解析器
+            if is_paired_end and unmapped_file:
+                record_generator = _merge_fanse_and_unmapped_records(fanse_file, unmapped_file)
+                file_read_size = (os.path.getsize(fanse_file) + os.path.getsize(unmapped_file)) / 450
+            else:
+                record_generator = fanse_parser_high_performance(fanse_file)
+                file_read_size = os.path.getsize(fanse_file) / 450
             
             # 进度条仅在输出到文件时显示
             disable_pbar = (output_sam is None)
             
             with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True, disable=disable_pbar) as pbar:
-                for record in fanse_parser_high_performance(fanse_file):
+                for record in record_generator:
                     total_count += 1
                     
                     if regions and not is_record_in_region(record, regions):
@@ -933,7 +936,7 @@ def fanse2sam(fanse_file, fasta_path, output_sam: Optional[str] = None, region: 
             raise e
             
     finally:
-        if should_close and writer:
+        if should_close and writer: # 只有当writer是我们自己打开的文件时才关闭
             writer.close()
 
 def run_sam_command(args):
@@ -971,25 +974,108 @@ def run_sam_command(args):
         input_path = str(input_file)
         
         # 确定输出路径
-        if output_dir:
+        # 如果启用了 --fixmate，则强制输出到标准输出，以便管道传递给samtools
+        if args.fixmate:
+            output_path = None
+        elif output_dir:
             fname = input_file.stem
             output_path = os.path.join(output_dir, fname + '.sam')
         elif args.output_sam:
             output_path = args.output_sam
         else:
-            output_path = None # stdout
+            # 修正意图：双端模式默认落盘到输入文件同目录，避免大量SAM内容直接刷到终端
+            if args.is_paired_end:
+                output_path = str(input_file.with_suffix('.sam'))
+            else:
+                output_path = None # stdout
 
         if len(input_files) > 1:
             console.print(f"[dim]Processing ({i+1}/{len(input_files)}): {input_file.name}[/dim]")
 
         try:
-            fanse2sam(input_path, 
-                      args.fasta_path, 
-                      output_path,
-                      region=args.region,
-                      console=console,
-                      threads=args.threads
-                      )
+            # 在这里处理unmapped_file的自动推断
+            current_unmapped_file = None
+            if args.is_paired_end:
+                # 尝试推断unmapped文件路径
+                # 假设unmapped文件和fanse文件在同一目录，且文件名只有后缀不同
+                unmapped_candidate = input_file.with_suffix('.unmapped')
+                if unmapped_candidate.exists():
+                    current_unmapped_file = str(unmapped_candidate)
+                else:
+                    console.print(f"[bold yellow]警告: 双端模式下未找到 {input_file.name} 对应的 .unmapped 文件，将只处理 .fanse3 文件[/bold yellow]")
+
+            # 如果启用了 --fixmate，则通过管道将fanse2sam的输出传递给samtools
+            if args.fixmate:
+                # 获取samtools路径
+                samtools_path = processor.get_samtools_path(console=console)
+                if not samtools_path:
+                    # 错误信息已在get_samtools_path中打印
+                    return
+
+                # 构建samtools sort -n 命令
+                sort_cmd = [samtools_path, 'sort', '-n', '-@', str(args.threads), '-o', '-', '-']
+                # 构建samtools fixmate 命令
+                fixmate_cmd = [samtools_path, 'fixmate', '-@', str(args.threads), '-', output_path if output_path else '-']
+
+                console.print(f"[dim]执行管道命令: fanse sam ... | {' '.join(sort_cmd)} | {' '.join(fixmate_cmd)}[/dim]")
+
+                # 启动samtools sort -n 进程
+                sort_process = subprocess.Popen(sort_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # 启动samtools fixmate 进程
+                fixmate_process = subprocess.Popen(fixmate_cmd, stdin=sort_process.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # 关闭sort_process的stdout，确保它不会阻塞
+                sort_process.stdout.close()
+
+                # 调用fanse2sam，将输出写入sort_process的stdin
+                fanse2sam(input_path, 
+                          args.fasta_path, 
+                          output_sam=None, # 强制输出到stdout，由管道捕获
+                          region=args.region,
+                          console=console,
+                          threads=args.threads,
+                          unmapped_file=current_unmapped_file,
+                          is_paired_end=args.is_paired_end,
+                          _pipe_writer=sort_process.stdin # 将stdin传递给fanse2sam
+                          )
+                sort_process.stdin.close() # 关闭stdin，通知sort进程输入结束
+
+                # 读取fixmate的输出并写入最终目的地
+                if output_path:
+                    with open(output_path, 'wb') as out_f:
+                        for line in fixmate_process.stdout:
+                            out_f.write(line)
+                else:
+                    # 如果output_path为None，则fixmate的输出直接到stdout
+                    for line in fixmate_process.stdout:
+                        sys.stdout.buffer.write(line)
+                
+                # 检查samtools进程的返回码
+                sort_stderr = sort_process.communicate()[1].decode('utf-8')
+                fixmate_stderr = fixmate_process.communicate()[1].decode('utf-8')
+
+                if sort_process.returncode != 0:
+                    console.print(f"[bold red]错误: samtools sort -n 进程异常退出，返回码 {sort_process.returncode}[/bold red]")
+                    console.print(f"[dim]Stderr: {sort_stderr}[/dim]")
+                    return
+                if fixmate_process.returncode != 0:
+                    console.print(f"[bold red]错误: samtools fixmate 进程异常退出，返回码 {fixmate_process.returncode}[/bold red]")
+                    console.print(f"[dim]Stderr: {fixmate_stderr}[/dim]")
+                    return
+                
+                console.print("[bold green]samtools sort -n | fixmate 管道处理完成。[/bold green]")
+
+            else:
+                # 正常调用fanse2sam
+                fanse2sam(input_path, 
+                          args.fasta_path, 
+                          output_path,
+                          region=args.region,
+                          console=console,
+                          threads=args.threads,
+                          unmapped_file=current_unmapped_file,
+                          is_paired_end=args.is_paired_end
+                          )
         except Exception as e:
             console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
 
@@ -998,27 +1084,23 @@ def add_sam_subparser(subparsers):
     sam_parser = subparsers.add_parser(
         'sam',
         help='转换为 SAM 格式',
-        description='将 FANSe3 文件转换为标准 SAM 格式',
+        description='将FANSe3比对结果转换为SAM格式，支持区域过滤和双端模式。',
         formatter_class=CustomHelpFormatter
     )
-    
-    sam_parser.add_argument(
-        '-i', '--input', dest='fanse_file', required=True, help='输入文件路径（FANSe3 格式）')
-    sam_parser.add_argument(
-        '-r', '--fasta', dest='fasta_path', required=True, help='参考基因组 FASTA 文件路径')
-    sam_parser.add_argument(
-        '-o', '--output', dest='output_sam', help='输出文件路径（不指定输出位置，默认打印到终端）')
-    sam_parser.add_argument(
-        '-t', '--threads', type=int, default=1, help='并行处理线程数（默认: 1）')
-    sam_parser.add_argument(
-        '-R', '--region', 
-        help='区域过滤（参考samtools格式）: chr1, chr1:1000, chr1:1000-2000, chr1,chr2:500-1000'
-    )
-    sam_parser.add_argument(
-        '--sort', choices=['coord', 'name'], 
-        help='输出排序方式'
-    )
-
+    sam_parser.add_argument('-i', '--fanse-file', required=True,
+                            help='输入FANSe3文件路径 (支持通配符和目录)')
+    sam_parser.add_argument('-r', '--fasta-path', required=True,
+                            help='参考基因组FASTA文件路径')
+    sam_parser.add_argument('-o', '--output-sam',
+                            help='输出SAM文件路径 (如果为None则打印到标准输出)')
+    sam_parser.add_argument('-R', '--region',
+                            help='区域过滤，例如 "chr1:1000-2000,chr2"')
+    sam_parser.add_argument('-t', '--threads', type=int, default=4,
+                            help='并行处理的线程数 (仅在输出到文件时有效)')
+    sam_parser.add_argument('--pe', '--paired-end', action='store_true', dest='is_paired_end',
+                            help='启用双端模式。将自动搜索同目录下的 .unmapped 文件进行合并处理。')
+    sam_parser.add_argument('--fixmate', action='store_true',
+                            help='在输出SAM后，自动通过管道执行 samtools sort -n | samtools fixmate。此选项会强制输出到标准输出。')
     sam_parser.set_defaults(func=run_sam_command)
 
     add_rich_epilog(sam_parser, """

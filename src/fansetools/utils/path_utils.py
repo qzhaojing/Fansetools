@@ -178,6 +178,31 @@ class PathProcessor:
         
         return f"{stem}{default_suffix}"
     
+    def get_samtools_path(self, console=None) -> Optional[str]:
+        """
+        尝试获取samtools可执行文件的路径。
+        首先检查fansetools/src/fansetools/bin/windows/samtools.exe，
+        如果不存在，则在系统PATH中查找。
+        """
+        if console is None:
+            from rich.console import Console
+            console = Console(stderr=True)
+
+        # 优先检查硬编码路径
+        # __file__ 是当前文件的路径，.parent.parent 向上两级到达 fansetools/src/fansetools 目录
+        hardcoded_path = Path(__file__).parent.parent / "bin" / "windows" / "samtools.exe"
+        if hardcoded_path.exists():
+            return str(hardcoded_path.resolve())
+        
+        # 其次在PATH中查找
+        import shutil
+        samtools_in_path = shutil.which("samtools")
+        if samtools_in_path:
+            return samtools_in_path
+        
+        console.print("[bold red]错误: 未找到 samtools 可执行文件。请确保 samtools 已安装并配置在 PATH 中，或在 fansetools/src/fansetools/bin/windows/samtools.exe 路径下。[/bold red]")
+        return None
+
     def validate_paths(self, *path_checks: Tuple[Path, str, Dict]) -> Tuple[bool, List[str]]:
         """
         集中验证路径

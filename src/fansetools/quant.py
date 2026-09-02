@@ -34,6 +34,13 @@ def build_length_maps(annotation_df: pd.DataFrame,
     if annotation_df is None or annotation_df.empty:
         return {}, {}
 
+    # 安全转换函数
+    def _safe_float(x, default=0.0):
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return default
+
     if level == 'isoform':
         id_col = 'txname' if 'txname' in annotation_df.columns else None
         if not id_col:
@@ -45,11 +52,11 @@ def build_length_maps(annotation_df: pd.DataFrame,
         if not len_col:
             return {}, {}
         eff_col = 'isoformEffectiveLength' if 'isoformEffectiveLength' in annotation_df.columns else None
-        length_map = dict(zip(annotation_df[id_col], annotation_df[len_col]))
+        length_map = {k: _safe_float(v) for k, v in zip(annotation_df[id_col], annotation_df[len_col])}
         if eff_col:
-            eff_length_map_raw = dict(zip(annotation_df[id_col], annotation_df[eff_col]))
+            eff_length_map_raw = {k: _safe_float(v) for k, v in zip(annotation_df[id_col], annotation_df[eff_col])}
             # 将无效(<=0或NA)的有效长度替换为总长度
-            eff_length_map = {k: (float(v) if (pd.notna(v) and float(v) > 0) else float(length_map.get(k, 0.0))) for k, v in eff_length_map_raw.items()}
+            eff_length_map = {k: (v if (v > 0) else float(length_map.get(k, 0.0))) for k, v in eff_length_map_raw.items()}
         else:
             eff_length_map = length_map
         return length_map, eff_length_map
@@ -60,22 +67,22 @@ def build_length_maps(annotation_df: pd.DataFrame,
     # gene 层长度选择
     mode_gene = mode or 'genelongesttxLength'
     if mode_gene == 'geneEffectiveLength' and 'geneEffectiveLength' in annotation_df.columns:
-        length_map = dict(annotation_df.groupby('geneName')['geneEffectiveLength'].max())
+        length_map = {k: _safe_float(v) for k, v in annotation_df.groupby('geneName')['geneEffectiveLength'].max().items()}
     elif mode_gene == 'genelongestcdsLength' and 'genelongestcdsLength' in annotation_df.columns:
-        length_map = dict(annotation_df.groupby('geneName')['genelongestcdsLength'].max())
+        length_map = {k: _safe_float(v) for k, v in annotation_df.groupby('geneName')['genelongestcdsLength'].max().items()}
     elif mode_gene == 'txLength' and 'txLength' in annotation_df.columns:
-        length_map = dict(annotation_df.groupby('geneName')['txLength'].max())
+        length_map = {k: _safe_float(v) for k, v in annotation_df.groupby('geneName')['txLength'].max().items()}
     elif 'genelongesttxLength' in annotation_df.columns:
-        length_map = dict(annotation_df.groupby('geneName')['genelongesttxLength'].max())
+        length_map = {k: _safe_float(v) for k, v in annotation_df.groupby('geneName')['genelongesttxLength'].max().items()}
     elif 'txLength' in annotation_df.columns:
-        length_map = dict(annotation_df.groupby('geneName')['txLength'].max())
+        length_map = {k: _safe_float(v) for k, v in annotation_df.groupby('geneName')['txLength'].max().items()}
     else:
         length_map = {}
 
     # 修正：若存在 geneEffectiveLength，则使用它；但对<=0/NA值回退到总长度，避免TPM为0
     if 'geneEffectiveLength' in annotation_df.columns:
-        eff_raw = dict(annotation_df.groupby('geneName')['geneEffectiveLength'].max())
-        eff_length_map = {k: (float(v) if (pd.notna(v) and float(v) > 0) else float(length_map.get(k, 0.0))) for k, v in eff_raw.items()}
+        eff_raw = {k: _safe_float(v) for k, v in annotation_df.groupby('geneName')['geneEffectiveLength'].max().items()}
+        eff_length_map = {k: (v if (v > 0) else float(length_map.get(k, 0.0))) for k, v in eff_raw.items()}
     else:
         eff_length_map = length_map
     return length_map, eff_length_map
