@@ -500,6 +500,10 @@ def create_parser():
 
     # 子命令：mpileup
     add_mpileup_subparser(subparsers)
+
+    # 子命令：stats（fanse 运行日志汇总统计）
+    from .stats import add_stats_subparser
+    add_stats_subparser(subparsers)
     
     #子命令：cluster
     #add_cluster_subparser(subparsers)
