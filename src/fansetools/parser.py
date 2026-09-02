@@ -238,21 +238,40 @@ def _split_ref_names(ref_field: str, expected_count: int):
     修正：解析 multi 行的 ref 列。
 
     fanse3 的参考序列名是完整 FASTA header（如 'NC_000962.3 Mycobacterium
-    tuberculosis H37Rv, complete genome'），名称内部可能含逗号；而 multi 行
-    各比对位置间也用逗号分隔，导致简单 split(',') 后碎片数 != 比对数
-    （如 29 个比对被拆成 58 个 name，与 positions 错位）。
+    tuberculosis H37Rv, complete genome'），名称内部可能含逗号且**各名称的
+    逗号数不均匀**（实测 Sporothrix header 有的 1 个、有的 2 个逗号）；
+    而 multi 行各比对位置间也用逗号分隔，导致简单 split(',') 后碎片数
+    != 比对数（如 48 个比对被拆成 104 个碎片），与 positions 错位，
+    下游 fanse_to_sam_type 取 positions[i] 时抛 IndexError。
 
-    利用 strands 列（每项为单字符 F/R，元素数可靠）作为期望比对数：
-      - 碎片数 == expected_count          → 直接使用
-      - 碎片数是 expected_count 的整数倍  → 均匀分组，每组用 ',' 拼回原名称
-      - 其余（无法整除）                  → 保持碎片（向后兼容旧行为）
+    利用 strands 列（每项为单字符 F/R，元素数可靠）作为期望比对数，三级策略：
+      1. 碎片数 == expected_count                       → 直接使用
+      2. 空格启发式重组：名称内部逗号后必跟空格（英文习惯
+         ', whole genome shotgun sequence'），而比对间逗号后直接跟下一个
+         accession（无空格）→ 以空格开头的碎片拼回前一个名称。
+         重组后数量 == expected_count 则采用（覆盖逗号数不均匀的情况）
+      3. 碎片数是 expected_count 整数倍                  → 均匀分组兜底
+      4. 以上皆失败                                      → 保持碎片（向后兼容旧行为）
     """
     parts = ref_field.split(',')
     if len(parts) == expected_count:
         return parts
+
+    # 策略2：空格启发式——名称内部逗号后跟空格，比对间逗号后无空格
+    grouped = []
+    for frag in parts:
+        if frag and frag[0] in (' ', '\t') and grouped:
+            grouped[-1] = grouped[-1] + ',' + frag   # 续片：拼回前一个名称
+        else:
+            grouped.append(frag.strip())             # 新名称起点
+    if len(grouped) == expected_count:
+        return grouped
+
+    # 策略3：均匀分组兜底（各名称逗号数一致的场景）
     if expected_count > 0 and len(parts) > expected_count and len(parts) % expected_count == 0:
         k = len(parts) // expected_count
         return [','.join(parts[i * k:(i + 1) * k]).strip() for i in range(expected_count)]
+
     return parts
 
 def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
