@@ -55,6 +55,24 @@ from rich.console import Console
 import pathlib
 import subprocess # 导入subprocess模块
 
+def _sam_ref_name(name: str) -> str:
+    """
+    新增：将完整 FASTA header 规范化为 accession（第一个空格前的部分）。
+
+    修正意图：fanse3 的 ref 名是完整 FASTA header（如
+    'NC_000962.3 Mycobacterium tuberculosis H37Rv, complete genome'），
+    直接写入 SAM 会导致 RNAME / @SQ SN / SA:Z 里携带冗长描述。
+    且 SAM 规范要求 SN: 不能含空白字符，带空格的名称不合规，
+    IGV 等下游工具可能解析异常。统一截取 accession：
+      - RNAME 与 @SQ SN 完全一致（samtools 校验的前提）
+      - SA:Z 中的参考名同步规范化，保持与 RNAME 一致
+    名称不含空格时原样返回（天然兼容无描述的 header）。
+    """
+    if not name:
+        return name
+    sp = name.find(' ')
+    return name if sp == -1 else name[:sp]
+
 def _merge_fanse_and_unmapped_records(fanse_file: str, unmapped_file: str) -> Generator[FANSeRecord, None, None]:
     """
     合并FANSe3文件和unmapped文件中的记录，生成统一的FANSeRecord流。
@@ -365,7 +383,8 @@ def generate_sa_tag(record: FANSeRecord, primary_idx: int) -> str:
             continue
         
         # 获取辅助比对信息
-        supp_ref_name = record.ref_names[i]
+        # 修正：SA:Z 中参考名规范化为 accession，与 RNAME 一致
+        supp_ref_name = _sam_ref_name(record.ref_names[i])
         supp_position = record.positions[i]
         supp_strand = record.strands[i] if record.strands else 'F'
         is_supp_reverse = (supp_strand == 'R')
@@ -394,7 +413,8 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         primary_idx = 0 # 假设第一个是主比对
         for i in range(len(record.ref_names)):
             # 获取比对信息
-            ref_name = record.ref_names[i]
+            # 修正：SA:Z 中参考名规范化为 accession，与 RNAME 一致
+            ref_name = _sam_ref_name(record.ref_names[i])
             position = record.positions[i]
             strand = record.strands[i] if record.strands else 'F'
             is_reverse = (strand == 'R')
@@ -451,7 +471,8 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         return
 
     # 获取主要比对信息
-    primary_ref_name = record.ref_names[primary_idx]
+    # 修正：RNAME 只取 accession（第一个空格前），与 @SQ SN 一致且符合 SAM 规范
+    primary_ref_name = _sam_ref_name(record.ref_names[primary_idx])
     primary_position = record.positions[primary_idx]
     primary_mismatches = record.mismatches[primary_idx] if record.mismatches else 0
     primary_strand = record.strands[primary_idx] if record.strands else 'F'
@@ -499,7 +520,8 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
             if i == primary_idx:
                 continue # 跳过主要比对
 
-            supp_ref_name = record.ref_names[i]
+            # 修正：辅助比对行 RNAME 同样只取 accession，与主比对/SA标签一致
+            supp_ref_name = _sam_ref_name(record.ref_names[i])
             supp_position = record.positions[i]
             supp_mismatches = record.mismatches[i] if record.mismatches else 0
             supp_strand = record.strands[i] if record.strands else 'F'
@@ -643,7 +665,9 @@ def generate_sam_header_from_ref_info(ref_info: Dict[str, int]) -> str:
     ]
 
     for ref_name, length in ref_info.items():
-        header_lines.append(f"@SQ\tSN:{ref_name}\tLN:{length}")
+        # 修正：@SQ SN 只取 accession（第一个空格前），与 RNAME 输出保持一致；
+        # SAM 规范要求 SN 不含空白字符
+        header_lines.append(f"@SQ\tSN:{_sam_ref_name(ref_name)}\tLN:{length}")
 
     return '\n'.join(header_lines) + '\n'
 
