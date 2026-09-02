@@ -50,12 +50,12 @@ except Exception:
     rust_fastcount_available = lambda: False
     parse_and_count_rust = None
 # 修正：新增定量模块引入，用于在唯一文件中追加 TPM/RPKM 列
-try:
-    from fansetools.quant import add_quant_columns, build_length_maps
-except Exception:
-    # 若独立模块不可用，保持兼容运行（不追加定量列）
-    add_quant_columns = None
-    build_length_maps = None
+#try:
+ #   from fansetools.quant import add_quant_columns, build_length_maps
+#except Exception:
+#    # 若独立模块不可用，保持兼容运行（不追加定量列）
+#    add_quant_columns = None
+#    build_length_maps = None
 from fansetools.utils.path_utils import PathProcessor
 try:
     from cryptography.utils import CryptographyDeprecationWarning
@@ -1062,7 +1062,11 @@ class FanseCounter:
                         self._region_count_batch(batch, region_hits)
 
             except Exception as e:
-                print(f"Error: {e}")
+                # 修正：原先仅打印 str(e)，MemoryError 等异常 str 为空导致只输出"Error:"无信息；
+                # 补充异常类型与完整 traceback 便于定位
+                print(f"Error: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
         duration = time.time() - start_time
@@ -1185,8 +1189,17 @@ class FanseCounter:
                 # 修正：染色体名规范化后再查询，兼容 fanse 'chr1' vs BED '1' 命名差异
                 chrom_key = _normalize_chrom_name(name)
                 hits = query_bed_hits(bed_regions, chrom_key, start, start + read_len)
-                # 修正：仅当 BED 中完全没有该染色体时才记为未知；有染色体但无重叠属正常情况
-                if chrom_key not in bed_regions:
+                if not hits:
+                    # 修正：fanse ref 名常为完整 FASTA header（如 'NC_000962.3 Mycobacterium
+                    # tuberculosis H37Rv, complete genome'），而 BED 通常用 accession。
+                    # 全名未命中时取首个空格前的 accession 二次查询
+                    first_token = name.strip().split()[0] if name.strip() else ''
+                    if first_token:
+                        alt_key = _normalize_chrom_name(first_token)
+                        if alt_key != chrom_key:
+                            hits = query_bed_hits(bed_regions, alt_key, start, start + read_len)
+                # 修正：仅当 BED 中完全没有该染色体（全名与 accession 均未定义）时才记为未知
+                if chrom_key not in bed_regions and _normalize_chrom_name(name.split()[0] if name.split() else '') not in bed_regions:
                     self._bed_unknown_chroms.add(chrom_key)
                 if not hits:
                     continue

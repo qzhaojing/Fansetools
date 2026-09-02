@@ -233,6 +233,28 @@ def parse_records_from_lines(lines: List[str]) -> Generator[FANSeRecord, None, N
         
         yield record
 
+def _split_ref_names(ref_field: str, expected_count: int):
+    """
+    修正：解析 multi 行的 ref 列。
+
+    fanse3 的参考序列名是完整 FASTA header（如 'NC_000962.3 Mycobacterium
+    tuberculosis H37Rv, complete genome'），名称内部可能含逗号；而 multi 行
+    各比对位置间也用逗号分隔，导致简单 split(',') 后碎片数 != 比对数
+    （如 29 个比对被拆成 58 个 name，与 positions 错位）。
+
+    利用 strands 列（每项为单字符 F/R，元素数可靠）作为期望比对数：
+      - 碎片数 == expected_count          → 直接使用
+      - 碎片数是 expected_count 的整数倍  → 均匀分组，每组用 ',' 拼回原名称
+      - 其余（无法整除）                  → 保持碎片（向后兼容旧行为）
+    """
+    parts = ref_field.split(',')
+    if len(parts) == expected_count:
+        return parts
+    if expected_count > 0 and len(parts) > expected_count and len(parts) % expected_count == 0:
+        k = len(parts) // expected_count
+        return [','.join(parts[i * k:(i + 1) * k]).strip() for i in range(expected_count)]
+    return parts
+
 def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
     """
     解析FANSe3结果文件的主函数
@@ -273,8 +295,8 @@ def fanse_parser(file_path: str) -> Generator[FANSeRecord, None, None]:
             # 处理可能的多值字段
             if multi_count!=1:
                 strands = tuple(fields2[0].split(','))
-                # 修正：对 ref_names 应用 sys.intern，驻留高重复的转录本/参考序列ID，减少内存与哈希成本
-                ref_names = tuple(sys.intern(name) for name in fields2[1].split(','))
+                # 修正：ref 列按 strands 数重组，兼容名称内部含逗号的完整 FASTA header
+                ref_names = tuple(sys.intern(name) for name in _split_ref_names(fields2[1], len(strands)))
                 mismatches = [int(fields2[2])]    #fanse 文件中此字段只有一个而非多个用逗号分割，因此测试注释掉上面行
                 positions = [int(x) for x in fields2[3].split(',')]
 
@@ -361,8 +383,8 @@ def fanse_parser_high_performance(file_path: str) -> Generator[FANSeRecord, None
             # 根据multi_count分支处理
             if multi_count != 1:
                 strands = tuple(comma_split(strand_field))
-                # 修正：高性能解析同样对 ref_names 执行 sys.intern，降低字符串重复与比较开销
-                ref_names = tuple(sys.intern(name) for name in comma_split(ref_field))
+                # 修正：ref 列按 strands 数重组，兼容名称内部含逗号的完整 FASTA header
+                ref_names = tuple(sys.intern(name) for name in _split_ref_names(ref_field, len(strands)))
                 positions = [int(x) for x in comma_split(position_field)]
                 mismatches = [mismatch_val] * len(positions)
             else:
