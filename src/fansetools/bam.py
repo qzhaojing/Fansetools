@@ -108,18 +108,60 @@ def bam_command(args):
         
     # 2. 处理输出
     output_path = Path(args.output_bam) if args.output_bam else None
-    
+
+    # 新增：并行线程数（仅批量模式生效；单文件模式管道本身已是 fanse sam/samtools view/sort
+    # 三个子进程的流式并行，再并行无意义）
+    threads = max(1, int(getattr(args, 'threads', 1) or 1))
+
     # 批量模式检查
     if len(input_files) > 1:
         if output_path and output_path.suffix:
              console.print(f"[bold red]错误: 批量处理 {len(input_files)} 个文件时，输出路径必须是目录 (如果指定)[/bold red]")
              sys.exit(1)
-        
+
         if output_path and not output_path.exists():
             output_path.mkdir(parents=True, exist_ok=True)
-        
+
         console.print(f"检测到批量模式，将处理 {len(input_files)} 个文件...")
-        
+
+        # 新增：threads>1 时用线程池并行转换（每个任务各自拉起独立的
+        # fanse sam | samtools view | samtools sort 子进程管道，互不干扰）
+        if threads > 1:
+            import concurrent.futures
+            console.print(f"[bold blue]启用并行模式: {threads} 个线程同时转换[/bold blue]")
+
+            def _convert_one(infile):
+                outfile = output_path / (infile.stem + ".bam") if output_path else None
+                try:
+                    fanse2bam(
+                        fanse_file=str(infile),
+                        fasta_path=args.fasta_path,
+                        output_bam=outfile,
+                        sort=not args.no_sort,
+                        index=not args.no_index,
+                        keep_sam=getattr(args, 'sam', False),
+                        console=console
+                    )
+                    return infile.name, None
+                except Exception as e:
+                    return infile.name, e
+
+            ok_count = fail_count = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = [executor.submit(_convert_one, infile) for infile in input_files]
+                for fut in concurrent.futures.as_completed(futures):
+                    name, err = fut.result()
+                    if err is None:
+                        ok_count += 1
+                        console.print(f"[bold green]完成 ({ok_count + fail_count}/{len(input_files)}): {name}[/bold green]")
+                    else:
+                        fail_count += 1
+                        console.print(f"[bold red]处理 {name} 失败: {err}[/bold red]")
+            console.print(f"批量转换完成: 成功 {ok_count}, 失败 {fail_count}")
+            if fail_count:
+                sys.exit(1)
+            return
+
         for infile in input_files:
             console.print(f"\n[bold blue]处理任务 ({input_files.index(infile) + 1}/{len(input_files)}): {infile.name}[/bold blue]")
             
@@ -192,7 +234,10 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         if sort and not legacy:
             samtools_sort = [samtools_path, 'sort', '-o', str(output_bam), '-']
         log(f"Converting {fanse_file} to BAM via pipe...")
-        p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # 修正：原 stderr=subprocess.PIPE 从未被读取，fanse sam 的 rich 进度/警告写满
+        # ~64KB 管道缓冲区后整个管道死锁（表现为长时间无响应，Ctrl+C 时停在 p3.wait()）。
+        # 按方案B改为 DEVNULL 彻底排空，消除死锁；警告信息不再显示，属可接受取舍
+        p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         
         if sort and not legacy:
             # fanse sam | fanse samtools view -bS - | fanse samtools sort -o output.bam
@@ -234,7 +279,8 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
             # 从 stdin 读取时，使用 `sort - <out.prefix>`
             samtools_sort_legacy = [samtools_path, 'sort', '-', output_prefix]
             
-            p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # 修正：p2 的 stderr=PIPE 从未被读取，同样存在缓冲区写满死锁隐患，改为 DEVNULL
+            p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             p3 = subprocess.Popen(samtools_sort_legacy, stdin=p2.stdout, stderr=subprocess.PIPE)
             p1.stdout.close()
             p2.stdout.close()
@@ -385,7 +431,16 @@ def add_bam_subparser(subparsers):
         '-s', '--sam', action='store_true',
         help='保留中间SAM文件（Windows临时文件模式）'
     )
-    
+
+    # 新增：并行转换线程数（仅批量模式生效）
+    bam_parser.add_argument(
+        '-t', '--threads', type=int, default=1,
+        help='并行转换线程数（仅批量模式生效）：每个线程独立运行一条 '
+             '"fanse sam | samtools view | samtools sort" 管道（3个子进程），'
+             '线程数为N时同时转换N个文件；单文件模式下管道本身已是多进程流式并行，'
+             '增大该值无效果。建议2-4，默认1（串行）。注意每个线程约占1个CPU核与数百MB内存'
+    )
+
     bam_parser.set_defaults(func=bam_command)
 
     add_rich_epilog(bam_parser, """
@@ -402,4 +457,7 @@ def add_bam_subparser(subparsers):
 
   3. 批量处理 (使用通配符):
      [green]fanse bam -i "*.fanse3" -r ref.fa[/green]
+
+  4. 批量并行转换 (4个文件同时转换):
+     [green]fanse bam -i "*.fanse3" -r ref.fa -o bam_out/ -t 4[/green]
 """)
