@@ -204,33 +204,25 @@ def calculate_flag(record: FANSeRecord, is_reverse_strand: bool, is_primary_alig
     """
     根据FANSeRecord信息计算SAM FLAG。
     现在FANSeRecord中已经包含了is_mapped, is_first_in_pair, is_second_in_pair等信息。
+
+    修正：fanse 为单文件单端比对，文件中不存在 mate 记录，按 SAM 规范
+    不应设置 0x1(paired)/0x40(first)/0x80(second) 位——否则 IGV 等工具会
+    误显示 "mate is mapped=yes" 等虚假配对信息（read name 中的 " 1:N:0:"
+    仅表示 R1 测序，不代表该文件存在配对的 R2）。如未来支持双端合并流程，
+    应在合并 R1/R2 后由 fixmate 类工具统一设置配对 FLAG。
     """
     flag = 0
 
-    # 0x1: read is paired in sequencing
-    if record.is_first_in_pair is not None or record.is_second_in_pair is not None:
-        flag |= 0x1
+    # 修正：不再设置 0x1(paired)/0x40(first in pair)/0x80(second in pair)，
+    # 单端输出；0x2/0x8/0x20 本就依赖真实配对，同样保持为 0
 
-    # 0x2: read is mapped in a proper pair (由samtools fixmate设置)
     # 0x4: read is unmapped
     if not record.is_mapped:
         flag |= 0x4
 
-    # 0x8: mate is unmapped (由samtools fixmate设置)
-
     # 0x10: read reverse strand
     if is_reverse_strand:
         flag |= 0x10
-
-    # 0x20: mate reverse strand (由samtools fixmate设置)
-
-    # 0x40: first in pair
-    if record.is_first_in_pair:
-        flag |= 0x40
-
-    # 0x80: second in pair
-    if record.is_second_in_pair:
-        flag |= 0x80
 
     # 0x100: not primary alignment
     if not is_primary_alignment:
@@ -428,28 +420,37 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     现在支持FANSeRecord中包含的双端信息和未比对信息。
     """
     # 质量值（FANSe3不提供，默认为所有位置'I'）
+    # 修正：QUAL 与 SEQ 一一对应，反链时 SEQ 为 revcomp；'I' 各碱基相同，
+    # 翻转与否结果一致，故无需处理
     qual = 'I' * len(record.seq)
 
-    # 预先计算所有辅助比对的SA标签，如果存在的话
-    all_sa_tag_str = ""
-    if record.is_multi and len(record.ref_names) > 1:
+    # 修正：SAM QNAME 不允许含空格，用标准化 read name（去除 " 1:N:0:..."
+    # 等 Illumina 后缀；后缀信息仅用于判定 R1/R2，不进入 QNAME）
+    qname = getattr(record, 'read_pair_id', None) or (
+        record.header.split()[0] if record.header.split() else record.header)
+
+    # SA:Z 标签生成
+    # 修正：SAM 规范中 SA:Z 列出该 read 除"当前行比对"外的所有其他比对——
+    #   主比对行: 列出全部辅助比对（旧实现把主比对也写入，IGV 显示虚假重复条目）;
+    #   辅助比对行: 应列出主比对+其他辅助（排除自身），旧实现共用主行视角。
+    def _make_sa_tag(exclude_idx: int) -> str:
         sa_parts = []
-        primary_idx = 0 # 假设第一个是主比对
         for i in range(len(record.ref_names)):
-            # 获取比对信息
+            if i == exclude_idx:
+                continue
             # 修正：SA:Z 中参考名规范化为 accession，与 RNAME 一致
             ref_name = _sam_ref_name(record.ref_names[i])
             position = record.positions[i]
             strand = record.strands[i] if record.strands else 'F'
             is_reverse = (strand == 'R')
-            
+
             cigar = generate_cigar(record.alignment[i], is_reverse)
-            mapq = calculate_mapq_advanced(record, i, is_primary=(i == primary_idx)) # 计算MAPQ
+            mapq = calculate_mapq_advanced(record, i, is_primary=(i == 0))
             nm = calculate_nm(record.alignment[i]) # 计算NM
 
             strand_char = '+' if not is_reverse else '-'
             sa_parts.append(f"{ref_name},{position+1},{strand_char},{cigar},{mapq},{nm}")
-        all_sa_tag_str = f"SA:Z:{';'.join(sa_parts)};"
+        return f"SA:Z:{';'.join(sa_parts)};" if sa_parts else ""
 
     # 如果read未比对
     if not record.is_mapped:
@@ -462,8 +463,9 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         tlen = 0
 
         # 生成SAM行
+        # 修正：QNAME 用标准化 read name（不含空格）
         sam_line = '\t'.join([
-            record.header,
+            qname,
             str(flag),
             '*',  # RNAME
             '0',  # POS
@@ -511,9 +513,11 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     # 计算FLAG
     flag = calculate_flag(record, is_reverse_strand, is_primary_alignment)
 
-    # RNEXT, PNEXT, TLEN 占位符，由samtools fixmate修正
-    rnext = '=' if (record.is_first_in_pair or record.is_second_in_pair) else '*'
-    pnext = primary_position + 1 if (record.is_first_in_pair or record.is_second_in_pair) else 0
+    # RNEXT, PNEXT, TLEN
+    # 修正：单端输出（FLAG 不再设 0x1），RNEXT/PNEXT 不再伪造"mate=自身"的
+    # 配对信息（旧输出使 IGV 显示 "Mate is mapped=yes, Mate start=..."）
+    rnext = '*'
+    pnext = 0
     tlen = 0
 
     # 生成主要比对的SAM行
@@ -523,8 +527,9 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     # （与 bam_linux.py 旧实现的 reverse_complement 处理保持一致）
     out_seq = reverse_complement(record.seq) if is_reverse_strand else record.seq
 
+    # 修正：QNAME 用标准化 read name（不含空格）
     sam_line_parts = [
-        record.header,
+        qname,
         str(flag),
         primary_ref_name,
         str(primary_position + 1),  # SAM是1-based
@@ -540,10 +545,11 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         f"NM:i:{calculate_nm(record.alignment[primary_idx])}", # 添加NM标签
         f"XS:i:{mapq}" # 添加XS标签
     ]
+    # 修正：主比对行的SA=全部辅助比对（排除主比对自身）
+    all_sa_tag_str = _make_sa_tag(primary_idx) if record.is_multi and len(record.ref_names) > 1 else ""
     if all_sa_tag_str:
         sam_line_parts.append(all_sa_tag_str)
     yield '\t'.join(sam_line_parts)
-
     # 处理辅助比对（如果存在）
     if record.is_multi and len(record.ref_names) > 1:
         for i in range(len(record.ref_names)):
@@ -570,7 +576,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
             supp_out_seq = reverse_complement(record.seq) if is_supp_reverse_strand else record.seq
 
             supp_sam_line_parts = [
-                record.header,
+                qname, # 修正：QNAME 用标准化 read name（不含空格）
                 str(supp_flag),
                 supp_ref_name,
                 str(supp_position + 1),
@@ -586,8 +592,10 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
                 f"NM:i:{calculate_nm(record.alignment[i])}", # 添加NM标签
                 f"XS:i:{supp_mapq}" # 添加XS标签
             ]
-            if all_sa_tag_str:
-                supp_sam_line_parts.append(all_sa_tag_str)
+            # 修正：辅助比对行的SA=主比对+其他辅助（排除自身），不再共用主行视角
+            supp_sa = _make_sa_tag(i)
+            if supp_sa:
+                supp_sam_line_parts.append(supp_sa)
             yield '\t'.join(supp_sam_line_parts)
 
 def parse_fasta(fasta_path: str) -> Dict[str, int]:
