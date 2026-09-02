@@ -151,31 +151,53 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
         H: hard-clip (不消耗序列)
         =: 完全匹配
         X: 错配
+
+    修正（基因组证据验证，CQ1-1 实测）:
+        1. FANSe 对齐串操作符语义: '.'=匹配(M), 'x'=错配(X),
+           '-'=参考有而read缺失 → 缺失D(仅消耗参考),
+           字母ACGT=read有而参考缺失 → 插入I(仅消耗查询)。
+           旧实现把 '-' 映射为 I，导致 CIGAR 查询长度 ≠ SEQ 长度，
+           samtools 报 "CIGAR and query sequence are of different length"。
+        2. 反向链(-R) alignment 串按 read 5'→3' 方向记录，与写出 SEQ
+           (revcomp，参考正向) 方向相反，必须先反转串再生成 CIGAR，
+           否则 X/I/D 位置全部镜像错位（与 bam_linux.py 旧实现一致）。
     """
     if not alignment:
         return ""
-    
-    # 预编译操作符映射
-    op_map = {'.': 'M', 'x': 'X', '-': 'I', '+': 'D'} # 修正：根据FANSe规范调整I和D的映射
-    
+
+    # 修正2: 反向链比对串按read方向记录, 先翻转为参考正向
+    if is_reverse:
+        alignment = alignment[::-1]
+
+    def _op(ch: str) -> str:
+        # 修正1: '-'=缺失D(仅消耗参考), 字母=插入I(仅消耗查询)
+        # 注意: 'x' 也是字母, 必须在 isalpha 之前判断
+        if ch == '.':
+            return 'M'
+        if ch == 'x':
+            return 'X'
+        if ch == '-':
+            return 'D'
+        if ch.isalpha():
+            return 'I'
+        return 'M'  # 未知符号兜底按M处理
+
     cigar_parts = []
-    count = 1
-    prev_char = alignment[0]
-    
-    for char in alignment[1:]:
-        if char == prev_char:
+    count = 0
+    prev_op = None
+    # 修正: 按操作符(而非字符)分组, 使相邻不同字母(如AC)正确合并为连续I
+    for char in alignment:
+        op = _op(char)
+        if op == prev_op:
             count += 1
         else:
-            # 确定操作符
-            op = op_map.get(prev_char, 'M') # 修正：如果遇到未知字符，默认按M处理，避免生成S
-            cigar_parts.append(f"{count}{op}")
+            if prev_op is not None:
+                cigar_parts.append(f"{count}{prev_op}")
+            prev_op = op
             count = 1
-            prev_char = char
-    
-    # 处理最后一个字符
-    op = op_map.get(prev_char, 'M') # 修正：如果遇到未知字符，默认按M处理，避免生成S
-    cigar_parts.append(f"{count}{op}")
-    
+    if prev_op is not None:
+        cigar_parts.append(f"{count}{prev_op}")
+
     return ''.join(cigar_parts)
 
 def calculate_flag(record: FANSeRecord, is_reverse_strand: bool, is_primary_alignment: bool) -> int:
@@ -221,14 +243,16 @@ def calculate_flag(record: FANSeRecord, is_reverse_strand: bool, is_primary_alig
     return flag
 
 def calculate_nm(alignment: str) -> int:
-    """计算编辑距离（不匹配+插入+缺失）"""
+    """计算编辑距离（错配+插入+缺失）"""
     nm = 0
     for char in alignment:
         if char == 'x':  # 错配
             nm += 1
-        elif char == '-':  # read 插入（参考序列缺失）
+        elif char == '-':  # 缺失（参考有read无）
             nm += 1
-        elif char == '+':  # read 缺失（参考序列插入）
+        elif char == '+':  # 兼容旧版fanse标记
+            nm += 1
+        elif char != '.' and char.isalpha():  # 修正：插入碱基(ACGT)也计入编辑距离
             nm += 1
     return nm
 
@@ -492,13 +516,13 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     pnext = primary_position + 1 if (record.is_first_in_pair or record.is_second_in_pair) else 0
     tlen = 0
 
+    # 生成主要比对的SAM行
     # 修正：SAM 规范要求 FLAG 含 0x10（反向链）时，SEQ 必须为原始测序序列的
     # 反向互补。fanse3 存储的是原始测序序列（按参考正链方向），若直接输出，
     # IGV 会将正链方向的碱基与反链参考比对，导致反链 reads 显示大量错配
     # （与 bam_linux.py 旧实现的 reverse_complement 处理保持一致）
     out_seq = reverse_complement(record.seq) if is_reverse_strand else record.seq
 
-    # 生成主要比对的SAM行
     sam_line_parts = [
         record.header,
         str(flag),
