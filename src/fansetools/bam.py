@@ -1,10 +1,47 @@
 # fansetools/bam.py
 import os
 import sys
+import json
 import subprocess
+import tempfile
 from pathlib import Path
 from .bin_utils import bin_manager
 from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
+
+# 新增：参考序列信息缓存（header 缓存）
+# 同一 -r FASTA 的 @SQ header 恒定不变，批量转换时只需 parse_fasta 一次，
+# 之后每个 fanse sam 子进程通过 --ref-info-json 毫秒级读取缓存，
+# 避免每个文件都重新逐行读取数 GB 网络盘 FASTA（实测 5.86GB 每次要数分钟）
+
+def build_ref_info_cache(fasta_path: str, console=None) -> str:
+    """
+    解析 FASTA 一次，将 {序列名: 长度} 写入本地临时 JSON 并返回路径。
+
+    修正：缓存放本地临时目录而非网络盘输出目录——本地写读都快且可靠，
+    避免对 \\fs2 这类网络盘的额外写放大。
+    """
+    from .sam import parse_fasta
+
+    def log(msg, style=None):
+        if console:
+            console.print(msg, style=style)
+        else:
+            print(msg)
+
+    log(f"构建参考序列信息缓存（仅此一次，后续转换直接复用）: {fasta_path}")
+    ref_info = parse_fasta(fasta_path)
+    cache_path = os.path.join(tempfile.gettempdir(), f'fansetools_ref_info_{os.getpid()}.json')
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(ref_info, f, ensure_ascii=False)
+    log(f"缓存就绪: {cache_path} ({len(ref_info)} 条序列)")
+    return cache_path
+
+def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None):
+    """新增：统一构建 fanse sam 命令；提供缓存时追加 --ref-info-json 跳过 FASTA 解析"""
+    cmd = ['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path)]
+    if ref_info_json:
+        cmd.extend(['--ref-info-json', str(ref_info_json)])
+    return cmd
 
 def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None):
     """
@@ -113,6 +150,16 @@ def bam_command(args):
     # 三个子进程的流式并行，再并行无意义）
     threads = max(1, int(getattr(args, 'threads', 1) or 1))
 
+    # 新增：header 缓存——同一 -r FASTA 的 @SQ header 恒定，只解析一次写本地 JSON，
+    # 后续每个 fanse sam 子进程毫秒级读缓存，避免每文件重复读取数 GB 网络盘 FASTA
+    ref_info_cache = None
+    try:
+        ref_info_cache = build_ref_info_cache(args.fasta_path, console)
+    except Exception as e:
+        # 修正：缓存构建失败不阻断转换，回退为每个 fanse sam 自行解析 FASTA（旧行为）
+        console.print(f"[bold yellow]警告: 参考序列缓存构建失败({e})，将回退为逐文件解析FASTA[/bold yellow]")
+        ref_info_cache = None
+
     # 批量模式检查
     if len(input_files) > 1:
         if output_path and output_path.suffix:
@@ -140,24 +187,33 @@ def bam_command(args):
                         sort=not args.no_sort,
                         index=not args.no_index,
                         keep_sam=getattr(args, 'sam', False),
-                        console=console
+                        console=console,
+                        ref_info_json=ref_info_cache  # 新增：header缓存透传
                     )
                     return infile.name, None
                 except Exception as e:
                     return infile.name, e
 
             ok_count = fail_count = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-                futures = [executor.submit(_convert_one, infile) for infile in input_files]
-                for fut in concurrent.futures.as_completed(futures):
-                    name, err = fut.result()
-                    if err is None:
-                        ok_count += 1
-                        console.print(f"[bold green]完成 ({ok_count + fail_count}/{len(input_files)}): {name}[/bold green]")
-                    else:
-                        fail_count += 1
-                        console.print(f"[bold red]处理 {name} 失败: {err}[/bold red]")
-            console.print(f"批量转换完成: 成功 {ok_count}, 失败 {fail_count}")
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                    futures = [executor.submit(_convert_one, infile) for infile in input_files]
+                    for fut in concurrent.futures.as_completed(futures):
+                        name, err = fut.result()
+                        if err is None:
+                            ok_count += 1
+                            console.print(f"[bold green]完成 ({ok_count + fail_count}/{len(input_files)}): {name}[/bold green]")
+                        else:
+                            fail_count += 1
+                            console.print(f"[bold red]处理 {name} 失败: {err}[/bold red]")
+                console.print(f"批量转换完成: 成功 {ok_count}, 失败 {fail_count}")
+            finally:
+                # 新增：批量结束删除临时 header 缓存
+                if ref_info_cache:
+                    try:
+                        os.remove(ref_info_cache)
+                    except OSError:
+                        pass
             if fail_count:
                 sys.exit(1)
             return
@@ -179,7 +235,8 @@ def bam_command(args):
                     sort=not args.no_sort,
                     index=not args.no_index,
                     keep_sam=getattr(args, 'sam', False),
-                    console=console
+                    console=console,
+                    ref_info_json=ref_info_cache  # 新增：header缓存透传
                 )
             except Exception as e:
                 console.print(f"[bold red]处理 {infile.name} 失败: {e}[/bold red]")
@@ -195,13 +252,21 @@ def bam_command(args):
                 sort=not args.no_sort,
                 index=not args.no_index,
                 keep_sam=getattr(args, 'sam', False),
-                console=console
+                console=console,
+                ref_info_json=ref_info_cache  # 新增：header缓存透传
             )
         except Exception as e:
             console.print(f"[bold red]错误: {e}[/bold red]")
             sys.exit(1)
+        finally:
+            # 新增：转换结束删除临时 header 缓存（单文件模式）
+            if ref_info_cache:
+                try:
+                    os.remove(ref_info_cache)
+                except OSError:
+                    pass
 
-def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None):
+def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None):
     #直接原位生成BAM文件，并进行排序索引
     def log(msg, style=None):
         if console:
@@ -211,8 +276,12 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
     if output_bam is None:
         output_bam = Path(fanse_file).with_suffix('.bam')
+    # 新增：fanse sam 的 stderr 重定向到日志文件（方案A替代DEVNULL）
+    # 转换期间屏幕静默时，可 tail 该日志查看 fanse sam 进度/警告，不再"假装卡死"
+    conv_log = Path(output_bam).with_suffix('.bam_conv.log')
+    conv_log_fp = None
     try:
-        fanse_cmd = ['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path)]
+        fanse_cmd = _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json)
         samtools_path = bin_manager.get_samtools_path()
         log(f"Using samtools from: {samtools_path}")
 
@@ -234,10 +303,11 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         if sort and not legacy:
             samtools_sort = [samtools_path, 'sort', '-o', str(output_bam), '-']
         log(f"Converting {fanse_file} to BAM via pipe...")
-        # 修正：原 stderr=subprocess.PIPE 从未被读取，fanse sam 的 rich 进度/警告写满
-        # ~64KB 管道缓冲区后整个管道死锁（表现为长时间无响应，Ctrl+C 时停在 p3.wait()）。
-        # 按方案B改为 DEVNULL 彻底排空，消除死锁；警告信息不再显示，属可接受取舍
-        p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # 修正：fanse sam 的 stderr 原为 PIPE 时从未读取会导致缓冲区写满死锁，
+        # 改为重定向到日志文件（方案A）：既消除死锁，又保留进度/警告供 tail 排查
+        conv_log_fp = open(conv_log, 'w', encoding='utf-8')
+        log(f"fanse sam 进度日志: {conv_log}")
+        p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
         
         if sort and not legacy:
             # fanse sam | fanse samtools view -bS - | fanse samtools sort -o output.bam
@@ -306,11 +376,24 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
         if index:
             subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
+        if conv_log_fp:
+            conv_log_fp.close()
+            conv_log_fp = None
         log(f"Successfully created BAM file: {output_bam}", style="bold green")
         return output_bam
     except Exception as e:
+        if conv_log_fp:
+            conv_log_fp.close()
+            conv_log_fp = None
         log(f"Pipe conversion failed: {e}", style="bold red")
         raise
+    finally:
+        # 修正：确保日志句柄在任何路径下都被关闭，避免并行模式下句柄泄漏
+        if conv_log_fp is not None:
+            try:
+                conv_log_fp.close()
+            except Exception:
+                pass
 
 def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None):
     """Windows专用版本（使用临时文件，避免管道问题）"""
@@ -383,11 +466,12 @@ def _fallback_conversion(fanse_file, fasta_path, output_bam, sort, index, consol
     
     raise RuntimeError("Fallback conversion not implemented. Please install a working version of samtools.")
 
-def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None):
+def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, ref_info_json=None):
     """自动选择平台最优方法"""
     if os.name == 'nt':
         try:
-            return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index, console)
+            # 新增：ref_info_json 透传给管道转换，跳过每文件的 FASTA 全量解析
+            return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json)
         except Exception:
             #如果Windows版本失败，尝试使用传统方法
             return fanse2bam_win(fanse_file, fasta_path, output_bam, sort, index, keep_sam, console)
@@ -447,6 +531,9 @@ def add_bam_subparser(subparsers):
 [bold]功能说明:[/bold]
   直接将 FANSe3 结果转换为 BAM 文件，无需生成中间的 SAM 文件。
   自动调用 samtools 进行排序和索引 (需安装 samtools)。
+  转换前自动解析一次 FASTA 生成参考序列信息缓存（本地临时JSON），
+  后续每个文件的 fanse sam 直接读缓存跳过数GB级FASTA重复解析，大幅提速。
+  每个文件的 fanse sam 进度/警告写入 <输出名>.bam_conv.log，可随时 tail 查看。
 
 [bold]示例:[/bold]
   1. 标准转换 (自动排序+索引):

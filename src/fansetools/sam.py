@@ -767,13 +767,14 @@ def is_record_in_region(record: FANSeRecord, regions: Dict[str, List[Tuple[int, 
                     
     return False
 
-def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None, 
+def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None,
               region: Optional[str] = None, console=None, threads: int = 4,
               unmapped_file: Optional[str] = None, is_paired_end: bool = False,
+              ref_info_json: Optional[str] = None,
               _pipe_writer=None): # 新增_pipe_writer参数
     """
     将FANSe3文件转换为SAM格式，支持区域过滤和双端模式。
-    
+
     参数:
         fanse_file: 输入FANSe3文件路径。
         fasta_path: 参考基因组FASTA文件路径。
@@ -783,13 +784,32 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
         threads: 并行处理的线程数。
         unmapped_file: 未比对reads文件路径（仅在is_paired_end为True时有效）。
         is_paired_end: 是否启用双端模式，将合并fanse_file和unmapped_file的记录。
+        ref_info_json: 参考序列信息缓存JSON路径（新增，{序列名: 长度}）。
+            提供时跳过逐行解析FASTA（数GB网络文件可节省数分钟），直接毫秒级读取缓存。
+            缓存不可用（缺失/损坏）时自动回退为解析FASTA，不影响正确性。
         _pipe_writer: 内部参数，用于将输出写入到subprocess管道的stdin。
     """
     if console is None:
         console = Console(stderr=True)
 
     # 解析参考序列信息
-    ref_info = parse_fasta(fasta_path)
+    # 修正：支持 ref_info_json 缓存——bam 批量转换时同一 -r 的 header 只解析一次 FASTA，
+    # 其余转换直接读缓存，避免每文件重复读取数 GB 网络文件
+    ref_info = None
+    if ref_info_json:
+        try:
+            import json
+            with open(ref_info_json, 'r', encoding='utf-8') as jf:
+                ref_info = json.load(jf)
+            if not isinstance(ref_info, dict) or not ref_info:
+                raise ValueError("缓存内容为空或格式错误")
+            console.print(f"从缓存加载参考序列信息: {ref_info_json} ({len(ref_info)} 条序列)")
+        except Exception as e:
+            # 修正：缓存失效时回退为解析FASTA，保证正确性
+            console.print(f"[bold yellow]警告: 参考序列缓存不可用({e})，回退为解析FASTA[/bold yellow]")
+            ref_info = None
+    if ref_info is None:
+        ref_info = parse_fasta(fasta_path)
     
     # 解析区域过滤条件
     regions = {}
@@ -1028,14 +1048,15 @@ def run_sam_command(args):
                 sort_process.stdout.close()
 
                 # 调用fanse2sam，将输出写入sort_process的stdin
-                fanse2sam(input_path, 
-                          args.fasta_path, 
+                fanse2sam(input_path,
+                          args.fasta_path,
                           output_sam=None, # 强制输出到stdout，由管道捕获
                           region=args.region,
                           console=console,
                           threads=args.threads,
                           unmapped_file=current_unmapped_file,
                           is_paired_end=args.is_paired_end,
+                          ref_info_json=getattr(args, 'ref_info_json', None), # 新增：header缓存透传
                           _pipe_writer=sort_process.stdin # 将stdin传递给fanse2sam
                           )
                 sort_process.stdin.close() # 关闭stdin，通知sort进程输入结束
@@ -1067,14 +1088,15 @@ def run_sam_command(args):
 
             else:
                 # 正常调用fanse2sam
-                fanse2sam(input_path, 
-                          args.fasta_path, 
+                fanse2sam(input_path,
+                          args.fasta_path,
                           output_path,
                           region=args.region,
                           console=console,
                           threads=args.threads,
                           unmapped_file=current_unmapped_file,
-                          is_paired_end=args.is_paired_end
+                          is_paired_end=args.is_paired_end,
+                          ref_info_json=getattr(args, 'ref_info_json', None) # 新增：header缓存透传
                           )
         except Exception as e:
             console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
@@ -1101,6 +1123,12 @@ def add_sam_subparser(subparsers):
                             help='启用双端模式。将自动搜索同目录下的 .unmapped 文件进行合并处理。')
     sam_parser.add_argument('--fixmate', action='store_true',
                             help='在输出SAM后，自动通过管道执行 samtools sort -n | samtools fixmate。此选项会强制输出到标准输出。')
+    # 新增：参考序列信息缓存JSON（{序列名: 长度}），跳过逐行解析FASTA生成header
+    sam_parser.add_argument('--ref-info-json',
+                            help='（可选）参考序列信息缓存JSON路径，格式为 {"序列名": 长度}。'
+                                 '提供时跳过逐行解析FASTA（数GB文件可节省数分钟），直接毫秒级读取缓存生成@SQ header；'
+                                 '缓存缺失或损坏时自动回退为解析FASTA。可由 fanse bam 批量转换自动生成，'
+                                 '也可用 fansetools.sam.parse_fasta 手动生成')
     sam_parser.set_defaults(func=run_sam_command)
 
     add_rich_epilog(sam_parser, """
