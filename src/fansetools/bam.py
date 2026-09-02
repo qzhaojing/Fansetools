@@ -307,7 +307,11 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
         samtools_view = [samtools_path, 'view', '-bS', '-']
         if sort and not legacy:
-            samtools_sort = [samtools_path, 'sort', '-o', str(output_bam), '-']
+            # 修正：samtools sort 默认每线程预留约768MB内存，批量并行(默认-5)时
+            # 多个 sort 同时分配导致物理内存耗尽，报 "couldn't allocate memory
+            # for bam_mem" 并连锁使上游 view 写管道失败。显式限制单线程+每转换
+            # 512MB：5 并行时 sort 总内存约 2.5GB，稳定可控
+            samtools_sort = [samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), '-']
         log(f"Converting {fanse_file} to BAM via pipe...")
         # 修正：fanse sam 的 stderr 原为 PIPE 时从未读取会导致缓冲区写满死锁，
         # 改为重定向到日志文件（方案A）：既消除死锁，又保留进度/警告供 tail 排查
@@ -418,21 +422,29 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
     try:
         # 生成临时SAM文件
         log(f"Creating temporary SAM file: {temp_sam}")
-        subprocess.run(['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path), '-o', str(temp_sam)], 
+        # 修正：加 -t 1 单线程流式输出。fallback 常见于超大 multi 文件（内存
+        # 敏感场景），多进程模式每批 20000 条 pickle 回传会重现 MemoryError
+        subprocess.run(['fanse', 'sam', '-t', '1', '-i', str(fanse_file), '-r', str(fasta_path), '-o', str(temp_sam)],
                       check=True, capture_output=True, text=True)
-        
+
         # 转换为BAM
         samtools_path = bin_manager.get_samtools_path()
         log(f"Using samtools from: {samtools_path}")
-        
+
         # 先将SAM转换为BAM（临时文件）
         subprocess.run([samtools_path, 'view', '-bS', str(temp_sam), '-o', str(temp_bam)], check=True)
-        
+
         if sort:
-            # 排序BAM文件 - 使用输出前缀（不带.bam后缀）
-            output_prefix = str(output_bam).replace('.bam', '')
-            subprocess.run([samtools_path, 'sort', str(temp_bam), output_prefix], check=True)
-            
+            # 修正：限制 sort 内存（同管道路径），并区分新旧版语法——
+            # 新版: sort -@ 1 -m 512M -o out.bam in.bam；旧版(0.x): sort in.bam out.prefix
+            try:
+                subprocess.run([samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), str(temp_bam)],
+                               check=True)
+            except subprocess.CalledProcessError:
+                # 旧版语法兜底
+                output_prefix = str(output_bam).replace('.bam', '')
+                subprocess.run([samtools_path, 'sort', str(temp_bam), output_prefix], check=True)
+
             if index:
                 subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
         else:
