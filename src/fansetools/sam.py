@@ -492,6 +492,12 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     pnext = primary_position + 1 if (record.is_first_in_pair or record.is_second_in_pair) else 0
     tlen = 0
 
+    # 修正：SAM 规范要求 FLAG 含 0x10（反向链）时，SEQ 必须为原始测序序列的
+    # 反向互补。fanse3 存储的是原始测序序列（按参考正链方向），若直接输出，
+    # IGV 会将正链方向的碱基与反链参考比对，导致反链 reads 显示大量错配
+    # （与 bam_linux.py 旧实现的 reverse_complement 处理保持一致）
+    out_seq = reverse_complement(record.seq) if is_reverse_strand else record.seq
+
     # 生成主要比对的SAM行
     sam_line_parts = [
         record.header,
@@ -503,7 +509,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         rnext,
         str(pnext),
         str(tlen),
-        record.seq,
+        out_seq,
         qual,
         f"XM:i:{primary_mismatches}", # 添加XM标签
         f"XN:i:{record.multi_count}", # 添加XN标签
@@ -536,6 +542,9 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
             supp_cigar = generate_cigar(record.alignment[i], is_supp_reverse_strand) # 修正：第一个参数应为比对字符串
             supp_mapq = calculate_mapq_advanced(record, i, is_primary=False) # 传递record和索引
 
+            # 修正：辅助比对为反向链时 SEQ 同样需要反向互补（同主比对，SAM 0x10 规范）
+            supp_out_seq = reverse_complement(record.seq) if is_supp_reverse_strand else record.seq
+
             supp_sam_line_parts = [
                 record.header,
                 str(supp_flag),
@@ -546,7 +555,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
                 rnext, # 辅助比对的RNEXT, PNEXT, TLEN与主要比对相同
                 str(pnext),
                 str(tlen),
-                record.seq,
+                supp_out_seq,
                 qual,
                 f"XM:i:{supp_mismatches}", # 添加XM标签
                 f"XN:i:{record.multi_count}", # 添加XN标签
