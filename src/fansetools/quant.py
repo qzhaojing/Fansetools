@@ -245,6 +245,14 @@ def write_matrix(samples_data: Dict[str, pd.DataFrame], out_path: str, id_col: s
     else:
         combined = count_mat
 
+    # 修正：输出前过滤全零/全空行——所有列（计数与TPM/RPKM）均为0或NaN的ID无表达信息，
+    #       直接剔除，仅输出至少在一个样本中有值的行；计数全为0的行其TPM/RPKM也必为0，故对整行判断即可
+    keep_mask = combined.fillna(0.0).abs().sum(axis=1) > 0
+    dropped = int((~keep_mask).sum())
+    if dropped:
+        print(f"已过滤 {dropped} 个全零/全空行（所有样本中均无计数的ID）")
+    combined = combined[keep_mask]
+
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(out_path)
     print(out_path)
@@ -340,8 +348,18 @@ def run_quant_with_args(args: argparse.Namespace) -> None:
         Console(force_terminal=True).print(f"[bold red]❌ 未找到匹配的输入文件: {args.inputs}[/bold red]")
         Console(force_terminal=True).print(f"[bold yellow]要求: {'*.counts_gene_level_unique.csv' if args.pattern == 'gene_unique' else '*.counts_isoform_level_unique.csv'}[/bold yellow]")
         sys.exit(1)
-    if not args.annotation:
-        Console(force_terminal=True).print(f"[bold red]❌ 需要提供 --annotation 才能计算长度与TPM[/bold red]")
+    # 修正：-f 非 none 时需要输出目录；提示语同步 -o/-m 合并后的新语义
+    if args.format != 'none' and not args.outdir:
+        Console(force_terminal=True).print(f"[bold red]❌ -f 非 none 时需要提供 -o/--outdir 指定输出目录[/bold red]")
+        Console(force_terminal=True).print(f"[bold yellow]提示: 若仅需合并计数矩阵，请使用 -f none（矩阵默认输出到 -i 文件夹下，可用 -o 指定输出目录或 .csv 路径），此时 -a 也可省略[/bold yellow]")
+        sys.exit(1)
+    # 修正：-f none 模式下未指定 -m 时不再报错——矩阵路径默认生成到 -i 输入数据文件夹下（见下方 matrix_path 逻辑）
+    # 修正：注释文件仅在需要长度信息时强制——TPM/RPKM 计算（-q 非 none）或格式导出（-f 非 none，文件内含 length/effective_length 列）
+    #       纯计数矩阵模式（-q none -f none）可跳过，用户无需准备注释文件
+    needs_length = (args.quant != 'none') or (args.format != 'none')
+    if needs_length and not args.annotation:
+        Console(force_terminal=True).print(f"[bold red]❌ 需要提供 --annotation 才能计算 TPM/RPKM 或导出格式文件[/bold red]")
+        Console(force_terminal=True).print(f"[bold yellow]提示: 若仅需合并计数矩阵，请使用 -q none -f none，此时 --annotation 可省略[/bold yellow]")
         sys.exit(1)
     samples: Dict[str, pd.DataFrame] = {}
     for f in files:
@@ -354,28 +372,69 @@ def run_quant_with_args(args: argparse.Namespace) -> None:
     else:
         id_col_default = 'Transcript' if 'Transcript' in next(iter(samples.values())).columns else 'txname'
         length_level = 'isoform'
-    len_map, eff_map = _load_lengths(args.annotation, level=length_level)
+    # 修正：仅在需要长度信息时解析注释文件——大 GTF/refflat 解析耗时明显，纯矩阵模式直接跳过以加速
+    if needs_length:
+        len_map, eff_map = _load_lengths(args.annotation, level=length_level)
+    else:
+        len_map, eff_map = {}, {}
     len_map = {k: _safe_float(v, 0.0) for k, v in len_map.items()}
     eff_map = {k: _safe_float(v, _safe_float(len_map.get(k, 0.0), 0.0)) for k, v in eff_map.items()}
+    # 修正：count.py 生成的 CSV 中 unique/multi 计数列名与文件层级有关——
+    #       isoform 文件列为 unique_to_isoform / multi_to_isoform，gene 文件列为 unique_to_gene / multi_to_gene；
+    #       此处将 -c unique / multi 别名按输入类型解析为实际列名，避免"列不存在"误报
+    unique_alias = 'unique_to_gene' if args.pattern == 'gene_unique' else 'unique_to_isoform'
+    multi_alias = 'multi_to_gene' if args.pattern == 'gene_unique' else 'multi_to_isoform'
+
+    def _resolve_ct(ct: str) -> str:
+        # 修正：列名别名解析——unique/multi 映射为当前文件层级对应的实际列名
+        if ct == 'unique':
+            return unique_alias
+        if ct == 'multi':
+            return multi_alias
+        return ct
+
     id_col = id_col_default
-    if args.matrix:
-        ct_for_matrix = args.count_type if (args.count_type and args.count_type != 'all') else (args.columns.split(',')[0] if args.columns else 'Final_EM')
-        if ct_for_matrix not in next(iter(samples.values())).columns:
-            Console(force_terminal=True).print(f"[bold yellow]提示:[/bold yellow] 矩阵计数列 {ct_for_matrix} 不存在，跳过生成矩阵")
-        else:
-            write_matrix(samples, args.matrix, id_col=id_col, count_col=ct_for_matrix, 
-                        len_map=len_map, eff_map=eff_map, quant_type=args.quant)
+    # 修正：-o 与原 -m 合并为统一输出参数——-o 给目录则矩阵输出到该目录（<pattern>_matrix.csv），
+    #       给 .csv 文件路径则直接作为矩阵输出（格式文件输出到其所在目录）；未指定时矩阵输出到 -i 数据文件夹下；
+    #       -o 无目录部分（纯文件名）时解析到 -i 文件夹下，避免落入当前工作目录找不到文件
+    default_dir = Path(files[0]).parent
     outdir = args.outdir
-    if args.count_type and args.count_type != 'all':
-        count_types = [args.count_type]
-    elif args.columns:
-        count_types = [c.strip() for c in args.columns.split(',') if c.strip()]
+    if outdir:
+        if Path(outdir).parent == Path('.'):
+            outdir = str(default_dir / outdir)
+        if outdir.lower().endswith('.csv'):
+            matrix_path = outdir
+            outdir = str(Path(matrix_path).parent)
+            print(f"矩阵输出到: {matrix_path}")
+        else:
+            matrix_path = str(Path(outdir) / f"{args.pattern}_matrix.csv")
     else:
-        count_types = ['Final_EM']
-    if args.count_type == 'all':
-        preset = ['raw', 'unique', 'firstID', 'Final_EM', 'Final_EQ', 'Final_MA']
+        outdir = None
+        # 修正：取首个输入文件的父目录作为默认输出目录（多目录输入时以第一个为准）
+        matrix_path = str(default_dir / f"{args.pattern}_matrix.csv")
+        print(f"未指定 -o，矩阵默认输出到输入数据文件夹: {matrix_path}")
+    # 修正：-c 合并原 --columns 功能——取消固定 choices，支持任意 count.py 输出列名与逗号分隔多列；
+    #       unique/multi 别名按 -p 解析；矩阵取第一列，格式导出循环全部列；缺失列在运行时报错并列出可用列
+    ct_tokens = [c.strip() for c in (args.count_type or 'Final_EM').split(',') if c.strip()]
+    if 'all' in ct_tokens:
+        # 修正：all 预设中的 unique/multi 替换为当前层级的实际列名（按实际存在列过滤）
+        preset = ['raw', unique_alias, multi_alias, 'firstID', 'Final_EM', 'Final_EQ', 'Final_MA']
         present = next(iter(samples.values())).columns
         count_types = [c for c in preset if c in present]
+    else:
+        count_types = [_resolve_ct(c) for c in ct_tokens]
+    ct_for_matrix = count_types[0]
+    if ct_for_matrix not in next(iter(samples.values())).columns:
+        # 修正：列不存在时列出首个样本的实际可用列，方便用户自查正确列名
+        available = list(next(iter(samples.values())).columns)
+        Console(force_terminal=True).print(f"[bold yellow]提示:[/bold yellow] 矩阵计数列 {ct_for_matrix} 不存在，跳过生成矩阵")
+        Console(force_terminal=True).print(f"[bold yellow]可用列:[/bold yellow] {', '.join(available)}")
+    else:
+        write_matrix(samples, matrix_path, id_col=id_col, count_col=ct_for_matrix,
+                    len_map=len_map, eff_map=eff_map, quant_type=args.quant)
+    # 修正：-f none 时不进入格式导出循环，仅生成合并矩阵（纯矩阵模式直接返回）
+    if args.format == 'none':
+        return
     level_list = ['gene', 'isoform'] if args.level == 'both' else [args.level]
     for lvl in level_list:
         id_col = 'Gene' if (lvl == 'gene') else ('Transcript' if 'Transcript' in next(iter(samples.values())).columns else 'txname')
@@ -398,21 +457,27 @@ def handle_quant_command(args: argparse.Namespace):
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     """将 quant 模块的公共参数集中定义，避免两处重复维护"""
     parser.add_argument('-i', '--inputs', required=True, help='输入文件或目录（通配符/逗号分隔），gene: *.counts_gene_level_unique.csv；isoform: *.counts_isoform_level_unique.csv')
-    parser.add_argument('-a', '--annotation', required=True, help='注释文件路径（必须）：支持 .refflat/.gtf/.gff/.gff3，将统一构建长度映射')
+    # 修正：--annotation 由"必须"改为"条件必须"——仅当需要长度信息（-q 非 none 或 -f 非 none）时才强制，
+    #       纯计数矩阵模式（-q none -f none）可省略，方便用户只合并 count 矩阵
+    parser.add_argument('-a', '--annotation', required=False, help='注释文件路径：支持 .refflat/.gtf/.gff/.gff3，用于构建长度映射；当 -q 非 none 或 -f 非 none 时必须提供，仅输出计数矩阵（-q none -f none）时可省略')
     parser.add_argument('-p', '--pattern', choices=['gene_unique', 'isoform_unique'], default='gene_unique', help='输入文件类型：gene 或 isoform_unique文件')
     parser.add_argument('-l', '--level', choices=['gene', 'isoform', 'both'], default='gene', help='导出层级：gene/isoform/both.默认gene，当选择文件为gene_unique时，isoform无效')
-    parser.add_argument('-f', '--format', choices=['rsem', 'salmon', 'kallisto', 'featureCounts', 'all'], default='rsem', help='导出格式')
-    parser.add_argument('-o', '--outdir', required=True, help='输出目录')
-    parser.add_argument('-m', '--matrix', required=False, help='可选：输出合并矩阵 CSV 路径（使用首个计数列）')
-    parser.add_argument('-c', '--count-type', choices=['raw', 'unique', 'firstID', 'Final_EM', 'Final_EQ', 'Final_MA', 'all'], default='Final_EM', help='计数列选择；all 输出多份')
+    # 修正：--format none 语义更新——仅输出合并矩阵（此时 --annotation 可省略）
+    parser.add_argument('-f', '--format', choices=['rsem', 'salmon', 'kallisto', 'featureCounts', 'all', 'none'], default='rsem', help='导出格式；none 表示不导出格式文件、仅输出合并矩阵（此时 --annotation 可省略）')
+    # 修正：-o 合并原 -m 为统一输出参数——给目录则矩阵与格式文件输出到该目录；给 .csv 路径则直接作为矩阵输出；
+    #       未指定时矩阵输出到 -i 数据文件夹下；纯文件名解析到 -i 文件夹下
+    parser.add_argument('-o', '--outdir', required=False, help='统一输出参数：给目录 → 格式文件与矩阵输出到该目录（矩阵名 <pattern>_matrix.csv）；给 .csv 文件路径 → 直接作为矩阵输出路径（格式文件输出到其所在目录）；未指定时矩阵输出到 -i 输入数据文件夹下；仅给文件名（无路径）时解析到 -i 文件夹下')
+    # 修正：-c 合并原 --columns——取消固定 choices，支持任意 count.py 输出列名与逗号分隔多列（矩阵取第一列）；
+    #       unique/multi 为智能别名，依据 -p 自动映射为对应层级的实际列名
+    parser.add_argument('-c', '--count-type', default='Final_EM', help='计数列选择：支持任意 count.py 输出的列名（raw/unique_to_isoform/unique_to_gene/multi_to_isoform/multi_to_gene/multi2all/multi_equal/firstID/Final_EM/Final_EQ/Final_MA 等），逗号分隔多列用于格式导出（矩阵取第一列）；unique/multi 为层级别名（按 -p 自动映射为 *_to_isoform 或 *_to_gene）；all 输出全部主要列；默认 Final_EM')
     parser.add_argument('-q', '--quant', choices=['none', 'tpm', 'rpkm', 'both'], default='tpm', help='矩阵中的定量类型：none(仅计数)/tpm/RPKM/both(两者)')
-    parser.add_argument('--columns', default='Final_EM', help='兼容参数：逗号分隔的计数列；与 --count-type 同时出现时以 --count-type 为准')
 
 def add_quant_subparser(subparsers):
     parser = subparsers.add_parser(
         'quant',
         help='汇总多个样本并导出格式文件/矩阵',
-        description='输入为 count 生成的 unique CSV: 基因 *.counts_gene_level_unique.csv 或 转录本 *.counts_isoform_level_unique.csv；不支持 multi CSV。支持导出 RSEM/Salmon/Kallisto/featureCounts 及合并矩阵。',
+        # 修正：描述更新——-o 为统一输出参数（目录或 .csv 路径），矩阵默认输出到 -i 文件夹下
+        description='输入为 count 生成的 unique CSV: 基因 *.counts_gene_level_unique.csv 或 转录本 *.counts_isoform_level_unique.csv；不支持 multi CSV。默认输出合并矩阵（未指定 -o 时输出到 -i 数据文件夹下，文件名 <pattern>_matrix.csv；-o 可指定输出目录或 .csv 矩阵路径），并可选导出 RSEM/Salmon/Kallisto/featureCounts 格式文件；-f none 时仅输出矩阵（-a 可省略）。',
         formatter_class=CustomHelpFormatter
     )
     _add_common_args(parser)
