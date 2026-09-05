@@ -1,0 +1,43 @@
+{% set name = "fansetools" %}
+{% set version = "1.2.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  noarch: python
+  number: 0
+  script: {{ PYTHON }} -m pip install . -vv
+
+requirements:
+  host:
+    - python
+    - pip
+    - setuptools
+    - setuptools_scm
+  run:
+    - python
+    - tqdm >=4.0.0
+    - pandas >=1.0.0
+    - biopython >=1.78
+    - packaging >=20.0
+    - requests >=2.20.0
+    - paramiko
+    - rich-argparse
+    - colorama  # [win]
+
+test:
+  imports:
+    - fansetools
+  commands:
+    - fanse --help
+
+about:
+  home: https://github.com/qzhaojing/Fansetools
+  summary: FANSe3 file processing toolkit
+  license: MIT
+  license_file: LICENSE

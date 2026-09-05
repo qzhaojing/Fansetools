@@ -5,8 +5,7 @@ Fansetools - FANSe3文件处理工具包
 try:
     from fansetools._version import __version__
 except ImportError:
-    # 如果 _version.py 不存在，使用默认版本
-    __version__ = "0.0.0"
+    __version__ = "1.2.0"
 #__version__ = "1.0.3"
 __author__ = "Zhao Jing"
 __email__ = "qzhaojing@qq.com"
@@ -27,14 +26,5 @@ from .bed import fanse2bed
 from .fastx import fanse2fasta, fanse2fastq, unmap2fasta, unmap2fastq
 from .count import FanseCounter
 from .cluster import add_cluster_subparser # 新增：导入cluster子命令的解析器添加函数
-
-# 版本检查
-#try:
-#    from .utils.version_check import check_fansetools_version
-#     在导入时自动检查版本
-#    check_fansetools_version()
-#except ImportError:
-#     如果版本检查模块不可用，静默跳过
-#    pass
 
 __all__ = ['add_run_subparser', 'main', 'FanseRunner', 'fanse2sam', 'fanse2bed', 'fanse2fasta', 'fanse2fastq','unmap2fasta', 'unmap2fastq','FanseCounter', 'add_cluster_subparser', ] # 新增：将add_cluster_subparser添加到__all__

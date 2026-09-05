@@ -16,7 +16,7 @@ setup(
         #"local_scheme": "dirty-tag",      # 本地修改标记
         "local_scheme": "no-local-version",  # 这行很重要，避免 +dirty 后缀
         "write_to_template": '__version__ = "{version}"',  # 自定义文件格式
-        "fallback_version": "1.0.0",     # Git无标签时的默认版本
+        "fallback_version": "1.2.0",     # Git无标签时的默认版本
     },
     
     setup_requires=["setuptools_scm"],
@@ -37,10 +37,6 @@ setup(
     ]
     },
     include_package_data=True,
-    # install_requires=[
-    #    'tqdm',   #进度条
-    #    # 你的依赖项
-    # ],
     install_requires=[
         'tqdm>=4.0.0',
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
@@ -48,23 +44,16 @@ setup(
         'biopython>=1.78',
         'packaging>=20.0',
         'requests>=2.20.0',
-        # 'cutadapt',  # 如需 cutadapt 功能，请取消注释
         'paramiko', 
         'rich_argparse', 
     ],
 
     extras_require={
         'test': [
-            # 'mock>=3.0.0',
             'pytest>=6.0.0',
         ],
         'full': [
             'numpy>=1.20.0',
-            # 'pysam>=0.16.0',
         ]
     }
-
-
-
-
 )
