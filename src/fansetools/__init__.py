@@ -5,7 +5,7 @@ Fansetools - FANSe3文件处理工具包
 try:
     from fansetools._version import __version__
 except ImportError:
-    __version__ = "1.2.0"
+    __version__ = "1.2.1"
 #__version__ = "1.0.3"
 __author__ = "Zhao Jing"
 __email__ = "qzhaojing@qq.com"

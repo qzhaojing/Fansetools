@@ -373,19 +373,18 @@ def run_sam_command(args):
         if len(input_files) > 1:
             console.print("[bold red]错误: 双端模式下，一次只能处理一个FANSe文件。[/bold red]")
             sys.exit(1)
-        
+
         base_file = Path(input_files[0])
-        # 尝试从.fanse3或.fanse文件中推断.unmapped文件
-        # 移除所有后缀，然后添加.unmapped
+        # 修正：默认按同目录同前缀自动寻找 .unmapped，避免用户手工指定遗漏
         stem = base_file.stem
         if stem.endswith('.fanse3') or stem.endswith('.fanse'):
-            stem = Path(stem).stem # Remove .fanse3 or .fanse
+            stem = Path(stem).stem
         unmapped_file_path = base_file.parent / (stem + '.unmapped')
 
         if not unmapped_file_path.exists():
             console.print(f"[bold yellow]警告: 启用了双端模式，但未找到对应的 .unmapped 文件: {unmapped_file_path}[/bold yellow]")
             console.print("[bold yellow]将以单端模式处理。[/bold yellow]")
-            is_paired_end = False # 回退到单端模式
+            is_paired_end = False
         else:
             console.print(f"[bold green]双端模式已启用。将合并处理文件: {input_files[0]} 和 {unmapped_file_path}[/bold green]")
 

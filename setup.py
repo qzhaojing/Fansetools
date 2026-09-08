@@ -16,7 +16,7 @@ setup(
         #"local_scheme": "dirty-tag",      # 本地修改标记
         "local_scheme": "no-local-version",  # 这行很重要，避免 +dirty 后缀
         "write_to_template": '__version__ = "{version}"',  # 自定义文件格式
-        "fallback_version": "1.2.0",     # Git无标签时的默认版本
+        "fallback_version": "1.2.1",     # Git无标签时的默认版本
     },
     
     setup_requires=["setuptools_scm"],
