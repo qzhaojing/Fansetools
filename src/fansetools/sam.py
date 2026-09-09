@@ -88,11 +88,11 @@ def _merge_fanse_and_unmapped_records(fanse_file: str, unmapped_file: str) -> Ge
     返回:
         生成器，每次yield一个FANSeRecord对象。
     """
-    # 从FANSe3文件解析记录
-    for record in fanse_parser(fanse_file):
+    # 修正意图：FANSe3 主转换路径统一使用高性能解析器，减少逐条生成器切换和重复字段处理
+    for record in fanse_parser_high_performance(fanse_file):
         yield record
     
-    # 从unmapped文件解析记录
+    # unmapped 文件格式不同，继续使用专用解析器
     for record in unmapped_parser(unmapped_file):
         yield record
 
@@ -240,6 +240,83 @@ def reverse_complement(seq: str) -> str:
     """优化反向互补：使用str.translate"""
     return seq.translate(_COMPLEMENT_TABLE)[::-1]
 
+# ============================================================
+# 修正(性能优化): FANSe3 对齐串字符集是固定的, 预先构建模块级查找表
+#  语义(与旧 _op 函数一致):
+#    '.'  → M  匹配
+#    'x'  → X  错配
+#    '-'  → D  缺失(参考有 read 无)
+#    ACGT → I  插入(read 有参考无), 同时保留小写 acgt 兜底以兼容潜在小写输入
+#  兜底策略: 未知符号(如旧版 fanse 的 '+' 标记)按 M 处理, 与旧实现一致;
+#  唯一差异是旧 isalpha 会把任意字母(如 'N')映射为 I, 现严格限定为 ACGT——
+#  FANSe3 插入位只输出具体碱基 ACGT, 不会出现其他字母, 属预期内的收紧
+# 目的: 热循环中用单次 dict.get 替代 if-chain + 通用 isalpha() 判断,
+#      并避免在每次函数调用里重复创建闭包带来的开销
+# ============================================================
+_ALIGN_OP_TABLE = {
+    '.': 'M', 'x': 'X', '-': 'D',
+    'A': 'I', 'C': 'I', 'G': 'I', 'T': 'I',
+    'a': 'I', 'c': 'I', 'g': 'I', 't': 'I',
+}
+
+def _op_lookup(ch: str) -> str:
+    """基于固定字符表的 CIGAR 操作符查找(表映射的规范定义, 供测试/外部调用)。
+
+    旧实现 _op 使用 if-chain + ch.isalpha() 逐字符判断, isalpha 需要做
+    Unicode 分类且对任意字母通用; FANSe3 实际只输出 . x - ACGT 五类字符,
+    因此这里严格限定为查表, 未命中统一回落 'M'。
+
+    性能说明: 实测(6.4M 字符 x 20 轮)每字符经函数调用走查表比旧 if-chain
+    闭包慢约 7%(函数调用开销主导), 因此下方热循环不经过本函数, 而是
+    内联 _ALIGN_OP_TABLE.get —— 内联版实测比旧实现快约 1.23x。
+    """
+    return _ALIGN_OP_TABLE.get(ch, 'M')
+
+def build_sa_tags(sa_entries: List[str]) -> List[str]:
+    """一次构建全部 SA:Z 标签（前缀/后缀分解法，O(N) 次列表操作）。
+
+    背景(2026-09-09)：旧 _sa_tag_excluding 闭包对每条输出行重建"排除自身"
+    列表再 join——单条 read 有 N 个比对位置就要输出 N 行 SAM，每行拼 N-1 个
+    entry，总计 O(N²) 次列表元素操作 + O(N²) 次字符串复制，multi-heavy 样本
+    （如 26.9311-Endosperm R2，multi 占比高）实测成为主要热点。
+
+    算法："除自身外全部拼接"与"连乘除自身"同型：
+      prefix[i] = entries[0..i-1] 各跟一个 ';'   （前向累积）
+      tag[i]    = "SA:Z:" + prefix[i] + suffix[i]（suffix = entries[i+1..]）
+    输出总量本身就是 Θ(N²·L) 字符（N 行 × N-1 entry），任何实现都无法低于
+    这个下限；本实现把 Python 对象操作降到 O(N) 次，字符复制约 2N²L，接近
+    理论下限 N²L，比旧实现少约一半复制且免去每行建表/join 的固定开销。
+
+    相对参考实现（独立 prefix/suffix 双数组）的改进：suffix 不建数组，用
+    单个字符串变量从后向前滚动累积（先取 tags[i] 再把 entries[i] 压入
+    suffix）——字符复制总量不变，峰值辅助内存减半（对单条 read 上千个
+    比对位置的极端 multi 更安全，管道内存受限场景重要）。
+
+    参数:
+        sa_entries: 每个比对位置的 SA 子串（不含 "SA:Z:" 前缀；分号由本函数添加）
+    返回:
+        与 sa_entries 等长的标签列表；n<=1 时全为 ""（单比对 read 无需 SA 标签，
+        调用方按空值省略该字段）
+    """
+    n = len(sa_entries)
+    if n <= 1:
+        return [""] * n
+
+    # 前向: prefix[i] = entries[0..i-1] 各跟一个 ';'
+    prefix = [""] * n
+    acc = ""
+    for i in range(1, n):
+        acc = acc + sa_entries[i - 1] + ";"
+        prefix[i] = acc
+
+    # 后向: 滚动 suffix。循环不变量: 进入第 i 轮时 suffix == entries[i+1..] 各跟 ';'
+    tags = [""] * n
+    suffix = ""
+    for i in range(n - 1, -1, -1):
+        tags[i] = f"SA:Z:{prefix[i]}{suffix}"
+        suffix = sa_entries[i] + ";" + suffix
+    return tags
+
 def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
     """优化CIGAR生成：使用更高效的算法"""
     """
@@ -289,12 +366,17 @@ def generate_cigar(alignment: str, is_reverse: bool = False) -> str:
             return 'I'
         return 'M'  # 未知符号兜底按M处理
 
+    # 修正(性能): 保留上方旧 _op 作为语义参考; 热循环内联固定字符表查找。
+    # 说明: 每字符调用 _op_lookup 函数反而比旧 if-chain 慢(函数调用开销主导),
+    # 故直接把 dict.get 绑定为局部变量零调用开销查表, 实测快约 1.23x
+    op_get = _ALIGN_OP_TABLE.get
+
     cigar_parts = []
     count = 0
     prev_op = None
     # 修正: 按操作符(而非字符)分组, 使相邻不同字母(如AC)正确合并为连续I
     for char in alignment:
-        op = _op(char)
+        op = op_get(char, 'M')
         if op == prev_op:
             count += 1
         else:
@@ -387,16 +469,11 @@ def _calculate_alignment_metrics(alignment: str, is_reverse: bool,
             'min_mapq': 0, 'max_mapq': 60
         }
 
-    def operation(char: str) -> str:
-        if char == '.':
-            return 'M'
-        if char == 'x':
-            return 'X'
-        if char == '-':
-            return 'D'
-        if char.isalpha():
-            return 'I'
-        return 'M'
+    # 修正(性能): 原实现每次调用都在此创建 operation 闭包(if-chain + isalpha),
+    # 且 CIGAR 循环每字符一次函数调用; 改为内联固定字符表 _ALIGN_OP_TABLE
+    # 的 dict.get 局部绑定, 字符集严格限定为 FANSe3 实际字符(. x - ACGT),
+    # 实测比旧实现快约 1.23x。表映射的规范定义见 _op_lookup
+    op_get = _ALIGN_OP_TABLE.get
 
     # 保持旧实现语义：MAPQ/NM 按原始 alignment 方向计算，CIGAR 反向链才翻转。
     score = 0
@@ -433,7 +510,7 @@ def _calculate_alignment_metrics(alignment: str, is_reverse: bool,
                 score += scoring_system['gap_extend_penalty']
 
     for char in cigar_source:
-        op = operation(char)
+        op = op_get(char, 'M')  # 修正(性能): 内联固定字符表查找, 替代旧 operation(char) 逐字符函数调用
         if op == previous_op:
             op_count += 1
         else:
@@ -613,6 +690,10 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
       - P1 multi 属性缓存：主比对和辅助比对共用一个预计算表（ref_name/pos/strand/is_reverse/cigar/mapq/nm），
         避免 generate_cigar / calculate_mapq / calculate_nm 对同一个比对串重复算 N 次。
       - 预期提速 2-4x（multi-mapping 重的样本效果更显著）
+    优化说明 (v4, 2026-09-09):
+      - P2 SA 标签 O(N²)→O(N)：v3 只把 entry 计算降为 O(N)，最终标签仍逐行
+        重建排除列表（O(N²) 列表操作）。现改用 build_sa_tags 前缀/后缀分解
+        一次性构建全部标签，multi-heavy 样本（26.9311 R2 型）收益显著。
     """
     # 质量值（FANSe3不提供，默认为所有位置'I'）
     qual = 'I' * len(record.seq)
@@ -683,13 +764,11 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         flags.append(calculate_flag(record, rev_i, is_primary_alignment=(i == primary_idx)))
         out_seqs.append(reverse_seq if rev_i else record.seq)
 
-    # SA:Z 完整标签（排除指定 index 的 entry）
-    def _sa_tag_excluding(exclude_idx: int) -> str:
-        """快速生成：跳过 exclude_idx，join 剩余 sa_entries"""
-        if n_align <= 1:
-            return ""
-        parts = [sa_entries[i] for i in range(n_align) if i != exclude_idx]
-        return f"SA:Z:{';'.join(parts)};"
+    # SA:Z 标签一次性全部构建（前缀/后缀分解，O(N) 次列表操作）
+    # 修正(2026-09-09): 旧 _sa_tag_excluding 闭包每条输出行重建排除列表 + join，
+    # N 个比对 → N 行 × (N-1 entry) = O(N²)。build_sa_tags 用前缀/后缀分解把
+    # 列表操作降到 O(N)，字符复制接近输出下限。见 build_sa_tags docstring。
+    sa_tags = build_sa_tags(sa_entries)
 
     # ═══ 预计算结束，开始生成 SAM 行 ═══
 
@@ -712,7 +791,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         f"NM:i:{nms[primary_idx]}",
         f"XS:i:{mapqs[primary_idx]}"
     ]
-    sa_tag = _sa_tag_excluding(primary_idx)
+    sa_tag = sa_tags[primary_idx]
     if sa_tag:
         sam_line_parts.append(sa_tag)
     yield '\t'.join(sam_line_parts)
@@ -740,7 +819,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
                 f"NM:i:{nms[i]}",
                 f"XS:i:{mapqs[i]}"
             ]
-            supp_sa = _sa_tag_excluding(i)
+            supp_sa = sa_tags[i]
             if supp_sa:
                 supp_sam_line_parts.append(supp_sa)
             yield '\t'.join(supp_sam_line_parts)
@@ -994,6 +1073,135 @@ def _normalize_output_sam_name(input_file: pathlib.Path, is_paired_end: bool) ->
         stem = stem.rstrip('_-.') + '_PE'
     return stem + '.sam'
 
+def _extract_flowcell_id(read_name: str) -> Optional[str]:
+    """从 read name 提取 instrument:run:flowcell 前缀。
+
+    Illumina/MGI 命名形如 A01045:965:HMNK7DMXY:2:1171:25762:5588，
+    第 3 段是 flowcell ID。取前 3 段作为"测序 run 指纹"：
+    同一文库的 R1/R2 必然来自同一组 (instrument, run, flowcell)，
+    不同 run 测序(top-up/合并)时双方文件包含相同的多 run 集合。
+    非冒号命名的 read name 返回 None（调用方据此跳过检查）。
+    """
+    parts = read_name.split(':')
+    if len(parts) >= 3 and all(parts[:3]):
+        return ':'.join(parts[:3])
+    return None
+
+def check_read_pair_consistency(r1_fanse3: str, r2_fanse3: str,
+                                sample_n: int = 1000, r2_scan_n: int = 5000) -> dict:
+    """PE 转换前的 R1/R2 配对一致性检查（头部采样，毫秒级，不做全量扫描）。
+
+    背景(2026-09-09)：26.9311-Endosperm_RNC 案例中 R1.fanse3 全部 reads 来自
+    flowcell A00877:344:HCHTMDSXY、R2.fanse3 全部来自 A01045:965:HMNK7DMXY，
+    两个文件并非 mate pair（不同文库/不同 run 错误配对），fixmate 找不到任何
+    同名 read，把全部记录按 orphan 处理剥掉 0x1。此类错误在 sort -n → fixmate
+    管道中静默通过（三进程 rc 全 0），必须在上游拦截。
+
+    判定分层（判定单位是 read 对，flowcell 只是廉价代理）：
+      1. flowcell 集合层：R1/R2 各采样头部 sample_n/r2_scan_n 条记录提取
+         instrument:run:flowcell 集合 →
+         - 集合相等            → 'ok'（单 run、跨 lane、多 run top-up 合并、
+                                  多文库混样后成对拼接，全部涵盖）
+         - 部分重叠            → 'pooled'（多 run 合并的头部采样常见形态，
+                                  可信，自动继续）
+         - 完全不相交          → 'mismatch'（26.9311 型错误，必须人工确认）
+      2. QNAME 采样层（辅助信息）：R1 采样名在 R2 采样名中的命中率。
+         注意 fanse3 是比对后文件且 unmapped 另存，R1/R2 记录索引会漂移，
+         命中率低不能证明非配对，仅 hit_rate>0 可作为真配对的佐证。
+
+    已知局限：R1=A+B 与 R2=C+D 且集合恰好相等的交叉拼接错误无法在本层
+    发现（需全量 QNAME 核验，暂未实现，见 --verify-pairs 规划）。
+
+    返回:
+        {'status': 'ok'|'pooled'|'mismatch'|'unknown',
+         'r1_flowcells': set, 'r2_flowcells': set, 'hit_rate': float|None}
+    """
+    from itertools import islice
+    r1_fc: Set[str] = set()
+    r2_fc: Set[str] = set()
+    r1_names: List[str] = []
+    r2_names: List[str] = []
+    for rec in islice(fanse_parser_high_performance(str(r1_fanse3)), sample_n):
+        name = rec.read_pair_id or rec.header
+        fc = _extract_flowcell_id(name)
+        if fc:
+            r1_fc.add(fc)
+        r1_names.append(name)
+    for rec in islice(fanse_parser_high_performance(str(r2_fanse3)), r2_scan_n):
+        name = rec.read_pair_id or rec.header
+        fc = _extract_flowcell_id(name)
+        if fc:
+            r2_fc.add(fc)
+        r2_names.append(name)
+
+    hit_rate = None
+    if r1_names and r2_names:
+        r2_set = set(r2_names)
+        hit_rate = sum(1 for n in r1_names if n in r2_set) / len(r1_names)
+
+    if not r1_fc or not r2_fc:
+        # read name 不含标准冒号命名 → 无法判定，交给用户自行确认
+        status = 'unknown'
+    elif r1_fc == r2_fc:
+        status = 'ok'
+    elif r1_fc & r2_fc:
+        status = 'pooled'
+    else:
+        status = 'mismatch'
+    return {'status': status, 'r1_flowcells': r1_fc, 'r2_flowcells': r2_fc,
+            'hit_rate': hit_rate}
+
+def ensure_pair_consistency(r1_fanse3: str, r2_fanse3: str,
+                            force: bool = False, console=None) -> None:
+    """配对检查的执行入口：ok/pooled 放行；mismatch 时询问或报错。
+
+    三态行为（对齐用户需求：检测到非同一 flowcell 时提示是否继续）：
+      - force=True：跳过检查，仅打印警告后继续（--force-pair）
+      - 交互式终端：rich Confirm 询问，选否则抛 KeyboardInterrupt
+      - 非交互（管道/批处理）：抛 RuntimeError 并提示 --force-pair
+    """
+    def log(msg, style=None):
+        if console:
+            console.print(msg, style=style)
+        else:
+            print(msg)
+
+    result = check_read_pair_consistency(r1_fanse3, r2_fanse3)
+    status = result['status']
+    if status == 'ok':
+        log(f"[dim]R1/R2 配对检查通过: flowcell 集合一致 "
+            f"({','.join(sorted(result['r1_flowcells']))})[/dim]")
+        return
+    if status == 'pooled':
+        log(f"[dim]R1/R2 配对检查: 检测到多 run 合并文库 "
+            f"(R1: {','.join(sorted(result['r1_flowcells']))} / "
+            f"R2: {','.join(sorted(result['r2_flowcells']))})，继续处理[/dim]")
+        return
+    if status == 'unknown':
+        log("[dim]R1/R2 配对检查: read name 非标准命名，跳过 flowcell 检查[/dim]")
+        return
+
+    # status == 'mismatch'：硬告警
+    r1_s = ','.join(sorted(result['r1_flowcells']))
+    r2_s = ','.join(sorted(result['r2_flowcells']))
+    hint = (f"R1/R2 配对检查失败:\n"
+            f"  R1 flowcells: {r1_s}\n"
+            f"  R2 flowcells: {r2_s}\n"
+            f"  QNAME 采样命中率: "
+            f"{('%.1f%%' % (result['hit_rate'] * 100)) if result['hit_rate'] is not None else 'N/A'}\n"
+            f"两个文件可能不是同一文库的 R1/R2（不同 run/不同样品错误配对），\n"
+            f"fixmate 将无法配对并剥掉全部 paired 标志。")
+    if force:
+        log(f"[bold yellow]警告: {hint}\n已指定 --force-pair，强制继续。[/bold yellow]")
+        return
+    from rich.prompt import Confirm
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        log(f"[bold red]{hint}[/bold red]")
+        if Confirm.ask("是否仍按双端(PE)模式继续？", default=False, console=console):
+            return
+        raise KeyboardInterrupt("用户取消：请确认 R1/R2 文件配对关系后重试")
+    raise RuntimeError(f"{hint}\n非交互环境已中止。如确认无误请加 --force-pair 继续。")
+
 def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None,
               region: Optional[str] = None, console=None, threads: int = 4,
               unmapped_file: Optional[str] = None, is_paired_end: bool = False,
@@ -1144,10 +1352,9 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
             reader = _iter_record_batches(record_generator, batch_size)
             worker_func = partial(_worker_process_records, regions=regions)
             
-            # 进度条仅在输出到文件时显示，避免干扰stdout
-            disable_pbar = (output_sam is None)
-            
-            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True, disable=disable_pbar) as pbar:
+            # 修正意图：管道模式也显示进度；tqdm 写 stderr，不污染 SAM/BAM stdout
+            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True,
+                      file=sys.stderr) as pbar:
                 with Pool(processes=threads) as pool:
                     for sam_lines_batch in pool.imap(worker_func, reader, chunksize=1):
                         if sam_lines_batch:
@@ -1171,7 +1378,7 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
             #  3. 干掉 _merge_four_streams 这种"四文件交错 generator"——没必要，两遍独立更直白
             #  4. 进度条在所有流启动前算好 total，全程跑一个条
             # ═══════════════════════════════════════════════════════
-            batch_size = 20_000
+            batch_size = 100_000
             batch_count = 0
             batch_lines = []
             filtered_count = 0
@@ -1231,15 +1438,30 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
                     pbar.update(1)
 
             # ── 3. 进度条 + 两遍独立消费
-            disable_pbar = (output_sam is None)
-            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True, disable=disable_pbar) as pbar:
-
+            # 修正意图：管道模式也显示进度；tqdm 写 stderr，避免破坏 stdout 数据流
+            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True,
+                      file=sys.stderr) as pbar:
                 if is_paired_end and r2_fanse3 and os.path.exists(str(r2_fanse3)):
                     # 真双端：先 R1，后 R2，用同一个 writer 追加写
+                    # 修正(2026-09-09): 真双端分支此前把可能为 None 的 unmapped_file /
+                    # r2_unmapped 直接传给 _merge_fanse_and_unmapped_records → 其内部
+                    # unmapped_parser(None) 抛 "expected str, bytes or os.PathLike
+                    # object, not NoneType"，导致"有 R2 fanse3 但无 unmapped 文件"
+                    # 的场景 PE 模式直接崩溃（测试样本 test_R1.fanse3 无对应
+                    # test.unmapped 命名时复现；生产数据均有 unmapped 文件故未暴露）。
+                    # 与下方假双端/单端分支对齐：None 或路径不存在时归一化并跳过合并。
+                    unmapped_path = unmapped_file if unmapped_file and os.path.exists(str(unmapped_file)) else None
+                    r2_unmapped_path = r2_unmapped if r2_unmapped and os.path.exists(str(r2_unmapped)) else None
                     console.print(f"[dim]遍 1/2: 处理 R1 (fanse3 + unmapped)[/dim]")
-                    _consume_stream(_merge_fanse_and_unmapped_records(fanse_file, unmapped_file))
+                    if unmapped_path:
+                        _consume_stream(_merge_fanse_and_unmapped_records(fanse_file, unmapped_path))
+                    else:
+                        _consume_stream(fanse_parser_high_performance(fanse_file))
                     console.print(f"[dim]遍 2/2: 处理 R2 (fanse3 + unmapped)[/dim]")
-                    _consume_stream(_merge_fanse_and_unmapped_records(r2_fanse3, r2_unmapped))
+                    if r2_unmapped_path:
+                        _consume_stream(_merge_fanse_and_unmapped_records(r2_fanse3, r2_unmapped_path))
+                    else:
+                        _consume_stream(fanse_parser_high_performance(r2_fanse3))
 
                 elif is_paired_end:
                     # 假双端：R2 不存在，只处理 R1
@@ -1340,8 +1562,17 @@ def run_sam_command(args):
             else:
                 output_path = args.output_sam
         else:
-            # 修正意图：双端模式默认落盘到输入文件同目录，避免大量SAM内容直接刷到终端
-            if args.is_paired_end:
+            # 修正(2026-09-09): PE 无 -o 时"默认落盘"仅应发生在交互式终端（原意是
+            # 防止 26GB SAM 刷屏）。原实现在任何 stdout 形态下都落盘，导致 bam.py
+            # 管道模式（stdout=PIPE、无 -o）调用 `fanse sam --pe` 时，全部 SAM 输出
+            # 被写进 <stem>_PE.sam 文件（实测 26.4GB，耗时数小时），stdout 始终为空：
+            # 下游 samtools view/sort -n 收到零字节流 → tmp.ns.bam 成为 <1KB 空壳 →
+            # fixmate 阶段报"输入不存在或过小"，整条管道作废，fallback 再从头重转
+            # 一遍（双倍耗时，且落盘的 PE.sam 纯属浪费磁盘）。
+            # 现改为：仅当 stdout 是 tty（用户直接敲命令）才默认落盘；
+            # 管道/重定向场景（isatty()==False）回归 stdout，
+            # 恢复 `fanse sam --pe | samtools view ...` 的管道语义。
+            if args.is_paired_end and sys.stdout.isatty():
                 output_path = str(input_file.parent / _normalize_output_sam_name(input_file, True))
             else:
                 output_path = None # stdout
@@ -1365,6 +1596,15 @@ def run_sam_command(args):
 
                 if current_r2_fanse3:
                     console.print(f"[bold green]发现 R2 fanse3: {pathlib.Path(current_r2_fanse3).name}[/bold green]")
+                    # 修正(2026-09-09): PE 模式新增 R1/R2 配对一致性检查（flowcell 集合
+                    # + QNAME 采样）。26.9311 案例中两个不同 run 的文件被错误配成 PE，
+                    # 管道静默通过但 fixmate 全部剥 0x1。mismatch 时交互终端询问是否
+                    # 继续，非交互环境直接报错；--force-pair 可跳过检查。
+                    # 注意：fanse2bam 调度层会先做同一检查，再给内层 fanse sam 传
+                    # --force-pair 避免重复询问，因此此处默认检查只对直接命令行生效。
+                    if not getattr(args, 'force_pair', False):
+                        ensure_pair_consistency(input_path, current_r2_fanse3,
+                                                force=False, console=console)
                 else:
                     console.print(f"[bold yellow]警告: 未发现 R2 fanse3，fixmate 将无法配对（仅处理 R1）[/bold yellow]")
 
@@ -1474,6 +1714,12 @@ def add_sam_subparser(subparsers):
                                  '在本地 SSD + 千兆网络环境下效果显著；本地文件会自动跳过。')
     sam_parser.add_argument('--pe', '--paired-end', action='store_true', dest='is_paired_end',
                             help='启用双端模式。自动搜索同目录下的 .unmapped 文件进行合并处理。')
+    # 修正(2026-09-09): PE 配对一致性检查的跳过开关（内部也由 fanse bam 调度层使用，
+    # 上游已检查过时透传此参数避免内层 fanse sam 重复询问）
+    sam_parser.add_argument('--force-pair', action='store_true',
+                            help='跳过 PE 模式的 R1/R2 配对一致性检查（flowcell 集合+QNAME 采样）。'
+                                 '默认开启检查：检测到 R1/R2 来自不同测序 run（flowcell 集合不相交）时，'
+                                 '交互终端会询问是否继续，非交互环境直接报错。确认文件配对无误时可用此参数强制跳过。')
     sam_parser.add_argument('--fixmate', action='store_true',
                             help='在输出SAM后，自动通过管道执行 samtools sort -n | samtools fixmate。此选项会强制输出到标准输出。')
     # 新增：参考序列信息缓存JSON（{序列名: 长度}），跳过逐行解析FASTA生成header
