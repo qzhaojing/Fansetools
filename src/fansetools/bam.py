@@ -3,6 +3,8 @@ import os
 import sys
 import json
 import subprocess
+import shutil
+import tempfile
 from pathlib import Path
 from .bin_utils import bin_manager
 from .utils.rich_help import CustomHelpFormatter, add_rich_epilog
@@ -43,12 +45,16 @@ def build_ref_info_cache(fasta_path: str, console=None) -> str:
     log(f"缓存就绪: {cache_path} ({len(ref_info)} 条序列)")
     return str(cache_path)
 
-def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None, is_paired_end=False, preload_network=False):
+def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None, is_paired_end=False, preload_network=False, force_pair=False):
     """新增：统一构建 fanse sam 命令；提供缓存时追加 --ref-info-json 跳过 FASTA 解析"""
     cmd = ['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path)]
     # 修正：双端模式透传——用户命令行 --pe 需要最终传到 fanse sam
     if is_paired_end:
         cmd.append('--pe')
+    # 修正(2026-09-09)：PE 配对一致性检查已在 fanse2bam 调度层统一执行，
+    # 内层 fanse sam 一律传 --force-pair 跳过，避免同一文件重复检查/重复询问
+    if is_paired_end and force_pair:
+        cmd.append('--force-pair')
     # 修正：网络盘预加载透传——用户命令行 --preload 需要最终传到 fanse sam
     if preload_network:
         cmd.append('--preload')
@@ -62,7 +68,61 @@ def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None, is_paired_end=Fal
     cmd.extend(['-t', '1'])
     return cmd
 
-def _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log):
+
+def _local_root(local):
+    # --local=True 使用系统临时目录；传入路径时使用用户指定根目录。
+    if local is True:
+        return Path(tempfile.gettempdir()) / 'fansetools_temp'
+    if local:
+        return Path(local)
+    return None
+
+
+def _create_local_workspace(local):
+    root = _local_root(local)
+    if root is None:
+        return None
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix='bam_', dir=str(root)))
+
+
+def _copy_final_outputs(local_bam, target_bam, index):
+    # 目标盘只在完整生成后通过 .copying 文件一次性替换，避免留下半成品。
+    target_bam = Path(target_bam)
+    target_bam.parent.mkdir(parents=True, exist_ok=True)
+    staged_bam = target_bam.with_name(target_bam.name + '.copying')
+    staged_bai = Path(str(target_bam) + '.bai.copying')
+    try:
+        shutil.copy2(str(local_bam), str(staged_bam))
+        os.replace(str(staged_bam), str(target_bam))
+        if index:
+            local_bai = Path(str(local_bam) + '.bai')
+            target_bai = Path(str(target_bam) + '.bai')
+            shutil.copy2(str(local_bai), str(staged_bai))
+            os.replace(str(staged_bai), str(target_bai))
+    except Exception:
+        for temporary in (staged_bam, staged_bai):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _finalize_bam_output(output_bam, target_bam, samtools_path, index, workspace, log, error_context='生成的 BAM'):
+    # 修正意图：所有路径统一在 BAM 完整生成后校验，再建立 BAI，最后复制到目标盘。
+    output_bam = Path(output_bam)
+    if not output_bam.exists() or output_bam.stat().st_size < 1000:
+        actual_size = output_bam.stat().st_size if output_bam.exists() else 0
+        raise RuntimeError(f'{error_context}过小 ({actual_size} 字节)')
+    if index:
+        subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
+    if workspace:
+        _copy_final_outputs(output_bam, target_bam, index)
+    return target_bam
+
+
+def _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log, local_work_dir=None):
     """
     双端配对专用管道：queryname-sorted BAM → fixmate → coordinate-sorted BAM
 
@@ -75,7 +135,7 @@ def _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, 
         tmp_ns_bam (queryname 排序)
           → samtools fixmate -m - - (stdin 读，stdout 写)
           → samtools sort -o output_bam - (coordinate 排序输出)
-          → [samtools index output_bam]
+          → 由调用方统一校验、索引并复制最终输出
 
     参数:
         tmp_ns_bam:   已按 queryname 排序的 BAM 输入文件（fixmate 前提条件）
@@ -95,11 +155,15 @@ def _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, 
     if not Path(tmp_ns_bam).exists() or Path(tmp_ns_bam).stat().st_size < 1000:
         raise RuntimeError(f'fixmate 输入 (queryname sorted BAM) 不存在或过小: {tmp_ns_bam}')
 
-    log(f"[PE fixmate] 开始修复 mate pair 信息...")
+    log(f"[PE fixmate] 修复 mate pair 信息...")
     # fixmate -m: 同时添加 ms (mate score) 标签，有利于下游分析
     # stdin=tmp_ns_bam, stdout=交给 sort 管道
     fixmate_cmd = [samtools_path, 'fixmate', '-m', str(tmp_ns_bam), '-']
-    sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), '-']
+    sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+    if local_work_dir:
+        # 新版 samtools 的排序分块也放入当前本地任务目录。
+        sort_cmd.extend(['-T', str(Path(local_work_dir) / 'sort_coord')])
+    sort_cmd.extend(['-o', str(output_bam), '-'])
 
     p_fix = subprocess.Popen(fixmate_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p_sort = subprocess.Popen(sort_cmd, stdin=p_fix.stdout)
@@ -119,9 +183,7 @@ def _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, 
         raise RuntimeError(f'samtools sort (fixmate后) 失败 (rc={rc_sort})')
 
     log(f"[PE fixmate] mate pair 信息修复完成，输出: {output_bam}")
-
-    if index:
-        subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
+    # 索引延后到调用方统一完成，确保先校验 BAM，再复制 BAM/BAI。
 
 def _detect_legacy_samtools(samtools_path, log):
     """
@@ -142,7 +204,7 @@ def _detect_legacy_samtools(samtools_path, log):
         log(f"Unexpected error during samtools version detection ({e}). Assuming legacy for compatibility.")
         return True
 
-def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False):
+def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, local=None):
     """
     将FANSe3文件直接转换为BAM格式（精简版）
     
@@ -174,7 +236,10 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
 
     if output_bam is None:
         output_bam = Path(fanse_file).with_suffix('.bam')
-    
+    target_bam = Path(output_bam)
+    workspace = _create_local_workspace(local)
+    output_bam = workspace / target_bam.name if workspace else target_bam
+
     # 步骤1: 直接通过管道将输入转换为BAM
     try:
         input_path = Path(fanse_file)
@@ -184,11 +249,13 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
         # 构建samtools命令
         samtools_cmd = [samtools_path, 'view', '-bS', '-']
         if sort:
-            samtools_sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam)]
-            samtools_index_cmd = [samtools_path, 'index', str(output_bam)] if index else None
+            samtools_sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+            if workspace:
+                # 本地模式下 sort 分块和最终 BAM 都留在任务目录。
+                samtools_sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
+            samtools_sort_cmd.extend(['-o', str(output_bam)])
         else:
             samtools_cmd.extend(['-o', str(output_bam)])
-            samtools_index_cmd = [samtools_path, 'index', str(output_bam)] if index else None
 
         # 三种输入：
         # 1) fanse3/fanse -> fanse sam -> samtools view/sort
@@ -199,7 +266,12 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
             # 修正：SAM 输入先统一转 BAM 流，再走 sort 输出，避免直写路径在复杂 SAM 下生成空/极小文件
             if sort:
                 p1 = subprocess.Popen([samtools_path, 'view', '-bS', str(fanse_file)], stdout=subprocess.PIPE)
-                p2 = subprocess.Popen([samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), '-'], stdin=p1.stdout)
+                sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+                if workspace:
+                    # 本地模式下排序分块不写网络输出目录。
+                    sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
+                sort_cmd.extend(['-o', str(output_bam), '-'])
+                p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout)
                 p1.stdout.close()
                 p2.communicate()
                 if p1.wait() != 0 or p2.returncode != 0:
@@ -211,11 +283,20 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
                     rc = p1.wait()
                     if rc != 0:
                         raise RuntimeError('sam -> bam view failed')
-            if index and samtools_index_cmd:
-                subprocess.run(samtools_index_cmd, check=True)
-            return output_bam
+            # 修正意图：先完成 BAM 大小校验，再生成索引并复制最终结果。
+            if not output_bam.exists() or output_bam.stat().st_size < 1000:
+                actual_size = output_bam.stat().st_size if output_bam.exists() else 0
+                raise RuntimeError(f'生成的 BAM 文件过小 ({actual_size} 字节)')
+            return _finalize_bam_output(
+                output_bam, target_bam, samtools_path, index, workspace, log,
+                error_context='生成的 BAM 文件'
+            )
 
-        fanse_cmd = _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json, is_paired_end, preload_network)
+        # 修正意图：调度层已完成配对检查；此处固定跳过重复检查。
+        fanse_cmd = _fanse_sam_cmd(
+            fanse_file, fasta_path, ref_info_json, is_paired_end,
+            preload_network, force_pair=True
+        )
         log(f"Converting {fanse_file} to BAM...")
 
         if sort:
@@ -227,20 +308,20 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
             p2.stdout.close()
             p3.communicate()
             
-            if index and samtools_index_cmd:
-                subprocess.run(samtools_index_cmd, check=True)
         else:
             # fanse sam | samtools view -bS - -o output.bam
             p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE)
             p2 = subprocess.Popen(samtools_cmd, stdin=p1.stdout)
             p1.stdout.close()
             p2.communicate()
-            
-            if index and samtools_index_cmd:
-                subprocess.run(samtools_index_cmd, check=True)
-        
-        log(f"Successfully created BAM file: {output_bam}", style="bold green")
-        return output_bam
+
+        # 修正意图：所有输入类型都统一在 BAM 完整生成后校验、索引和复制。
+        result = _finalize_bam_output(
+            output_bam, target_bam, samtools_path, index, workspace, log,
+            error_context='生成的 BAM 文件'
+        )
+        log(f"Successfully created BAM file: {target_bam}", style="bold green")
+        return result
         
     except subprocess.CalledProcessError as e:
         log(f"Error converting to BAM: {e.stderr.decode() if e.stderr else str(e)}", style="bold red")
@@ -248,6 +329,9 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
     except Exception as e:
         log(f"Unexpected error: {str(e)}", style="bold red")
         sys.exit(1)
+    finally:
+        if workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 from .utils.path_utils import PathProcessor
 from rich.console import Console
@@ -316,7 +400,9 @@ def bam_command(args):
                         console=console,
                         ref_info_json=ref_info_cache,  # 新增：header缓存透传
                         is_paired_end=getattr(args, 'is_paired_end', False),  # 修正：--pe 双端模式透传
-                        preload_network=getattr(args, 'preload', False)  # 修正：--preload 网络盘预加载透传
+                        preload_network=getattr(args, 'preload', False),  # 修正：--preload 网络盘预加载透传
+                        force_pair=getattr(args, 'force_pair', False),  # 修正(2026-09-09): 配对检查跳过透传
+                        local=getattr(args, 'local', None)
                     )
                     return infile.name, None
                 except Exception as e:
@@ -359,7 +445,9 @@ def bam_command(args):
                     keep_sam=getattr(args, 'sam', False),
                     console=console,
                     ref_info_json=ref_info_cache,  # 新增：header缓存透传
-                    is_paired_end=getattr(args, 'is_paired_end', False)  # 修正：--pe 双端模式透传
+                    is_paired_end=getattr(args, 'is_paired_end', False),  # 修正：--pe 双端模式透传
+                    force_pair=getattr(args, 'force_pair', False),  # 修正(2026-09-09): 配对检查跳过透传
+                    local=getattr(args, 'local', None)
                 )
             except Exception as e:
                 console.print(f"[bold red]处理 {infile.name} 失败: {e}[/bold red]")
@@ -377,7 +465,9 @@ def bam_command(args):
                 keep_sam=getattr(args, 'sam', False),
                 console=console,
                 ref_info_json=ref_info_cache,  # 新增：header缓存透传
-                is_paired_end=getattr(args, 'is_paired_end', False)  # 修正：--pe 双端模式透传
+                is_paired_end=getattr(args, 'is_paired_end', False),  # 修正：--pe 双端模式透传
+                force_pair=getattr(args, 'force_pair', False),  # 修正(2026-09-09): 配对检查跳过透传
+                local=getattr(args, 'local', None)
             )
         except Exception as e:
             console.print(f"[bold red]错误: {e}[/bold red]")
@@ -385,7 +475,7 @@ def bam_command(args):
         # 修正：同批量模式，ref_info_cache 是持久化缓存，不再主动删除
         # （跨运行复用可节省数分钟 FASTA 解析时间）
 
-def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False):
+def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, local=None):
     #直接原位生成BAM文件，并进行排序索引
     def log(msg, style=None):
         if console:
@@ -395,6 +485,9 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
     if output_bam is None:
         output_bam = Path(fanse_file).with_suffix('.bam')
+    target_bam = Path(output_bam)
+    workspace = _create_local_workspace(local)
+    output_bam = workspace / target_bam.name if workspace else target_bam
 
     # 修正：Windows 路径此前未按输入后缀分流，.sam 被错误交给 fanse sam 导致空 BAM
     # （fanse sam 无法解析 SAM 格式，产生空输出流 → 下游 samtools 生成 92 字节空骨架）。
@@ -406,9 +499,10 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
     samtools_path = bin_manager.get_samtools_path()
 
     if input_suffix in ['.sam']:
+        # 修正意图：SAM 直通路径使用本地输出，并在完成或失败后清理 workspace。
         log(f"[SAM 直通] 检测到 .sam 输入，跳过 fanse sam 直接转换: {fanse_file}")
         # 用独立日志记录 SAM 直通过程，避免与 fanse sam 日志混淆
-        conv_log = Path(output_bam).with_suffix('.bam_conv.log')
+        conv_log = target_bam.with_suffix('.bam_conv.log')
 
         # 修正：PE 模式需要 fixmate，先检查 samtools 版本
         # （.sam 路径原先未做版本检查，此处补齐以支持 fixmate）
@@ -417,12 +511,17 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         # PE + sort → 特殊管道：view → sort -n (queryname) → fixmate → sort (coordinate) → index
         if is_paired_end and sort:
             tmp_ns_bam = Path(output_bam).with_suffix('.tmp.ns.bam')
+            tmp_ns_bam.parent.mkdir(parents=True, exist_ok=True)
             log(f"[PE 模式] SAM 直通 + fixmate: view → sort -n → fixmate → sort (coord)...")
             try:
                 # Step 1: SAM → BAM → queryname 排序临时文件
                 p1 = subprocess.Popen([samtools_path, 'view', '-bS', str(fanse_file)], stdout=subprocess.PIPE)
-                p2 = subprocess.Popen([samtools_path, 'sort', '-n', '-@', '1', '-m', '512M',
-                                       '-o', str(tmp_ns_bam), '-'], stdin=p1.stdout)
+                name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '4', '-m', '512M']
+                if workspace:
+                    # PE name sort 的分块也放入本地任务目录。
+                    name_sort_cmd.extend(['-T', str(workspace / 'sort_name')])
+                name_sort_cmd.extend(['-o', str(tmp_ns_bam), '-'])
+                p2 = subprocess.Popen(name_sort_cmd, stdin=p1.stdout)
                 p1.stdout.close()
                 p2.communicate()
                 rc1, rc2 = p1.wait(), p2.returncode
@@ -431,31 +530,40 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
                 # Step 2: fixmate → coordinate sort → index（含 legacy 检查）
                 if not legacy:
-                    _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log)
+                    _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log, workspace)
                 else:
-                    # 旧版 samtools 无 fixmate，退回普通 coordinate sort
+                    # 旧版 samtools 无 fixmate，退回普通 coordinate sort。
                     log("[bold yellow]警告: 旧版 samtools 无 fixmate，退回普通 coordinate sort[/bold yellow]")
-                    subprocess.run([samtools_path, 'sort', '-@', '1', '-m', '512M',
-                                    '-o', str(output_bam), str(tmp_ns_bam)], check=True)
-                    if index:
-                        subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
+                    output_prefix = str(output_bam).removesuffix('.bam')
+                    subprocess.run([
+                        samtools_path,
+                        'sort',
+                        str(tmp_ns_bam),
+                        output_prefix
+                    ], check=True)
             finally:
                 if tmp_ns_bam.exists():
                     try: tmp_ns_bam.unlink()
                     except OSError: pass
 
         elif sort:
-            # 非 PE + sort：原有简单管道不变
-            p1 = subprocess.Popen([samtools_path, 'view', '-bS', str(fanse_file)], stdout=subprocess.PIPE)
-            p2 = subprocess.Popen([samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), '-'], stdin=p1.stdout)
+            # 非 PE + sort：SAM 先转 BAM，再在本地任务目录完成排序。
+            p1 = subprocess.Popen(
+                [samtools_path, 'view', '-bS', str(fanse_file)],
+                stdout=subprocess.PIPE
+            )
+            sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+            if workspace:
+                # 修正意图：排序分块只写本地任务目录，避免网络盘临时 I/O。
+                sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
+            sort_cmd.extend(['-o', str(output_bam), '-'])
+            p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout)
             p1.stdout.close()
             p2.communicate()
             rc1 = p1.wait()
             rc2 = p2.returncode
             if rc1 != 0 or rc2 != 0:
                 raise RuntimeError(f'sam -> bam sort pipeline failed (view={rc1}, sort={rc2})')
-            if index:
-                subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
 
         else:
             # 不排序：直接 view 写 BAM（PE 也无法 fixmate，fixmate 要求 name-sorted 前提）
@@ -464,20 +572,23 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 rc = p1.wait()
                 if rc != 0:
                     raise RuntimeError(f'sam -> bam view failed (rc={rc})')
-            if index:
-                subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
 
         # 修正：输出 BAM 有效性校验——避免生成 92 字节空骨架却继续索引
-        if output_bam.stat().st_size < 1000:
-            raise RuntimeError(f'生成的 BAM 文件过小 ({output_bam.stat().st_size} 字节)，输入 SAM 可能为空或格式有误')
-        log(f"成功创建 BAM 文件: {output_bam}", style="bold green")
-        return output_bam
+        result = _finalize_bam_output(
+            output_bam, target_bam, samtools_path, index, workspace, log,
+            error_context='生成的 BAM 文件'
+        )
+        log(f"成功创建 BAM 文件: {target_bam}", style="bold green")
+        # .sam 直通分支提前返回，不能依赖后方 fanse3 分支的 finally 清理。
+        if workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
+        return result
 
     # fanse3/fanse 路径：构建 fanse sam 命令 + 日志重定向
-    conv_log = Path(output_bam).with_suffix('.bam_conv.log')
+    conv_log = target_bam.with_suffix('.bam_conv.log')
     conv_log_fp = None
     try:
-        fanse_cmd = _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json, is_paired_end, preload_network)
+        fanse_cmd = _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json, is_paired_end, preload_network, force_pair=True)  # 修正(2026-09-09): 上游调度层已做配对检查，内层跳过
         # samtools_path 已在后缀分流前获取（L327），这里直接复用避免重复调用
         log(f"Using samtools from: {samtools_path}")
 
@@ -499,8 +610,12 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 # Step 1: fanse sam | view | sort -n → queryname 排序临时 BAM
                 p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
                 p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                p3 = subprocess.Popen([samtools_path, 'sort', '-n', '-@', '1', '-m', '512M',
-                                       '-o', str(tmp_ns_bam), '-'], stdin=p2.stdout, stderr=subprocess.DEVNULL)
+                name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '4', '-m', '512M']
+                if workspace:
+                    # PE name sort 的分块也放入本地任务目录。
+                    name_sort_cmd.extend(['-T', str(workspace / 'sort_name')])
+                name_sort_cmd.extend(['-o', str(tmp_ns_bam), '-'])
+                p3 = subprocess.Popen(name_sort_cmd, stdin=p2.stdout, stderr=subprocess.DEVNULL)
                 p1.stdout.close()
                 p2.stdout.close()
                 rc_p3 = p3.wait()
@@ -515,13 +630,12 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
                 # Step 2: fixmate → coordinate sort → index（含 legacy 检查）
                 if not legacy:
-                    _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log)
+                    _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log, workspace)
                 else:
                     log("[bold yellow]警告: 旧版 samtools 无 fixmate，退回普通 coordinate sort[/bold yellow]")
-                    subprocess.run([samtools_path, 'sort', '-@', '1', '-m', '512M',
-                                    '-o', str(output_bam), str(tmp_ns_bam)], check=True)
-                    if index:
-                        subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
+                    # 旧版 samtools 不支持新版 -T/-o 参数，保持其原生语法。
+                    output_prefix = str(output_bam).removesuffix('.bam')
+                    subprocess.run([samtools_path, 'sort', str(tmp_ns_bam), output_prefix], check=True)
             finally:
                 if tmp_ns_bam.exists():
                     try: tmp_ns_bam.unlink()
@@ -530,7 +644,11 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         # ===== 非 PE + sort + 新版 samtools：fanse sam | view | sort =====
         elif sort and not legacy:
             # fanse sam | samtools view -bS - | samtools sort -o output.bam
-            samtools_sort = [samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), '-']
+            samtools_sort = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+            if workspace:
+                # 新版 sort 分块统一落到本地任务目录。
+                samtools_sort.extend(['-T', str(workspace / 'sort_coord')])
+            samtools_sort.extend(['-o', str(output_bam), '-'])
             p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
             p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE)
             p3 = subprocess.Popen(samtools_sort, stdin=p2.stdout)
@@ -544,8 +662,6 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 raise RuntimeError(f'fanse sam 失败 (rc={rc_p1})，详见日志: {conv_log}')
             if rc_p3 != 0:
                 raise RuntimeError(f'samtools sort 失败 (rc={rc_p3})')
-            if index:
-                subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
 
         # ===== 非 PE + sort + 旧版 samtools =====
         elif sort and legacy:  # 基本都是走这条通道（当前环境安装的是旧版 samtools）
@@ -572,8 +688,6 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 log(f"Samtools sort (legacy) stderr: {stderr_p3.decode()}", style="red")
             if p3.returncode != 0:
                 raise RuntimeError(f'samtools sort (legacy) failed (rc={p3.returncode})')
-            if index:
-                subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
 
         else:
             # 不排序：直接写入输出 BAM（PE 时也无法 fixmate）
@@ -587,22 +701,17 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 raise RuntimeError(f'fanse sam 失败 (rc={rc_p1})，详见日志: {conv_log}')
             if rc_p2 != 0:
                 raise RuntimeError(f'samtools view failed (rc={rc_p2})')
-            if index:
-                subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
 
-        # 修正：输出 BAM 有效性校验——即使 fanse sam 和 samtools 都返回 0，
-        # 也可能因输入为空生成 92 字节空骨架，此处拦截避免继续索引并误导后续分析
-        if not output_bam.exists() or output_bam.stat().st_size < 1000:
-            actual_size = output_bam.stat().st_size if output_bam.exists() else 0
-            raise RuntimeError(f'生成的 BAM 文件过小 ({actual_size} 字节)，fanse sam 可能未产出有效数据，详见日志: {conv_log}')
-
-        if index:
-            subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
+        # 修正意图：BAM 校验、索引和最终复制统一收尾，避免各分支提前索引。
+        result = _finalize_bam_output(
+            output_bam, target_bam, samtools_path, index, workspace, log,
+            error_context=f'生成的 BAM 文件（详见日志: {conv_log}）'
+        )
         if conv_log_fp:
             conv_log_fp.close()
             conv_log_fp = None
         log(f"Successfully created BAM file: {output_bam}", style="bold green")
-        return output_bam
+        return result
     except Exception as e:
         if conv_log_fp:
             conv_log_fp.close()
@@ -610,14 +719,20 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         log(f"Pipe conversion failed: {e}", style="bold red")
         raise
     finally:
+        # 本地任务失败或完成后仅清理任务子目录，保留日志和 local 根目录。
+        if workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
         # 修正：确保日志句柄在任何路径下都被关闭，避免并行模式下句柄泄漏
         if conv_log_fp is not None:
             try:
-                conv_log_fp.close()
+                if not conv_log_fp.closed:
+                    conv_log_fp.close()
             except Exception:
                 pass
+            finally:
+                conv_log_fp = None
 
-def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, is_paired_end=False, preload_network=False):
+def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, is_paired_end=False, preload_network=False, local=None):
     """Windows专用版本（使用临时文件，避免管道问题）"""
     def log(msg, style=None):
         if console:
@@ -627,9 +742,12 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
 
     if output_bam is None:
         output_bam = Path(fanse_file).with_suffix('.bam')
+    target_bam = Path(output_bam)
+    workspace = _create_local_workspace(local)
+    output_bam = workspace / target_bam.name if workspace else target_bam
     
-    temp_sam = Path(output_bam).with_suffix('.temp.sam')
-    temp_bam = Path(output_bam).with_suffix('.temp.bam')
+    temp_sam = (workspace / (target_bam.stem + '.temp.sam')) if workspace else target_bam.with_suffix('.temp.sam')
+    temp_bam = (workspace / (target_bam.stem + '.temp.bam')) if workspace else target_bam.with_suffix('.temp.bam')
 
     # 修正：fallback 路径此前同样未按后缀分流，.sam 被错误交给 fanse sam
     # 镜像 fanse2bam_win_pipe() 的分流逻辑：.sam 跳过 fanse sam，直接走 samtools
@@ -654,7 +772,12 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
             fanse_sam_args = ['fanse', 'sam', '-t', '1', '-i', str(fanse_file), '-r', str(fasta_path), '-o', str(temp_sam)]
             if is_paired_end:
                 fanse_sam_args.append('--pe')  # 修正：透传双端模式
-            subprocess.run(fanse_sam_args, check=True, capture_output=True, text=True)
+                # 修正(2026-09-09): 调度层已做配对检查，内层跳过避免重复询问
+                fanse_sam_args.append('--force-pair')
+            # 修正意图：stderr 实时写入原始输出目录日志，便于网络任务随时查看。
+            conv_log = target_bam.with_suffix('.bam_conv.log')
+            with open(conv_log, 'w', encoding='utf-8') as conv_log_fp:
+                subprocess.run(fanse_sam_args, stderr=conv_log_fp, check=True)
 
         # 转换为BAM
         log(f"Using samtools from: {samtools_path}")
@@ -672,9 +795,13 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
                 tmp_ns_bam = Path(output_bam).with_suffix('.tmp.ns.bam')
                 log(f"[PE 模式] fallback + fixmate: sort -n → fixmate → sort (coord)...")
                 try:
-                    subprocess.run([samtools_path, 'sort', '-n', '-@', '1', '-m', '512M',
-                                    '-o', str(tmp_ns_bam), str(temp_bam)], check=True)
-                    _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log)
+                    name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '4', '-m', '512M']
+                    if workspace:
+                        # 修正意图：PE queryname sort 的临时分块写入本地任务目录。
+                        name_sort_cmd.extend(['-T', str(workspace / 'sort_name')])
+                    name_sort_cmd.extend(['-o', str(tmp_ns_bam), str(temp_bam)])
+                    subprocess.run(name_sort_cmd, check=True)
+                    _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, log, workspace)
                 finally:
                     if tmp_ns_bam.exists():
                         try: tmp_ns_bam.unlink()
@@ -684,30 +811,35 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
                 if is_paired_end and legacy:
                     log("[bold yellow]警告: 旧版 samtools 无 fixmate，跳过 mate pair 修复[/bold yellow]")
                 try:
-                    subprocess.run([samtools_path, 'sort', '-@', '1', '-m', '512M', '-o', str(output_bam), str(temp_bam)],
+                    sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+                    if workspace:
+                        # fallback 的新版 sort 临时分块也写本地任务目录。
+                        sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
+                    sort_cmd.extend(['-o', str(output_bam), str(temp_bam)])
+                    subprocess.run(sort_cmd,
                                    check=True)
                 except subprocess.CalledProcessError:
                     # 旧版语法兜底
                     output_prefix = str(output_bam).replace('.bam', '')
                     subprocess.run([samtools_path, 'sort', str(temp_bam), output_prefix], check=True)
-                if index:
-                    subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
         else:
             # 不排序，直接移动临时BAM到输出位置
             temp_bam.rename(output_bam)
-            if index:
-                subprocess.run([samtools_path, 'index', str(output_bam)], check=True)
-                
-        return output_bam
-        
+
+        return _finalize_bam_output(
+            output_bam, target_bam, samtools_path, index, workspace, log,
+            error_context='生成的 BAM 文件'
+        )
     except subprocess.CalledProcessError as e:
         log(f"Samtools error: {e.stderr.decode() if e.stderr else str(e)}", style="bold red")
-        # 尝试使用备用方法
-        return _fallback_conversion(fanse_file, fasta_path, output_bam, sort, index, console)
+        raise
     except Exception as e:
         log(f"Unexpected error: {str(e)}", style="bold red")
-        return _fallback_conversion(fanse_file, fasta_path, output_bam, sort, index, console)
+        raise
     finally:
+        # 本地模式失败时清理任务子目录，不触碰输入、日志和本地根目录。
+        if workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
         # 修正：.sam 直通模式下 temp_sam 指向用户原始输入文件，
         # 此时绝对不能删它——只删真正由本函数创建的临时 temp.sam
         files_to_clean = [temp_bam]
@@ -731,17 +863,34 @@ def _fallback_conversion(fanse_file, fasta_path, output_bam, sort, index, consol
     
     raise RuntimeError("Fallback conversion not implemented. Please install a working version of samtools.")
 
-def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, ref_info_json=None, is_paired_end=False, preload_network=False):
+def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, force_pair=False, local=None):
     """自动选择平台最优方法"""
+    # 修正(2026-09-09): PE 模式统一在调度层做 R1/R2 配对一致性检查（唯一检查点）：
+    # 1) 用户 --force-pair → ensure_pair_consistency(force=True) 仅打印警告
+    # 2) 检查通过后给内层所有 fanse sam 子进程追加 --force-pair，避免重复检查/询问
+    # 内层平台函数无需感知用户原始 force_pair 值
+    if is_paired_end:
+        try:
+            from .sam import _discover_paired_fanse_files, ensure_pair_consistency
+            _r1, _r1u, _r2f, _r2u = _discover_paired_fanse_files(Path(fanse_file))
+            if _r2f:
+                ensure_pair_consistency(str(fanse_file), str(_r2f),
+                                        force=bool(force_pair), console=console)
+        except KeyboardInterrupt:
+            raise  # 用户在确认提示中选择否 → 原样上抛终止转换
+        except RuntimeError:
+            raise  # 非交互环境的 mismatch 报错 → 原样上抛
+        except Exception:
+            pass  # R2 发现/检查本身的意外异常不阻断转换，交由内层原有警告逻辑兜底
     if os.name == 'nt':
         try:
             # 新增：ref_info_json 透传给管道转换，跳过每文件的 FASTA 全量解析
-            return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network)
+            return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network, local)
         except Exception:
             #如果Windows版本失败，尝试使用传统方法
-            return fanse2bam_win(fanse_file, fasta_path, output_bam, sort, index, keep_sam, console, is_paired_end, preload_network)
+            return fanse2bam_win(fanse_file, fasta_path, output_bam, sort, index, keep_sam, console, is_paired_end, preload_network, local)
     else:  # Linux/Mac
-        return fanse2bam_unix(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network)
+        return fanse2bam_unix(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network, local)
 
 
 
@@ -797,6 +946,18 @@ def add_bam_subparser(subparsers):
         help='网络盘 UNC 路径文件预加载到本地 temp（加速 5-10x），透传给内部 fanse sam。'
              '默认不预加载，在本地 SSD + 千兆网络环境下效果显著；本地文件会自动跳过。'
     )
+    bam_parser.add_argument(
+        '--local', nargs='?', const=True, default=None, metavar='PATH',
+        help='将 BAM 中间文件、PE fixmate 和排序放入本地工作区；不带 PATH 时使用系统临时目录下的 fansetools_temp，带 PATH 时使用指定目录；与 --preload 独立。'
+    )
+    # 修正(2026-09-09): PE 配对一致性检查的跳过开关
+    bam_parser.add_argument(
+        '--force-pair', action='store_true',
+        help='跳过 --pe 模式的 R1/R2 配对一致性检查（flowcell 集合+QNAME 采样，毫秒级）。'
+             '默认开启检查：R1/R2 flowcell 集合不相交（典型场景：不同测序 run 的文件'
+             '被错误配对，fixmate 会静默剥掉全部 paired 标志）时，交互终端询问是否继续，'
+             '非交互环境（脚本/批处理）直接报错终止。确认数据无误后可用此参数跳过。'
+    )
 
     # 新增：并行转换线程数（仅批量模式生效）
     bam_parser.add_argument(
@@ -829,4 +990,18 @@ def add_bam_subparser(subparsers):
 
   4. 批量并行转换 (4个文件同时转换):
      [green]fanse bam -i "*.fanse3" -r ref.fa -o bam_out/ -t 4[/green]
+
+[bold]双端模式 (--pe) 与配对检查:[/bold]
+  --pe 会自动搜索同目录的 R2.fanse3/R2.unmapped 合并四文件流，并执行:
+  sort -n → fixmate → sort (coordinate) → index。
+  转换前默认执行 R1/R2 配对一致性检查（毫秒级头部采样）:
+  - R1/R2 flowcell 集合一致或多 run 合并（部分重叠）→ 直接继续
+  - 集合完全不相交（如不同测序 run 的文件被错误配对）→ 交互终端询问
+    是否继续；非交互环境（脚本/批处理）直接报错，此时请先人工确认
+    两个文件是否真的为 mate pair
+  - 确认数据无误后可用 [green]--force-pair[/green] 跳过检查:
+     [green]fanse bam --pe -i sample_R1.fanse3 -r ref.fa -o sample_PE.bam --force-pair[/green]
+  检查背景: R1/R2 来自不同 flowcell 时 fixmate 找不到任何同名 read，
+  会把全部记录按 orphan 处理剥掉 paired 标志(0x1)，且管道三进程返回码
+  全为 0 静默通过——只能靠此类前置检查拦截。
 """)
