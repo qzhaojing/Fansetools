@@ -353,7 +353,37 @@ def bam_command(args):
     if not input_files:
         console.print(f"[bold red]错误: 未找到有效的输入文件: {args.fanse_file}[/bold red]")
         sys.exit(1)
-        
+
+    # 新增(2026-09-10): --pe 模式输入自动配对去重。
+    # 场景：-i 文件夹 / 通配符同时匹配到 R1 和 R2 文件。R1 经
+    # _discover_paired_fanse_files 自动发现 R2 并合并转换（四文件流），
+    # 若 R2 仍在输入列表中会被当作独立文件再转换一遍（R2 数据重复处理、
+    # 多出多余 BAM）。此处把"已被某个 R1 覆盖的 R2"从输入列表剔除。
+    if getattr(args, 'is_paired_end', False) and len(input_files) > 1:
+        from .sam import _discover_paired_fanse_files
+        covered_r2 = set()
+        for f in input_files:
+            try:
+                _, _, _r2f, _ = _discover_paired_fanse_files(f)
+            except Exception:
+                _r2f = None
+            if _r2f is not None:
+                covered_r2.add(str(Path(_r2f).resolve()))
+        if covered_r2:
+            deduped = []
+            for f in input_files:
+                if str(Path(f).resolve()) in covered_r2:
+                    console.print(f"[dim]跳过 {Path(f).name}: 已由其 R1 配对文件以 --pe 模式合并转换[/dim]")
+                else:
+                    deduped.append(f)
+            if len(deduped) < len(input_files):
+                console.print(
+                    f"[bold blue]--pe 自动配对: 输入 {len(input_files)} 个文件，"
+                    f"其中 {len(input_files) - len(deduped)} 个 R2 已由 R1 合并处理，"
+                    f"实际转换 {len(deduped)} 个[/bold blue]"
+                )
+            input_files = deduped
+
     # 2. 处理输出
     output_path = Path(args.output_bam) if args.output_bam else None
 
@@ -459,11 +489,19 @@ def bam_command(args):
     else:
         # 单文件模式
         infile = input_files[0]
+        # 修正(2026-09-10): -o 指向目录（或无后缀）时自动拼接 <stem>.bam。
+        # --pe 自动配对去重可能把"一对 R1/R2"从批量模式折叠为单文件模式，
+        # 此时目录型 -o 必须像批量模式一样拼接文件名，而不是把目录当 BAM 路径
+        if output_path and (output_path.is_dir() or not output_path.suffix):
+            single_out = output_path / (infile.stem + ".bam")
+            single_out.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            single_out = output_path
         try:
             fanse2bam(
                 fanse_file=str(infile),
                 fasta_path=args.fasta_path,
-                output_bam=output_path,
+                output_bam=single_out,
                 sort=not args.no_sort,
                 index=not args.no_index,
                 keep_sam=getattr(args, 'sam', False),
@@ -1068,6 +1106,9 @@ def add_bam_subparser(subparsers):
 [bold]双端模式 (--pe) 与配对检查:[/bold]
   --pe 会自动搜索同目录的 R2.fanse3/R2.unmapped 合并四文件流，并执行:
   sort -n → fixmate → sort (coordinate) → index。
+  输入端支持文件夹/通配符: -i 指定文件夹或同时匹配 R1+R2 时，
+  --pe 自动按 R1/R2 命名约定配对，已被 R1 覆盖的 R2 自动跳过，
+  每个双端文库只转换一次（一个文库一个 BAM）。
   转换前默认执行 R1/R2 配对一致性检查（毫秒级头部采样）:
   - R1/R2 flowcell 集合一致或多 run 合并（部分重叠）→ 直接继续
   - 集合完全不相交（如不同测序 run 的文件被错误配对）→ 交互终端询问

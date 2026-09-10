@@ -141,11 +141,17 @@ fanse bam -i \\fs2\d\data\sample.fanse3 -r \\fs2\d\ref.fa -o \\fs2\d\out\sample.
 
 ##### Directory mode and PE pairing
 
-Directory mode (`-i dir`) itself does **not** pair R1/R2 — it simply lists every `.fanse3` file and converts each one independently. With `--pe`, each input file that matches the R1 naming convention will additionally auto-discover its R2 partner (see below). **Caution**: if the directory contains both R1 and R2 files, the R2 file will be processed twice (once merged into its R1's PE conversion, once again as its own "single-end" input). For PE libraries prefer a wildcard that selects only R1 files:
+With `--pe`, directory mode (`-i dir`) and wildcards now **auto-pair** R1/R2: every input file matching the R1 naming convention auto-discovers its R2 partner (see below), and any R2 file already covered by an R1's pairing is skipped automatically (`跳过 xxx: 已由其 R1 配对文件以 --pe 模式合并转换`). So `-i dir --pe` converts each PE library exactly once — R1+R2 merged into one BAM per library:
 
 ```bash
+# Whole folder of PE libraries — one BAM per library
+fanse bam -i dir -r ref.fa -o bam_out/ --pe
+
+# Equivalent explicit form
 fanse bam -i "dir\*_R1_*.fanse3" -r ref.fa -o bam_out/ --pe
 ```
+
+Notes: R2-only folders (no R1 counterpart) still convert each R2 as an independent input; the pair-consistency check runs per discovered pair as usual (`--force-pair` skips).
 
 ##### Automatic R2 discovery (`--pe`)
 
