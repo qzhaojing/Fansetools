@@ -1334,38 +1334,105 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
             writer.flush()  # 确保头部立即写入，防止samtools等待或超时
 
         # 核心处理逻辑（并行/串行）
-        # 修正：双端模式默认走单线程流式输出，避免 Pool + 大批次在合并 unmapped 时显著降速
-        # 单端且 threads>1 时才保留并行批处理；双端/配对修复场景以稳定优先
-        if threads > 1 and not (is_paired_end and unmapped_file):
-            if output_sam:
-                console.print(f"启用并行处理: 使用 {threads} 个线程")
-            
+        # 修正(2026-09-10): PE 模式也支持 -t 多线程并行转换；早期版本因 multi-mapping 大批次 pickle 风险
+        # 强制串行，现 _worker_process_records 已改为逐行流式组装 SAM，可安全并行。
+        # PE + 有 unmapped 时：两遍独立 Pool（R1 并行 → 追加写 → R2 并行），共用 writer。
+        if threads > 1:
             from functools import partial
-            
-            # 调整批次大小
-            batch_size = 20_000 
-            
-            # 单端模式，只解析fanse文件
-            record_generator = fanse_parser_high_performance(fanse_file)
-            file_read_size = os.path.getsize(fanse_file) / 450
-            
-            reader = _iter_record_batches(record_generator, batch_size)
+
+            batch_size = 200_000  # 串行分支也是这个；越小 Pool 开销越大
             worker_func = partial(_worker_process_records, regions=regions)
-            
-            # 修正意图：管道模式也显示进度；tqdm 写 stderr，不污染 SAM/BAM stdout
-            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True,
-                      file=sys.stderr) as pbar:
-                with Pool(processes=threads) as pool:
-                    for sam_lines_batch in pool.imap(worker_func, reader, chunksize=1):
-                        if sam_lines_batch:
-                            text = '\n'.join(sam_lines_batch) + '\n'
-                            if is_binary:
-                                writer.write(text.encode('utf-8'))
-                            else:
-                                writer.write(text)
-                        # 修正意图：并行模式下按批次近似推进进度，避免固定错误步长
-                        pbar.update(batch_size)
-                            
+
+            def _run_parallel_stream(record_gen, total_reads, stream_label=""):
+                """对一个 FANSeRecord generator 启 Pool 并行消费，结果追加写入 writer。"""
+                if stream_label:
+                    console.print(f"[dim]并行处理: {stream_label}[/dim]")
+                reader = _iter_record_batches(record_gen, batch_size)
+                with tqdm(total=total_reads, unit='reads', mininterval=10,
+                          unit_scale=True, file=sys.stderr) as pbar:
+                    with Pool(processes=threads) as pool:
+                        for sam_lines_batch in pool.imap(worker_func, reader, chunksize=1):
+                            if sam_lines_batch:
+                                text = '\n'.join(sam_lines_batch) + '\n'
+                                if is_binary:
+                                    writer.write(text.encode('utf-8'))
+                                else:
+                                    writer.write(text)
+                            pbar.update(batch_size)
+
+            def _file_read_count(p):
+                """按 fanse 经验值：每 450 字节 ≈ 1 read"""
+                if p and os.path.exists(str(p)):
+                    return os.path.getsize(str(p)) // 450
+                return 0
+
+            if is_paired_end and r2_fanse3 and os.path.exists(str(r2_fanse3)):
+                # 真双端：两遍独立 Pool，同一个 writer 追加
+                console.print(f"[bold blue]双端并行: R1 → R2，各用 {threads} 进程[/bold blue]")
+                console.print(f"  R1 fanse3 : {fanse_file}")
+                console.print(f"  R1 unmapped: {unmapped_file or '(无)'}")
+                console.print(f"  R2 fanse3 : {r2_fanse3}")
+                console.print(f"  R2 unmapped: {r2_unmapped or '(无)'}")
+                unmapped_path = unmapped_file if unmapped_file and os.path.exists(str(unmapped_file)) else None
+                r2_unmapped_path = r2_unmapped if r2_unmapped and os.path.exists(str(r2_unmapped)) else None
+                # 遍 1：R1
+                if unmapped_path:
+                    _run_parallel_stream(
+                        _merge_fanse_and_unmapped_records(fanse_file, unmapped_path),
+                        _file_read_count(fanse_file) + _file_read_count(unmapped_path),
+                        "R1 (fanse3 + unmapped)"
+                    )
+                else:
+                    _run_parallel_stream(
+                        fanse_parser_high_performance(fanse_file),
+                        _file_read_count(fanse_file),
+                        "R1 (fanse3 only)"
+                    )
+                # 遍 2：R2
+                if r2_unmapped_path:
+                    _run_parallel_stream(
+                        _merge_fanse_and_unmapped_records(r2_fanse3, r2_unmapped_path),
+                        _file_read_count(r2_fanse3) + _file_read_count(r2_unmapped_path),
+                        "R2 (fanse3 + unmapped)"
+                    )
+                else:
+                    _run_parallel_stream(
+                        fanse_parser_high_performance(r2_fanse3),
+                        _file_read_count(r2_fanse3),
+                        "R2 (fanse3 only)"
+                    )
+            elif is_paired_end:
+                # 假双端：R2 不存在，只处理 R1
+                console.print(f"[bold yellow]警告: 双端模式但未发现 R2 fanse3 文件，仅并行处理 R1[/bold yellow]")
+                unmapped_path = unmapped_file if unmapped_file and os.path.exists(str(unmapped_file)) else None
+                if unmapped_path:
+                    _run_parallel_stream(
+                        _merge_fanse_and_unmapped_records(fanse_file, unmapped_path),
+                        _file_read_count(fanse_file) + _file_read_count(unmapped_path),
+                        "R1 (fanse3 + unmapped)"
+                    )
+                else:
+                    _run_parallel_stream(
+                        fanse_parser_high_performance(fanse_file),
+                        _file_read_count(fanse_file),
+                        "R1 (fanse3 only)"
+                    )
+            else:
+                # 单端
+                unmapped_path = unmapped_file if unmapped_file and os.path.exists(str(unmapped_file)) else None
+                if unmapped_path:
+                    _run_parallel_stream(
+                        _merge_fanse_and_unmapped_records(fanse_file, unmapped_path),
+                        _file_read_count(fanse_file) + _file_read_count(unmapped_path),
+                        "fanse3 + unmapped"
+                    )
+                else:
+                    _run_parallel_stream(
+                        fanse_parser_high_performance(fanse_file),
+                        _file_read_count(fanse_file),
+                        "fanse3"
+                    )
+
             if output_sam:
                 console.print(f"处理完成")
         else:
@@ -1439,7 +1506,8 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
 
             # ── 3. 进度条 + 两遍独立消费
             # 修正意图：管道模式也显示进度；tqdm 写 stderr，避免破坏 stdout 数据流
-            with tqdm(total=file_read_size, unit='reads', mininterval=5, unit_scale=True,
+            # 注：mininterval=10 降低网络盘 conv_log 的 flush 频率（用户可实时 tail -f）
+            with tqdm(total=file_read_size, unit='reads', mininterval=10, unit_scale=True,
                       file=sys.stderr) as pbar:
                 if is_paired_end and r2_fanse3 and os.path.exists(str(r2_fanse3)):
                     # 真双端：先 R1，后 R2，用同一个 writer 追加写
