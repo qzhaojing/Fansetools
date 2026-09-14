@@ -1,9 +1,8 @@
 from setuptools import setup, find_packages
-import os
 import sys
-package_data = {}
-if sys.platform == 'win32':
-    package_data['fansetools'] = ['bin/windows/*']
+# 精简(2026-09-14): 移除顶部死代码 package_data 构造块 —— 其结果从未被使用，
+# setup() 内的 package_data 字面量才是生效配置（原顶部块在 win32 时构造
+# package_data['fansetools']=['bin/windows/*']，但被 setup() 参数直接覆盖）
 
 
 setup(

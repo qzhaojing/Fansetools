@@ -1,0 +1,16 @@
+[package]
+name = "fansetools_fastcount"
+version = "0.1.0"
+edition = "2021"
+authors = ["Fansetools"]
+description = "Rust + PyO3 加速的 FANSe3 解析与计数扩展"
+license = "MIT"
+
+[lib]
+name = "fansetools_fastcount"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+

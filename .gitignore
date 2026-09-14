@@ -40,3 +40,9 @@ cli copy.py
 *.fasta
 *.bam
 *.sam
+
+# 精简(2026-09-14): 屏蔽本地运行产物与第三方大文件，保持 git status 干净
+*.log
+.vscode/
+src/fansetools/bin/windows/snpeff/
+fastcount_rs/target/
