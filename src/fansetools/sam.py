@@ -202,23 +202,25 @@ def _merge_four_streams(r1_fanse3, r1_unmapped, r2_fanse3, r2_unmapped):
 # 预编译转换表（全局变量）
 _COMPLEMENT_TABLE = str.maketrans('ATCGNatcgn', 'TAGCNtagcn')
 
-def _worker_process_batch(records: List[FANSeRecord], regions: Optional[Dict] = None) -> List[str]:
+def _worker_process_batch(records: List[FANSeRecord], regions: Optional[Dict] = None, primary_only: bool = False) -> List[str]:
     """
     Worker function for parallel processing of FANSe records in batches.
+    新增(2026-09-14) primary_only: --primary-only 透传到 fanse_to_sam_type。
     """
     results = []
     for record in records:
         if regions and not is_record_in_region(record, regions):
             continue
-        results.extend(fanse_to_sam_type(record))
+        results.extend(fanse_to_sam_type(record, primary_only=primary_only))
     return results
 
-def _worker_process_records(records: List[FANSeRecord], regions: Optional[Dict] = None) -> List[str]:
+def _worker_process_records(records: List[FANSeRecord], regions: Optional[Dict] = None, primary_only: bool = False) -> List[str]:
     """
     兼容并行分支调用名称，实际复用批处理逻辑。
     修正意图：避免 threads>1 时出现 NameError: _worker_process_records 未定义。
+    新增(2026-09-14) primary_only: --primary-only 透传。
     """
-    return _worker_process_batch(records, regions=regions)
+    return _worker_process_batch(records, regions=regions, primary_only=primary_only)
 
 def _iter_record_batches(record_generator, batch_size: int):
     """
@@ -678,10 +680,19 @@ def calculate_mapq_advanced(record: FANSeRecord, alignment_index: int,
     
     return discretize_mapq(raw_mapq_val)
 
-def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #20251024第二次优化
+def fanse_to_sam_type(record: FANSeRecord, primary_only: bool = False) -> Generator[str, None, None]:  #20251024第二次优化
+    # 新增(2026-09-14) --primary-only: 仅输出主比对行，跳过全部辅助比对（0x100/0x800）行。
+    # 意图：multi-heavy 样本下游只需主比对位置时，从源头砍掉 N-1 行辅助输出，
+    # 并省掉整个 SA:Z 标签构建（预计算表 + build_sa_tags）的 CPU/内存开销。
+    # XN:i:<multi_count> 标签保留在主比对行上，多重比对次数信息不丢失。
     """
     将FANSeRecord对象转换为SAM格式的字符串。
     现在支持FANSeRecord中包含的双端信息和未比对信息。
+
+    参数:
+        record: FANSeRecord 对象。
+        primary_only: 只输出主比对（primary）行，不生成辅助比对行（FLAG 0x100|0x800）。
+            关闭 SA:Z 标签构建（无辅助行时 SA 无意义），multi-heavy 样本显著提速。
 
     优化说明 (v3):
       - P0 SA:Z 预计算：先算好每个比对位置的 SA entry 字符串（ref,pos,strand,cigar,mapq,nm），
@@ -737,9 +748,16 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     # 修正：同一条 read 的多个反向比对共享一次反向互补结果。
     reverse_seq = None
     if any(strand == 'R' for strand in (record.strands or [])):
-        reverse_seq = reverse_complement(record.seq)
+        # 新增(2026-09-14) --primary-only: 主比对为正向时辅助链的 revcomp 也不需要
+        if not primary_only or (record.strands and record.strands[primary_idx] == 'R'):
+            reverse_seq = reverse_complement(record.seq)
 
-    for i in range(n_align):
+    # 新增(2026-09-14) --primary-only: 只计算主比对（索引 primary_idx）的属性，
+    # 为将被丢弃的辅助行计算 cigar/mapq/nm/SA entry 纯属浪费——
+    # 这是 multi-heavy 样本下 --primary-only 的主要 CPU 节省点
+    calc_indices = [primary_idx] if primary_only else range(n_align)
+
+    for i in calc_indices:
         ref_nm = record.mismatches[i] if record.mismatches else 0
         strand_i = record.strands[i] if record.strands else 'F'
         rev_i = (strand_i == 'R')
@@ -752,9 +770,11 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         )
 
         # SA entry 格式: ref,pos1based,+|-,cigar,mapq,nm
-        sa_entries.append(
-            f"{_sam_ref_name(record.ref_names[i])},{record.positions[i]+1},{('-' if rev_i else '+')},{cig},{mapq_i},{nm_i}"
-        )
+        # 新增(2026-09-14) --primary-only: 无辅助行时 SA:Z 无意义，不构建 entry
+        if not primary_only:
+            sa_entries.append(
+                f"{_sam_ref_name(record.ref_names[i])},{record.positions[i]+1},{('-' if rev_i else '+')},{cig},{mapq_i},{nm_i}"
+            )
 
         ref_names_sam.append(_sam_ref_name(record.ref_names[i]))
         positions_0based.append(record.positions[i])
@@ -768,7 +788,7 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
     # 修正(2026-09-09): 旧 _sa_tag_excluding 闭包每条输出行重建排除列表 + join，
     # N 个比对 → N 行 × (N-1 entry) = O(N²)。build_sa_tags 用前缀/后缀分解把
     # 列表操作降到 O(N)，字符复制接近输出下限。见 build_sa_tags docstring。
-    sa_tags = build_sa_tags(sa_entries)
+    sa_tags = build_sa_tags(sa_entries) if not primary_only else []  # 新增(2026-09-14): --primary-only 跳过 SA 标签构建
 
     # ═══ 预计算结束，开始生成 SAM 行 ═══
 
@@ -791,13 +811,15 @@ def fanse_to_sam_type(record: FANSeRecord) -> Generator[str, None, None]:  #2025
         f"NM:i:{nms[primary_idx]}",
         f"XS:i:{mapqs[primary_idx]}"
     ]
-    sa_tag = sa_tags[primary_idx]
+    sa_tag = sa_tags[primary_idx] if sa_tags else None  # 新增(2026-09-14): --primary-only 时 sa_tags 为空列表
     if sa_tag:
         sam_line_parts.append(sa_tag)
     yield '\t'.join(sam_line_parts)
 
     # ── 辅助比对行（跳过 primary_idx）──
-    if n_align > 1:
+    # 新增(2026-09-14) --primary-only: 直接不生成辅助比对行（FLAG 0x100|0x800），
+    # 每条 multi read 只输出主比对位置
+    if n_align > 1 and not primary_only:
         for i in range(n_align):
             if i == primary_idx:
                 continue
@@ -1208,6 +1230,7 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
               ref_info_json: Optional[str] = None,
               r2_fanse3: Optional[str] = None, r2_unmapped: Optional[str] = None,
               preload_network: bool = False,  # 修正：网络盘预加载从默认启用改为显式选项
+              primary_only: bool = False,  # 新增(2026-09-14) --primary-only: 仅输出主比对行
               _pipe_writer=None): # 内部参数，用于将输出写入到subprocess管道的stdin
     """
     将FANSe3文件转换为SAM格式，支持区域过滤和双端模式。
@@ -1227,6 +1250,8 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
             为下游 samtools fixmate 提供正确的配对数据源。
             若为 None 则回退为原"假双端"行为（仅合并 R1 fanse3 + R1 unmapped）。
         r2_unmapped: 修正：R2 unmapped 文件路径（双端模式可选）。
+        primary_only: 新增(2026-09-14) --primary-only：仅输出主比对行，
+            不生成 0x100/0x800 辅助比对行及 SA:Z 标签（multi-heavy 提速）。
         _pipe_writer: 内部参数，用于将输出写入到subprocess管道的stdin。
     """
     if console is None:
@@ -1340,8 +1365,12 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
         if threads > 1:
             from functools import partial
 
-            batch_size = 200_000  # 串行分支也是这个；越小 Pool 开销越大
-            worker_func = partial(_worker_process_records, regions=regions)
+            # 修正(2026-09-14): 200k→50k。意图：单批 20万条 SAM 行的 pickle 峰值
+            # 数百 MB，在 commit 内存紧张时直接 MemoryError（CQ1-1 复现：
+            # multiprocessing _send_bytes dumps MemoryError）。50k 批次仍远大于
+            # Pool 每任务开销，吞吐影响可忽略
+            batch_size = 50_000  # 串行分支同步下调；越小 Pool 开销越大
+            worker_func = partial(_worker_process_records, regions=regions, primary_only=primary_only)  # 新增(2026-09-14): primary_only 透传
 
             def _run_parallel_stream(record_gen, total_reads, stream_label=""):
                 """对一个 FANSeRecord generator 启 Pool 并行消费，结果追加写入 writer。"""
@@ -1445,7 +1474,7 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
             #  3. 干掉 _merge_four_streams 这种"四文件交错 generator"——没必要，两遍独立更直白
             #  4. 进度条在所有流启动前算好 total，全程跑一个条
             # ═══════════════════════════════════════════════════════
-            batch_size = 100_000
+            batch_size = 50_000  # 修正(2026-09-14): 100k→50k，降低峰值 commit 内存（与并行分支同步）
             batch_count = 0
             batch_lines = []
             filtered_count = 0
@@ -1491,7 +1520,8 @@ def fanse2sam(fanse_file: str, fasta_path: str, output_sam: Optional[str] = None
                         filtered_count += 1
                         pbar.update(1)
                         continue
-                    for sam_line in fanse_to_sam_type(record):
+                    # 新增(2026-09-14): primary_only 透传，仅输出主比对行
+                    for sam_line in fanse_to_sam_type(record, primary_only=primary_only):
                         batch_lines.append(sam_line)
                         batch_count += 1
                     if batch_count >= batch_size:
@@ -1712,6 +1742,7 @@ def run_sam_command(args):
                           r2_fanse3=current_r2_fanse3,      # 修正：R2 fanse3 传入
                           r2_unmapped=current_r2_unmapped,  # 修正：R2 unmapped 传入
                           preload_network=getattr(args, 'preload', False),  # 修正：网络盘预加载选项
+                          primary_only=getattr(args, 'only_primary', False),  # 新增(2026-09-14): --primary-only 透传
                           _pipe_writer=sort_process.stdin # 将stdin传递给fanse2sam
                           )
                 sort_process.stdin.close() # 关闭stdin，通知sort进程输入结束
@@ -1754,10 +1785,14 @@ def run_sam_command(args):
                           ref_info_json=getattr(args, 'ref_info_json', None),
                           r2_fanse3=current_r2_fanse3,      # 修正：R2 fanse3 传入
                           r2_unmapped=current_r2_unmapped,   # 修正：R2 unmapped 传入
-                          preload_network=getattr(args, 'preload', False)  # 修正：网络盘预加载选项
+                          preload_network=getattr(args, 'preload', False),  # 修正：网络盘预加载选项
+                          primary_only=getattr(args, 'only_primary', False)  # 新增(2026-09-14): --primary-only 透传
                           )
         except Exception as e:
-            console.print(f"[bold red]Error processing {input_path}: {e}[/bold red]")
+            # 修正(2026-09-14): 异常文本含 [WinError ...]/[Errno ...] 时会被 rich 当作
+            # markup 标签吞掉（CQ1-1 案例：错误信息显示为空白），escape 后完整可见
+            from rich.markup import escape
+            console.print(f"[bold red]Error processing {escape(str(input_path))}: {escape(str(e))}[/bold red]")
 
 
 def add_sam_subparser(subparsers):
@@ -1796,6 +1831,16 @@ def add_sam_subparser(subparsers):
                                  '提供时跳过逐行解析FASTA（数GB文件可节省数分钟），直接毫秒级读取缓存生成@SQ header；'
                                  '缓存缺失或损坏时自动回退为解析FASTA。可由 fanse bam 批量转换自动生成，'
                                  '也可用 fansetools.sam.parse_fasta 手动生成')
+    # 新增(2026-09-14): --primary-only — 只输出主比对（primary alignment）行，
+    # 跳过 0x100/0x800 辅助比对行及 SA:Z 标签构建。
+    # 意图：multi-heavy 样本下游只需主比对位置时，从源头砍掉 N-1 行辅助输出，
+    # 并省掉整个 SA:Z 标签构建（预计算表 + build_sa_tags）的 CPU/内存开销。
+    # XN:i:<multi_count> 标签保留在主比对行上，多重比对次数信息不丢失。
+    sam_parser.add_argument('--primary-only', action='store_true', dest='only_primary',
+                            help='仅输出主比对（primary alignment）行，不生成辅助比对行'
+                                 '（FLAG 0x100|0x800）及 SA:Z 标签。'
+                                 '适用于下游只需唯一比对位置的流程（如 coverage 计算、variant calling）。'
+                                 '多重比对次数仍保留在主比对行的 XN:i 标签中。')
     sam_parser.set_defaults(func=run_sam_command)
 
     add_rich_epilog(sam_parser, """
@@ -1820,6 +1865,11 @@ def add_sam_subparser(subparsers):
 
   3. 区域过滤:
      [green]fanse sam -i sample.fanse3 -r ref.fa -R chr1:1000-2000 -o filtered.sam[/green]
+
+  4. 只输出主比对位置 (--primary-only, 2026-09-14 新增):
+     [green]fanse sam -i sample.fanse3 -r ref.fa --primary-only -o sample.primary.sam[/green]
+     多重比对 read 仅输出主比对行（不生成 0x100/0x800 辅助行与 SA 标签），
+     速度更快、文件更小；multi 次数保留在 [green]XN:i[/green] 标签。
 """)
 
 

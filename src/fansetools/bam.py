@@ -47,7 +47,7 @@ def build_ref_info_cache(fasta_path: str, console=None) -> str:
     log(f"缓存就绪: {cache_path} ({len(ref_info)} 条序列)")
     return str(cache_path)
 
-def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None, is_paired_end=False, preload_network=False, force_pair=False, threads=1):
+def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None, is_paired_end=False, preload_network=False, force_pair=False, threads=1, primary_only=False):
     """统一构建 fanse sam 命令；提供缓存时追加 --ref-info-json 跳过 FASTA 解析"""
     cmd = ['fanse', 'sam', '-i', str(fanse_file), '-r', str(fasta_path)]
     if is_paired_end:
@@ -58,6 +58,11 @@ def _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json=None, is_paired_end=Fal
         cmd.append('--preload')
     if ref_info_json:
         cmd.extend(['--ref-info-json', str(ref_info_json)])
+    # 新增(2026-09-14): --primary-only 透传给内层 fanse sam，
+    # 意图：多重比对 read 仅输出主比对行（跳过 0x100/0x800 辅助行与 SA 标签），
+    # multi-heavy 样本下显著降低 SAM 流体积与 fanse sam CPU 开销
+    if primary_only:
+        cmd.append('--primary-only')
     # threads 透传到 fanse sam 子进程：默认 1；用户 fanse bam -t N 时 fanse sam 也用 N
     # 注：sam.py 现 PE 模式已支持多进程两遍并行处理（R1 并行 → R2 并行），
     # 不再因 multi-mapping 大批次 pickle 风险强制串行
@@ -85,6 +90,32 @@ def _create_local_workspace(local):
 def _now_ts():
     """返回当前时间戳字符串 YYYY-MM-DD HH:MM:SS"""
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _fanse_sam_env():
+    # 新增(2026-09-14): fanse sam 子进程限制 OpenBLAS/OMP 线程为 1。
+    # 意图：fanse sam 导入 pandas/numpy 时 OpenBLAS 按"核数 × worker 进程"预分配
+    # 线程池缓冲；commit 内存紧张时（本机实测 29.6/31.9GB, 93%）4 个 Pool worker
+    # 全部报 'OpenBLAS error: Memory allocation still failed' 并连锁 MemoryError。
+    # fanse sam 的格式转换不使用 BLAS，限 1 线程零性能损失、大幅降低 commit 压力。
+    # 注：重复 spawn 场景下 setdefault 保证用户显式设置的环境变量优先。
+    env = dict(os.environ)
+    env.setdefault('OPENBLAS_NUM_THREADS', '1')
+    env.setdefault('OMP_NUM_THREADS', '1')
+    return env
+
+
+def _conv_log_has_fatal(conv_log_path):
+    # 新增(2026-09-14): 扫描 conv_log 中 run_sam_command 的 'Error processing' 致命标记。
+    # 意图：fanse sam 内部异常被捕获后仍以 rc=0 退出（静默容错），下游 view/sort
+    # 对空数据流也全部 rc=0，曾产出 0.5MB 纯 header 空壳 BAM 并报告"成功"
+    # （CQ1-1_S10_R1_001_new.bam 案例）。stderr（conv_log）中的 'Error processing'
+    # 行是唯一可靠信号，命中即中止——宁可报错失败，不要静默空 BAM。
+    try:
+        with open(str(conv_log_path), 'r', encoding='utf-8', errors='ignore') as fp:
+            return 'Error processing' in fp.read()
+    except OSError:
+        return False
 
 
 def _copy_final_outputs(local_bam, target_bam, index):
@@ -157,10 +188,16 @@ def _run_fixmate_pipeline(tmp_ns_bam, output_bam, samtools_path, legacy, index, 
         raise RuntimeError(f'fixmate 输入 (queryname sorted BAM) 不存在或过小: {tmp_ns_bam}')
 
     log(f"[PE fixmate] 修复 mate pair 信息...")
+    # 修正(2026-09-14): 本文件全部 samtools sort 统一 '-@ 4'→'-@ 1'（共9处，replace_all）。
+    # 意图：'-@ 4 -m 512M' 要求一次性分配 ~2GB 排序缓冲（4线程×512M），内存紧张时
+    # samtools 报 "couldn't allocate memory for bam_mem"；且管道模式下 sort 先死
+    # → view 收到 EPIPE 报 rc=1（级联影子，见 2026-09-09 PE 管道诊断）。
+    # 单线程 -@ 1 只需 512M，符合并行转换管线的既有内存约束，速度瓶颈主要在
+    # fanse sam 阶段，sort 线程数影响很小。
     # fixmate -m: 同时添加 ms (mate score) 标签，有利于下游分析
     # stdin=tmp_ns_bam, stdout=交给 sort 管道
     fixmate_cmd = [samtools_path, 'fixmate', '-m', str(tmp_ns_bam), '-']
-    sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+    sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M']
     if local_work_dir:
         # 新版 samtools 的排序分块也放入当前本地任务目录。
         sort_cmd.extend(['-T', str(Path(local_work_dir) / 'sort_coord')])
@@ -205,7 +242,7 @@ def _detect_legacy_samtools(samtools_path, log):
         log(f"Unexpected error during samtools version detection ({e}). Assuming legacy for compatibility.")
         return True
 
-def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, local=None, threads=1):
+def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, local=None, threads=1, primary_only=False):
     """
     将FANSe3文件直接转换为BAM格式（精简版）
     
@@ -250,7 +287,7 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
         # 构建samtools命令
         samtools_cmd = [samtools_path, 'view', '-bS', '-']
         if sort:
-            samtools_sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+            samtools_sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M']
             if workspace:
                 # 本地模式下 sort 分块和最终 BAM 都留在任务目录。
                 samtools_sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
@@ -267,7 +304,7 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
             # 修正：SAM 输入先统一转 BAM 流，再走 sort 输出，避免直写路径在复杂 SAM 下生成空/极小文件
             if sort:
                 p1 = subprocess.Popen([samtools_path, 'view', '-bS', str(fanse_file)], stdout=subprocess.PIPE)
-                sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+                sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M']
                 if workspace:
                     # 本地模式下排序分块不写网络输出目录。
                     sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
@@ -296,13 +333,14 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
         # 修正意图：调度层已完成配对检查；此处固定跳过重复检查。
         fanse_cmd = _fanse_sam_cmd(
             fanse_file, fasta_path, ref_info_json, is_paired_end,
-            preload_network, force_pair=True, threads=threads
+            preload_network, force_pair=True, threads=threads,
+            primary_only=primary_only  # 新增(2026-09-14): --primary-only 透传到内层 fanse sam
         )
         log(f"Converting {fanse_file} to BAM...")
 
         if sort:
             # fanse sam | samtools view -bS - | samtools sort -o output.bam
-            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE)
+            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, env=_fanse_sam_env())  # 新增(2026-09-14): env 限制 OpenBLAS 线程
             p2 = subprocess.Popen(samtools_cmd, stdin=p1.stdout, stdout=subprocess.PIPE)
             p3 = subprocess.Popen(samtools_sort_cmd, stdin=p2.stdout)
             p1.stdout.close()
@@ -311,7 +349,7 @@ def fanse2bam_unix(fanse_file, fasta_path, output_bam=None, sort=True, index=Tru
             
         else:
             # fanse sam | samtools view -bS - -o output.bam
-            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE)
+            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, env=_fanse_sam_env())  # 新增(2026-09-14): env 限制 OpenBLAS 线程
             p2 = subprocess.Popen(samtools_cmd, stdin=p1.stdout)
             p1.stdout.close()
             p2.communicate()
@@ -434,7 +472,7 @@ def bam_command(args):
                         preload_network=getattr(args, 'preload', False),  # 修正：--preload 网络盘预加载透传
                         force_pair=getattr(args, 'force_pair', False),  # 修正(2026-09-09): 配对检查跳过透传
                         local=getattr(args, 'local', None),
-                        threads=args.threads
+                        threads=args.threads, primary_only=getattr(args, 'only_primary', False)  # 新增(2026-09-14): --primary-only 透传
                     )
                     return infile.name, None
                 except Exception as e:
@@ -481,7 +519,7 @@ def bam_command(args):
                     preload_network=getattr(args, 'preload', False),  # 修正：--preload 网络盘预加载透传
                     force_pair=getattr(args, 'force_pair', False),  # 修正(2026-09-09): 配对检查跳过透传
                     local=getattr(args, 'local', None),
-                    threads=args.threads
+                    threads=args.threads, primary_only=getattr(args, 'only_primary', False)  # 新增(2026-09-14): --primary-only 透传
                 )
             except Exception as e:
                 console.print(f"[bold red]处理 {infile.name} 失败: {e}[/bold red]")
@@ -511,7 +549,7 @@ def bam_command(args):
                 preload_network=getattr(args, 'preload', False),  # 修正：--preload 网络盘预加载透传
                 force_pair=getattr(args, 'force_pair', False),  # 修正(2026-09-09): 配对检查跳过透传
                 local=getattr(args, 'local', None),
-                threads=args.threads
+                threads=args.threads, primary_only=getattr(args, 'only_primary', False)  # 新增(2026-09-14): --primary-only 透传
             )
         except Exception as e:
             console.print(f"[bold red]错误: {e}[/bold red]")
@@ -519,7 +557,7 @@ def bam_command(args):
         # 修正：同批量模式，ref_info_cache 是持久化缓存，不再主动删除
         # （跨运行复用可节省数分钟 FASTA 解析时间）
 
-def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, local=None, threads=1):
+def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index=True, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, local=None, threads=1, primary_only=False):
     #直接原位生成BAM文件，并进行排序索引
     def log(msg, style=None):
         if console:
@@ -560,7 +598,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
             try:
                 # Step 1: SAM → BAM → queryname 排序临时文件
                 p1 = subprocess.Popen([samtools_path, 'view', '-bS', str(fanse_file)], stdout=subprocess.PIPE)
-                name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '4', '-m', '512M']
+                name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '1', '-m', '512M']
                 if workspace:
                     # PE name sort 的分块也放入本地任务目录。
                     name_sort_cmd.extend(['-T', str(workspace / 'sort_name')])
@@ -596,7 +634,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 [samtools_path, 'view', '-bS', str(fanse_file)],
                 stdout=subprocess.PIPE
             )
-            sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+            sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M']
             if workspace:
                 # 修正意图：排序分块只写本地任务目录，避免网络盘临时 I/O。
                 sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
@@ -632,7 +670,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
     conv_log = target_bam.with_suffix('.bam_conv.log')
     conv_log_fp = None
     try:
-        fanse_cmd = _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json, is_paired_end, preload_network, force_pair=True, threads=threads)
+        fanse_cmd = _fanse_sam_cmd(fanse_file, fasta_path, ref_info_json, is_paired_end, preload_network, force_pair=True, threads=threads, primary_only=primary_only)  # 新增(2026-09-14): --primary-only 透传
         log(f"Using samtools from: {samtools_path}")
 
         legacy = _detect_legacy_samtools(samtools_path, log)
@@ -657,9 +695,9 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
             conv_log_fp.flush()
             try:
                 t_pipe_start = time.time()
-                p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
+                p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp, env=_fanse_sam_env())
                 p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '4', '-m', '512M']
+                name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '1', '-m', '512M']
                 if workspace:
                     name_sort_cmd.extend(['-T', str(workspace / 'sort_name')])
                 name_sort_cmd.extend(['-o', str(tmp_ns_bam), '-'])
@@ -696,14 +734,14 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
 
         # ===== 非 PE + sort + 新版 samtools：fanse sam | view | sort =====
         elif sort and not legacy:
-            samtools_sort = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+            samtools_sort = [samtools_path, 'sort', '-@', '1', '-m', '512M']
             if workspace:
                 samtools_sort.extend(['-T', str(workspace / 'sort_coord')])
             samtools_sort.extend(['-o', str(output_bam), '-'])
             conv_log_fp.write(f"[{_now_ts()}] fanse sam → view → sort (coord, 新版) 开始\n")
             conv_log_fp.flush()
             t_pipe_start = time.time()
-            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
+            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp, env=_fanse_sam_env())
             p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE)
             p3 = subprocess.Popen(samtools_sort, stdin=p2.stdout)
             p1.stdout.close()
@@ -726,7 +764,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
             conv_log_fp.write(f"[{_now_ts()}] fanse sam → view → sort (legacy) 开始\n")
             conv_log_fp.flush()
             t_pipe_start = time.time()
-            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
+            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp, env=_fanse_sam_env())
             p2 = subprocess.Popen(samtools_view, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             p3 = subprocess.Popen(samtools_sort_legacy, stdin=p2.stdout, stderr=subprocess.PIPE)
             p1.stdout.close()
@@ -745,7 +783,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
             conv_log_fp.write(f"[{_now_ts()}] fanse sam → view (no sort) 开始\n")
             conv_log_fp.flush()
             t_pipe_start = time.time()
-            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp)
+            p1 = subprocess.Popen(fanse_cmd, stdout=subprocess.PIPE, stderr=conv_log_fp, env=_fanse_sam_env())
             samtools_view_nosort = [samtools_path, 'view', '-bS', '-', '-o', str(output_bam)]
             p2 = subprocess.Popen(samtools_view_nosort, stdin=p1.stdout)
             p1.stdout.close()
@@ -758,6 +796,15 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
                 raise RuntimeError(f'fanse sam 失败 (rc={rc_p1})')
             if rc_p2 != 0:
                 raise RuntimeError(f'samtools view failed (rc={rc_p2})')
+
+        # 新增(2026-09-14): 空流防护 — fanse sam 内部异常后 rc=0，view/sort 对空流
+        # 也全部 rc=0，若不检查会产出纯 header 空壳 BAM 并误报成功。
+        # conv_log 中出现 'Error processing' 即 fanse sam 真实失败，立即中止。
+        if _conv_log_has_fatal(conv_log):
+            raise RuntimeError(
+                'fanse sam 内部报错 (rc=0 但输出流中断，见 bam_conv.log 中 '
+                '"Error processing" 行)；已中止以避免生成空 BAM'
+            )
 
         # BAM 校验、索引、最终复制
         conv_log_fp.write(f"[{_now_ts()}] BAM 校验 → 索引 → 复制到目标盘 开始\n")
@@ -798,7 +845,7 @@ def fanse2bam_win_pipe(fanse_file, fasta_path, output_bam=None, sort=True, index
         if workspace:
             shutil.rmtree(workspace, ignore_errors=True)
 
-def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, is_paired_end=False, preload_network=False, local=None, threads=1):
+def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, is_paired_end=False, preload_network=False, local=None, threads=1, primary_only=False):
     """Windows专用版本（使用临时文件，避免管道问题）"""
     def log(msg, style=None):
         if console:
@@ -837,6 +884,9 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
             if is_paired_end:
                 fanse_sam_args.append('--pe')
                 fanse_sam_args.append('--force-pair')
+            # 新增(2026-09-14): --primary-only 透传，多重比对仅输出主比对行
+            if primary_only:
+                fanse_sam_args.append('--primary-only')
             conv_log = target_bam.with_suffix('.bam_conv.log')
             conv_log_fp = open(str(conv_log), 'w', encoding='utf-8')
             conv_log_fp.write(f"[{_now_ts()}] === fanse2bam_win (fallback) 启动 ===\n")
@@ -848,7 +898,7 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
             log(f"fanse sam 进度日志: {conv_log}")
             try:
                 t_fanse = time.time()
-                subprocess.run(fanse_sam_args, stderr=conv_log_fp, check=True)
+                subprocess.run(fanse_sam_args, stderr=conv_log_fp, check=True, env=_fanse_sam_env())  # 新增(2026-09-14): env 限制 OpenBLAS 线程
                 conv_log_fp.write(f"[{_now_ts()}] fanse sam 结束 (耗时 {time.time()-t_fanse:.1f}s)\n")
                 conv_log_fp.flush()
             except subprocess.CalledProcessError as e:
@@ -859,6 +909,13 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
                 raise
             conv_log_fp.close()
             conv_log_fp = None
+            # 新增(2026-09-14): 空流防护 — fanse sam rc=0 但内部报错（静默容错）时，
+            # temp.sam 为空/不完整，继续跑 view/sort 会产出空壳 BAM，先检查再中止
+            if _conv_log_has_fatal(conv_log):
+                raise RuntimeError(
+                    'fanse sam 内部报错 (rc=0 但输出流中断，见 bam_conv.log 中 '
+                    '"Error processing" 行)；已中止以避免生成空 BAM'
+                )
 
         # 转换为BAM
         log(f"Using samtools from: {samtools_path}")
@@ -882,7 +939,7 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
                     conv_log_fp.flush()
                     t_sortn = time.time()
                     try:
-                        name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '4', '-m', '512M']
+                        name_sort_cmd = [samtools_path, 'sort', '-n', '-@', '1', '-m', '512M']
                         if workspace:
                             name_sort_cmd.extend(['-T', str(workspace / 'sort_name')])
                         name_sort_cmd.extend(['-o', str(tmp_ns_bam), str(temp_bam)])
@@ -905,7 +962,7 @@ def fanse2bam_win(fanse_file, fasta_path, output_bam=None, sort=True, index=True
                     conv_log_fp.flush()
                     t_sort = time.time()
                     try:
-                        sort_cmd = [samtools_path, 'sort', '-@', '4', '-m', '512M']
+                        sort_cmd = [samtools_path, 'sort', '-@', '1', '-m', '512M']
                         if workspace:
                             sort_cmd.extend(['-T', str(workspace / 'sort_coord')])
                         sort_cmd.extend(['-o', str(output_bam), str(temp_bam)])
@@ -975,7 +1032,7 @@ def _fallback_conversion(fanse_file, fasta_path, output_bam, sort, index, consol
     
     raise RuntimeError("Fallback conversion not implemented. Please install a working version of samtools.")
 
-def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, force_pair=False, local=None, threads=1):
+def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, keep_sam=False, console=None, ref_info_json=None, is_paired_end=False, preload_network=False, force_pair=False, local=None, threads=1, primary_only=False):
     """自动选择平台最优方法"""
     # 修正(2026-09-09): PE 模式统一在调度层做 R1/R2 配对一致性检查（唯一检查点）：
     # 1) 用户 --force-pair → ensure_pair_consistency(force=True) 仅打印警告
@@ -997,12 +1054,12 @@ def fanse2bam(fanse_file, fasta_path, output_bam=None, sort=True, index=True, ke
     if os.name == 'nt':
         try:
             # 新增：ref_info_json 透传给管道转换，跳过每文件的 FASTA 全量解析
-            return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network, local, threads=threads)
+            return fanse2bam_win_pipe(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network, local, threads=threads, primary_only=primary_only)  # 新增(2026-09-14): primary_only 透传
         except Exception:
             #如果Windows版本失败，尝试使用传统方法
-            return fanse2bam_win(fanse_file, fasta_path, output_bam, sort, index, keep_sam, console, is_paired_end, preload_network, local, threads=threads)
+            return fanse2bam_win(fanse_file, fasta_path, output_bam, sort, index, keep_sam, console, is_paired_end, preload_network, local, threads=threads, primary_only=primary_only)  # 新增(2026-09-14): primary_only 透传
     else:  # Linux/Mac
-        return fanse2bam_unix(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network, local, threads=threads)
+        return fanse2bam_unix(fanse_file, fasta_path, output_bam, sort, index, console, ref_info_json, is_paired_end, preload_network, local, threads=threads, primary_only=primary_only)  # 新增(2026-09-14): primary_only 透传
 
 
 
@@ -1080,6 +1137,19 @@ def add_bam_subparser(subparsers):
              '增大该值无效果。建议2-4，默认1（串行）。注意每个线程约占1个CPU核与数百MB内存'
     )
 
+    # 新增(2026-09-14): --primary-only — 多重比对 read 仅输出主比对行。
+    # 意图：下游只需主比对位置（如 coverage/IGV 浏览）时，从源头跳过
+    # 0x100/0x800 辅助比对行与 SA:Z 标签构建，BAM 更小、转换更快。
+    # multi 次数仍保留在主比对行的 XN:i 标签中。
+    bam_parser.add_argument(
+        '--primary-only', action='store_true', dest='only_primary',
+        help='仅输出主比对（primary alignment）行：多重比对 read 不生成辅助比对行'
+             '（FLAG 0x100|0x800）及 SA:Z 标签。适用于下游只需主比对位置的流程'
+             '（coverage 计算、IGV 浏览等），BAM 体积更小、转换更快。'
+             '多重比对次数仍保留在主比对行的 XN:i 标签中。'
+             '注意：.sam 输入（SAM 直通模式）不应用此选项。'
+    )
+
     bam_parser.set_defaults(func=bam_command)
 
     add_rich_epilog(bam_parser, """
@@ -1102,6 +1172,12 @@ def add_bam_subparser(subparsers):
 
   4. 批量并行转换 (4个文件同时转换):
      [green]fanse bam -i "*.fanse3" -r ref.fa -o bam_out/ -t 4[/green]
+
+  5. 只输出主比对位置 (--primary-only, 2026-09-14 新增):
+     [green]fanse bam -i sample.fanse3 -r ref.fa -o sample.bam --primary-only[/green]
+     多重比对 read 仅输出主比对行（不生成 0x100/0x800 辅助行与 SA 标签），
+     BAM 体积更小、转换更快；multi 次数保留在 [green]XN:i[/green] 标签。
+     适用于 coverage 计算、IGV 浏览等只需主比对位置的下游流程。
 
 [bold]双端模式 (--pe) 与配对检查:[/bold]
   --pe 会自动搜索同目录的 R2.fanse3/R2.unmapped 合并四文件流，并执行:
