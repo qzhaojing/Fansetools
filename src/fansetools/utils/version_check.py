@@ -14,6 +14,44 @@ from pathlib import Path
 from packaging import version
 from datetime import datetime, timedelta
 
+def _find_git_root(start):
+    """向上查找包含 .git 的目录，找不到返回 None。
+
+    新增(2026-09-14): 安装方式与本地 commit 检测不能依赖 CWD ——
+    包的真实源码位置才是 git pull / pip install -e . 的正确执行位置。
+    """
+    try:
+        start = Path(start).resolve()
+    except Exception:
+        return None
+    for p in [start, *start.parents]:
+        if (p / '.git').exists():
+            return p
+    return None
+
+
+def _get_editable_project_dir():
+    """读取 pip show 的 'Editable project location' 字段，非可编辑安装返回 None。
+
+    新增(2026-09-14): 可编辑安装（pip install -e .）的真实源码目录与 CWD 无关；
+    git pull 与重新安装必须在该目录执行，否则更新错仓库或直接失败。
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, '-m', 'pip', 'show', 'fansetools'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.lower().startswith('editable project location'):
+                    loc = line.split(':', 1)[1].strip()
+                    if loc:
+                        return Path(loc)
+    except Exception:
+        pass
+    return None
+
+
 class DualVersionChecker:
     """双平台版本检测器（PyPI + GitHub）"""
     
@@ -109,36 +147,43 @@ class DualVersionChecker:
     
     def get_local_commit_info(self):
         """获取本地Git信息（如果是从Git安装）"""
+        # 修正(2026-09-14): 原实现只检测 CWD 是否为 git 仓库 —— CWD 与包安装
+        # 位置无关，用户在数据目录运行 fanse 时会误判 is_git_install=False，
+        # 连带 github_update_available 永远为 False、perform_update 误报
+        # "已是最新版本"。现优先从本模块所在包目录向上找 .git（可编辑安装
+        # 即源码仓库），再回退 CWD。
+        candidates = [Path(__file__).resolve().parent]
         try:
-            # 检查当前目录是否是Git仓库
-            result = subprocess.run([
-                'git', 'rev-parse', '--is-inside-work-tree'
-            ], capture_output=True, text=True, timeout=5)
-            
-            if result.returncode == 0:
-                # 获取当前commit
+            candidates.append(Path.cwd())
+        except Exception:
+            pass
+        for cand in candidates:
+            git_root = _find_git_root(cand)
+            if git_root is None:
+                continue
+            try:
                 commit_result = subprocess.run([
                     'git', 'rev-parse', 'HEAD'
-                ], capture_output=True, text=True, timeout=5)
-                
+                ], capture_output=True, text=True, timeout=5, cwd=str(git_root))
+
                 if commit_result.returncode == 0:
                     current_sha = commit_result.stdout.strip()[:7]
-                    
+
                     # 获取当前分支
                     branch_result = subprocess.run([
                         'git', 'branch', '--show-current'
-                    ], capture_output=True, text=True, timeout=5)
-                    
+                    ], capture_output=True, text=True, timeout=5, cwd=str(git_root))
+
                     branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
-                    
+
                     return {
                         'sha': current_sha,
                         'branch': branch,
                         'is_git_install': True
                     }
-        except:
-            pass
-        
+            except Exception:
+                continue
+
         return {'is_git_install': False}
     
     def check_version(self):
@@ -286,22 +331,35 @@ class DualVersionChecker:
         installation_method = get_installation_method()
         print("检查更新中...")
         version_info = self.check_version()
-        
-        if not version_info or not version_info.get('any_update_available'):
+
+        update_available = bool(version_info and version_info.get('any_update_available'))
+        # 新增(2026-09-14): 显式更新意图放行。
+        # 意图：install_win.ps1 / install_linux.sh 安装的机器
+        # （pip install git+https://...）运行目录通常不是 git 仓库，且
+        # fansetools 未发布 PyPI，原逻辑此时直接报"已是最新版本"返回、
+        # 从不执行升级。用户运行 'fanse update' 即表达升级意图 →
+        # pip/git 安装一律放行，由 pip --force-reinstall 拉取仓库最新
+        # commit（版本号不变也会重装）；unknown 安装方式才维持旧行为。
+        force_sync = installation_method in ('pip', 'git')
+
+        if not update_available and not force_sync:
             print(f"当前已是最新版本：{self.current_version}，无需更新。")
             return True
-        
+
         print("=" * 60)
         print("开始更新 fansetools")
         print("=" * 60)
-        
+
         if interactive:
             # 显示更新信息
-            if version_info.get('pypi_update_available'):
-                print(f"发现新版本: {version_info['pypi_latest']} (当前: {version_info['current_version']})")
-            elif version_info.get('github_update_available'):
-                print("发现GitHub代码更新")
-            
+            if update_available:
+                if version_info.get('pypi_update_available'):
+                    print(f"发现新版本: {version_info['pypi_latest']} (当前: {version_info['current_version']})")
+                elif version_info.get('github_update_available'):
+                    print("发现GitHub代码更新")
+            else:
+                print("将同步 GitHub 仓库最新代码（git 安装的版本号可能不随 commit 变化）")
+
             # 确认更新
             try:
                 response = input("是否立即更新? [y/N]: ").strip().lower()
@@ -311,13 +369,20 @@ class DualVersionChecker:
             except KeyboardInterrupt:
                 print("\n更新已取消。")
                 return False
-        
+
         try:
             if installation_method == 'pip':
-                print("使用pip进行更新...")
-                result = subprocess.run([
-                    sys.executable, '-m', 'pip', 'install', '--upgrade', 'git+https://github.com/qzhaojing/Fansetools.git --force-reinstall',
-                ], check=True, capture_output=True, text=True)
+                print("使用pip进行更新（git+https 拉取仓库最新 commit）...")
+                # 修正(2026-09-14): 原实现把 '--force-reinstall' 与 URL 拼成
+                # 单个参数 'git+https://... --force-reinstall' 传给 pip，
+                # pip 将其视为 URL 一部分直接报错 —— 这是 'fanse update'
+                # 长期失效的直接原因。现拆分为独立参数；同时不再
+                # capture_output，让 pip 的下载/安装进度实时可见。
+                subprocess.run([
+                    sys.executable, '-m', 'pip', 'install',
+                    '--upgrade', '--force-reinstall',
+                    f'git+https://github.com/{self.github_repo}.git',
+                ], check=True)
                 new_ver = None
                 try:
                     out = subprocess.run([sys.executable, '-c', 'import fansetools; print(getattr(fansetools, "__version__", "unknown"))'], capture_output=True, text=True)
@@ -325,9 +390,9 @@ class DualVersionChecker:
                         new_ver = out.stdout.strip()
                 except Exception:
                     pass
-                print(f"更新完毕，最新版本 {new_ver or version_info.get('pypi_latest') or '未知'}")
+                print(f"更新完毕，已同步至仓库最新提交（版本号: {new_ver or '未知'}）")
                 return True
-                
+
             elif installation_method == 'conda':
                 print("使用conda进行更新...")
                 result = subprocess.run([
@@ -335,18 +400,31 @@ class DualVersionChecker:
                 ], check=True, capture_output=True, text=True)
                 print(f"更新完毕，最新版本 {version_info.get('pypi_latest') or '未知'}")
                 return True
-                
+
             elif installation_method == 'git':
                 print("使用git进行更新...")
-                # 拉取最新代码
-                subprocess.run(['git', 'pull'], check=True)
+                # 修正(2026-09-14): git pull 必须在包源码目录执行。
+                # 原实现在 CWD 执行 pull —— 用户在其他目录运行 fanse update
+                # 时要么 pull 错误的仓库，要么直接失败。现优先用 pip show 的
+                # Editable project location，回退到本模块所在的 git 根目录。
+                src_dir = _get_editable_project_dir()
+                if src_dir is None:
+                    src_dir = _find_git_root(Path(__file__).resolve().parent)
+                if src_dir is None:
+                    print("无法定位源码目录，请手动更新:")
+                    print("  cd <Fansetools源码目录>")
+                    print("  git pull origin main")
+                    print(f"  {sys.executable} -m pip install -e .")
+                    return False
+                print(f"源码目录: {src_dir}")
+                subprocess.run(['git', 'pull'], check=True, cwd=str(src_dir))
                 # 重新安装
                 subprocess.run([
-                    sys.executable, '-m', 'pip', 'install', '-e', '.'
+                    sys.executable, '-m', 'pip', 'install', '-e', str(src_dir)
                 ], check=True)
                 print("更新完毕，已同步至仓库最新提交")
                 return True
-                
+
             else:
                 print("无法确定安装方式，请手动更新:")
                 if version_info.get('pypi_latest'):
@@ -363,40 +441,48 @@ class DualVersionChecker:
             return False
             
 def get_installation_method():
-    """检测安装方式"""
+    """检测安装方式
+
+    修正(2026-09-14): 原实现有两个误判源：
+      1) 'pip show fansetools' 成功即判为 pip —— 但 pip show 对
+         pip install -e .（可编辑）与 pip install git+https 安装同样返回 0，
+         导致可编辑安装走错分支（会被 git+https 重装覆盖）；
+      2) 'git rev-parse' 在 CWD 检测 —— CWD 与包安装位置无关，
+         用户在数据目录运行 fanse update 会把任意 git 仓库误判为 git 安装。
+    现改为：pip show 优先（覆盖 git+https 与可编辑安装）；可编辑安装再查
+    源码目录是否含 .git 决定 git/pip 分支；pip 检测失败才回退 conda；
+    最后以包自身位置向上找 .git 兜底（源码直跑、未注册 pip 的场景）。
+    """
+    # 1) pip 系安装（含 pip install git+https://... 与 pip install -e .）
     try:
-        # 检查是否通过pip安装
         result = subprocess.run([
             sys.executable, '-m', 'pip', 'show', 'fansetools'
         ], capture_output=True, text=True, timeout=10)
-        
+
         if result.returncode == 0:
-            return 'pip'
-    except:
+            editable_dir = _get_editable_project_dir()
+            if editable_dir and (editable_dir / '.git').exists():
+                return 'git'   # 可编辑安装 + 源码目录是 git 仓库 → git pull 模式
+            return 'pip'       # git+https / 普通安装 → pip 重装模式
+    except Exception:
         pass
-    
+
+    # 2) conda 安装（pip show 失败时才可能走到）
     try:
-        # 检查是否通过conda安装
         result = subprocess.run([
             'conda', 'list', 'fansetools'
         ], capture_output=True, text=True, timeout=10)
-        
+
         if result.returncode == 0 and 'fansetools' in result.stdout:
             return 'conda'
-    except:
+    except Exception:
         pass
-    
-    # 检查是否是Git安装（开发模式）
-    try:
-        result = subprocess.run([
-            'git', 'rev-parse', '--is-inside-work-tree'
-        ], capture_output=True, text=True, timeout=5)
-        
-        if result.returncode == 0:
-            return 'git'
-    except:
-        pass
-    
+
+    # 3) 兜底：包自身位于 git 工作树内（源码直跑、未注册 pip）
+    git_root = _find_git_root(Path(__file__).resolve().parent)
+    if git_root is not None:
+        return 'git'
+
     return 'unknown'
 
 
