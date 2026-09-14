@@ -41,11 +41,18 @@ setup(
         'tqdm>=4.0.0',
         'colorama>=0.4.0; platform_system=="Windows"',  # Windows下推荐安装
         'pandas>=1.0.0',
-        'biopython>=1.78',
         'packaging>=20.0',
         'requests>=2.20.0',
-        'paramiko', 
-        'rich_argparse', 
+        'paramiko',
+        'rich>=13.0.0',   # 修正(2026-09-14): sam/bam/cli/count 等直接 import rich，
+                          # 原先仅靠 rich_argparse 传递安装，依赖声明不完整
+        'rich_argparse',
+        'psutil>=5.0.0',  # 修正(2026-09-14): run.py 内存缓存检测使用（缺失时优雅降级），
+                          # 补入默认依赖以保证内存检查功能可用
+        # 修正(2026-09-14): 移除 'biopython>=1.78' —— 全源码递归扫描确认从未
+        # import Bio，属历史遗留无用依赖（wheel 体积大，白装）
+        # pysam: 仅 bam_linux.py 使用且该模块未被其他代码引用，改为可选
+        # （Linux 用户需要时手动 pip install pysam），见 requirements.txt
     ],
 
     extras_require={
